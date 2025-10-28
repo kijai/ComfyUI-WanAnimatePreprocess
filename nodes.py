@@ -1013,23 +1013,33 @@ class PoseDataEditorAutomatic:
                 "leg_scaling_mode": (
                     "STRING",
                     {
-                        "default": "stretch_to_canvas",
+                        "default": "Scale Legs to Bottom",
                         "choices": [
-                            "stretch_to_canvas",
-                            "preserve_length",
-                            "ratio_to_upper_body",
+                            "Scale Legs to Bottom",
+                            "Scale Legs (Normal)",
+                            "Scale Legs Relative to Torso-Head Distance",
                         ],
-                        "tooltip": "How to adapt the leg length: stretch to the floor, keep the current span or scale to an upper-body multiple.",
+                        "tooltip": "Choose how to adjust the leg span: stretch to the canvas floor, apply a manual factor or match a torso-to-head multiple.",
                     },
                 ),
-                "leg_upper_body_ratio": (
+                "scale_legs": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "Multiplier applied to the current leg span when 'Scale Legs (Normal)' is selected.",
+                    },
+                ),
+                "scale_legs_relative_to_upper_body": (
                     "FLOAT",
                     {
                         "default": 1.5,
                         "min": 0.0,
                         "max": 10.0,
                         "step": 0.01,
-                        "tooltip": "Multiplier applied to the upper body span when the ratio-to-upper-body leg mode is selected.",
+                        "tooltip": "Multiplier applied to the torso-to-head distance when 'Scale Legs Relative to Torso-Head Distance' is selected.",
                     },
                 ),
                 "head_padding": (
@@ -1103,7 +1113,8 @@ class PoseDataEditorAutomatic:
         self,
         pose_data,
         leg_scaling_mode,
-        leg_upper_body_ratio,
+        scale_legs,
+        scale_legs_relative_to_upper_body,
         head_padding,
         head_padding_normalized,
         foot_padding,
@@ -1125,7 +1136,8 @@ class PoseDataEditorAutomatic:
             self._auto_align_meta(
                 meta,
                 leg_scaling_mode,
-                leg_upper_body_ratio,
+                scale_legs,
+                scale_legs_relative_to_upper_body,
                 head_padding,
                 head_padding_normalized,
                 foot_padding,
@@ -1140,7 +1152,8 @@ class PoseDataEditorAutomatic:
         self,
         meta,
         leg_scaling_mode,
-        leg_upper_body_ratio,
+        scale_legs,
+        scale_legs_relative_to_upper_body,
         head_padding,
         head_padding_normalized,
         foot_padding,
@@ -1167,7 +1180,8 @@ class PoseDataEditorAutomatic:
             width,
             height,
             leg_scaling_mode,
-            leg_upper_body_ratio,
+            scale_legs,
+            scale_legs_relative_to_upper_body,
         )
 
         if center_horizontally:
@@ -1203,7 +1217,8 @@ class PoseDataEditorAutomatic:
         width,
         height,
         leg_scaling_mode,
-        leg_upper_body_ratio,
+        scale_legs,
+        scale_legs_relative_to_upper_body,
     ):
         anchor_y = self._compute_leg_anchor(meta)
         if anchor_y is None:
@@ -1217,16 +1232,20 @@ class PoseDataEditorAutomatic:
         if span <= 1e-6:
             return
 
-        mode = (leg_scaling_mode or "").lower()
+        mode_key = (leg_scaling_mode or "").strip().lower()
 
-        if mode == "preserve_length":
-            return
-
-        if mode == "ratio_to_upper_body":
+        if mode_key == "scale legs (normal)":
+            multiplier = max(float(scale_legs), 0.0)
+            if multiplier <= 0.0:
+                return
+            scale = multiplier
+        elif mode_key == "scale legs relative to torso-head distance":
             upper_length = self._compute_upper_body_length(meta, anchor_y)
             if upper_length is None or upper_length <= 1e-6:
                 return
-            multiplier = max(float(leg_upper_body_ratio), 0.0)
+            multiplier = max(float(scale_legs_relative_to_upper_body), 0.0)
+            if multiplier <= 0.0:
+                return
             desired_span = upper_length * multiplier
             if desired_span <= 1e-6:
                 return
