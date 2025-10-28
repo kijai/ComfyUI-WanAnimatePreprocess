@@ -1,0 +1,35 @@
+{
+    "keypoints":
+    [  # The list of frames, len(json['keypoints']) == len(video)
+        {  # For each frame a dict
+            "0": [  #  keys are id to track people and value the keypoints
+                [121.19, 458.15, 0.99], # Each keypoint is (y, x, score)
+                [110.02, 469.43, 0.98],
+                [110.86, 445.04, 0.99],
+            ],
+            "1": [
+                ...
+            ],
+        },
+        {
+            "0": [
+                [122.19, 458.15, 0.91],
+                [105.02, 469.43, 0.95],
+                [122.86, 445.04, 0.99],
+            ],
+            "1": [
+                ...
+            ]
+        }
+    ],
+    "skeleton":
+    {  # Skeleton reference, key the idx, value the name
+        "0": "nose",
+        "1": "left_eye",
+        "2": "right_eye",
+        "3": "left_ear",
+        "4": "right_ear",
+        "5": "neck",
+        ...
+    }
+}
