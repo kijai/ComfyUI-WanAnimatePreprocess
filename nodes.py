@@ -369,6 +369,11 @@ class PoseDataEditor:
         require_visible_part,
         person_index,
     ):
+        if only_scale_up and only_scale_down:
+            raise ValueError(
+                "Only one of 'only_scale_up' or 'only_scale_down' can be enabled at a time."
+            )
+
         pose_data_copy = copy.deepcopy(pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
 
@@ -1010,16 +1015,25 @@ class PoseDataEditorAutomatic:
         return {
             "required": {
                 "pose_data": ("POSEDATA",),
-                "leg_scaling_mode": (
-                    "STRING",
+                "scale_legs_to_bottom": (
+                    "BOOLEAN",
                     {
-                        "default": "Stretch to Canvas Floor",
-                        "choices": [
-                            "Stretch to Canvas Floor",
-                            "Apply Manual Factor",
-                            "Match Torso-to-Head Multiple",
-                        ],
-                        "tooltip": "Select how to extend the legs: reach the canvas floor, apply a manual scale or match a torso-to-head multiple.",
+                        "default": True,
+                        "tooltip": "Stretch legs so the lowest point reaches the canvas floor (after foot padding).",
+                    },
+                ),
+                "scale_legs_normal": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Apply a manual scaling factor to the current leg span.",
+                    },
+                ),
+                "scale_legs_relative_to_body": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Match legs to a multiple of the torso-to-head distance.",
                     },
                 ),
                 "scale_legs": (
@@ -1029,7 +1043,7 @@ class PoseDataEditorAutomatic:
                         "min": 0.0,
                         "max": 10.0,
                         "step": 0.01,
-                        "tooltip": "Multiplier applied to the current leg span when 'Scale Legs (Normal)' is selected.",
+                        "tooltip": "Multiplier applied to the current leg span when the 'Scale Legs Normal' checkbox is enabled.",
                     },
                 ),
                 "torso_head_multiple": (
@@ -1039,7 +1053,7 @@ class PoseDataEditorAutomatic:
                         "min": 0.0,
                         "max": 10.0,
                         "step": 0.01,
-                        "tooltip": "Multiplier applied to the torso-to-head distance when 'Match Torso-to-Head Multiple' is selected.",
+                        "tooltip": "Multiplier applied to the torso-to-head distance when 'Scale Legs Relative to Body' is enabled.",
                     },
                 ),
                 "head_padding": (
@@ -1112,7 +1126,9 @@ class PoseDataEditorAutomatic:
     def process(
         self,
         pose_data,
-        leg_scaling_mode,
+        scale_legs_to_bottom,
+        scale_legs_normal,
+        scale_legs_relative_to_body,
         scale_legs,
         torso_head_multiple,
         head_padding,
@@ -1129,13 +1145,19 @@ class PoseDataEditorAutomatic:
         if not pose_metas:
             return (pose_data_copy,)
 
+        leg_mode = self._select_leg_mode(
+            scale_legs_to_bottom,
+            scale_legs_normal,
+            scale_legs_relative_to_body,
+        )
+
         for idx, meta in enumerate(pose_metas):
             if person_index >= 0 and idx != person_index:
                 continue
 
             self._auto_align_meta(
                 meta,
-                leg_scaling_mode,
+                leg_mode,
                 scale_legs,
                 torso_head_multiple,
                 head_padding,
@@ -1148,10 +1170,33 @@ class PoseDataEditorAutomatic:
 
         return (pose_data_copy,)
 
+    def _select_leg_mode(
+        self,
+        scale_legs_to_bottom,
+        scale_legs_normal,
+        scale_legs_relative_to_body,
+    ):
+        selection = [
+            bool(scale_legs_to_bottom),
+            bool(scale_legs_normal),
+            bool(scale_legs_relative_to_body),
+        ]
+
+        if sum(selection) != 1:
+            raise ValueError(
+                "PoseDataEditorAutomatic requires exactly one leg scaling checkbox to be enabled."
+            )
+
+        if scale_legs_to_bottom:
+            return "bottom"
+        if scale_legs_normal:
+            return "normal"
+        return "relative"
+
     def _auto_align_meta(
         self,
         meta,
-        leg_scaling_mode,
+        leg_mode,
         scale_legs,
         torso_head_multiple,
         head_padding,
@@ -1179,7 +1224,7 @@ class PoseDataEditorAutomatic:
             foot_pad_px,
             width,
             height,
-            leg_scaling_mode,
+            leg_mode,
             scale_legs,
             torso_head_multiple,
         )
@@ -1216,7 +1261,7 @@ class PoseDataEditorAutomatic:
         foot_padding_px,
         width,
         height,
-        leg_scaling_mode,
+        leg_mode,
         scale_legs,
         torso_head_multiple,
     ):
@@ -1232,14 +1277,14 @@ class PoseDataEditorAutomatic:
         if span <= 1e-6:
             return
 
-        mode_key = (leg_scaling_mode or "").strip().lower()
+        mode_key = (leg_mode or "").strip().lower()
 
-        if mode_key == "apply manual factor":
+        if mode_key == "normal":
             multiplier = max(float(scale_legs), 0.0)
             if multiplier <= 0.0:
                 return
             scale = multiplier
-        elif mode_key == "match torso-to-head multiple":
+        elif mode_key == "relative":
             upper_length = self._compute_upper_body_length(meta, anchor_y)
             if upper_length is None or upper_length <= 1e-6:
                 return
