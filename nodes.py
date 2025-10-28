@@ -1,4 +1,6 @@
 import os
+import copy
+import math
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -20,6 +22,44 @@ from .pose_utils.pose2d_utils import load_pose_metas_from_kp2ds_seq, crop, bbox_
 from .utils import get_face_bboxes, padding_resize, resize_by_area, resize_to_bounds
 from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new, draw_aaface_by_meta
 from .retarget_pose import get_retarget_pose
+
+
+BODY_GROUPS = {
+    "ALL": list(range(20)),
+    "TORSO": [1, 2, 5, 8, 11],
+    "SHOULDERS": [2, 5],
+    "ARMS": [2, 3, 4, 5, 6, 7],
+    "LEGS": [8, 9, 10, 11, 12, 13],
+    "FEET": [10, 13, 18, 19],
+    "HEAD": [0, 14, 15, 16, 17],
+    "HIP_WIDTH": [8, 11],
+}
+
+HAND_GROUPS = {
+    "LEFT_HAND": "left",
+    "RIGHT_HAND": "right",
+    "HANDS": "both",
+}
+
+FACE_GROUP = {
+    "FACE": True,
+}
+
+TARGET_OPTIONS = [
+    "ALL",
+    "BODY",
+    "TORSO",
+    "SHOULDERS",
+    "ARMS",
+    "LEGS",
+    "FEET",
+    "HEAD",
+    "HIP_WIDTH",
+    "HANDS",
+    "LEFT_HAND",
+    "RIGHT_HAND",
+    "FACE",
+]
 
 class OnnxDetectionModelLoader:
     @classmethod
@@ -214,6 +254,219 @@ class PoseAndFaceDetection:
 
         return (pose_data, face_images_tensor, json.dumps(points_dict_list), [bbox_ints], face_bboxes)
 
+
+class PoseDataEditor:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "target_region": (TARGET_OPTIONS, {"default": "BODY", "tooltip": "Select which set of keypoints to manipulate."}),
+                "x_offset": ("FLOAT", {"default": 0.0, "min": -2048.0, "max": 2048.0, "step": 0.01, "tooltip": "Horizontal offset applied to the selected points."}),
+                "y_offset": ("FLOAT", {"default": 0.0, "min": -2048.0, "max": 2048.0, "step": 0.01, "tooltip": "Vertical offset applied to the selected points."}),
+                "normalized_offset": ("BOOLEAN", {"default": False, "tooltip": "Interpret offsets in normalised 0-1 space instead of pixels."}),
+                "rotation_deg": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.1, "tooltip": "Rotation angle applied around the centroid of the selected points."}),
+                "scale_x": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "Scale factor along the X axis (bi-directional)."}),
+                "scale_y": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "Scale factor along the Y axis (bi-directional)."}),
+                "limit_scale_to_canvas": ("BOOLEAN", {"default": True, "tooltip": "Clamp transformed points so they stay within the canvas."}),
+                "only_scale_up": ("BOOLEAN", {"default": False, "tooltip": "Prevent scale factors below 1.0 to avoid shrinking the selection."}),
+                "person_index": ("INT", {"default": -1, "min": -1, "max": 9999, "step": 1, "tooltip": "When >= 0, only edit the matching pose entry. Use -1 to edit every pose."}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "edit"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Interactive editor for pose data allowing offsets, rotation and scaling of body, hand and face keypoints."
+
+    def edit(
+        self,
+        pose_data,
+        target_region,
+        x_offset,
+        y_offset,
+        normalized_offset,
+        rotation_deg,
+        scale_x,
+        scale_y,
+        limit_scale_to_canvas,
+        only_scale_up,
+        person_index,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        indices = (
+            [person_index]
+            if isinstance(person_index, int) and person_index >= 0 and person_index < len(pose_metas)
+            else list(range(len(pose_metas)))
+        )
+
+        for idx in indices:
+            meta = pose_metas[idx]
+            if meta is None:
+                continue
+            self._apply_edit(
+                meta,
+                target_region,
+                x_offset,
+                y_offset,
+                normalized_offset,
+                rotation_deg,
+                scale_x,
+                scale_y,
+                limit_scale_to_canvas,
+                only_scale_up,
+            )
+
+        return (pose_data_copy,)
+
+    def _apply_edit(
+        self,
+        meta,
+        target_region,
+        x_offset,
+        y_offset,
+        normalized_offset,
+        rotation_deg,
+        scale_x,
+        scale_y,
+        limit_scale_to_canvas,
+        only_scale_up,
+    ):
+        width = getattr(meta, "width", None)
+        height = getattr(meta, "height", None)
+
+        if width in (None, 0) or height in (None, 0):
+            return
+
+        selections = self._resolve_selection(meta, target_region)
+        if not selections:
+            return
+
+        points = []
+        refs = []
+
+        for arr_name, indices in selections:
+            arr = getattr(meta, arr_name, None)
+            if arr is None:
+                continue
+
+            if isinstance(indices, str) and indices == "ALL":
+                iterable = range(len(arr))
+            else:
+                iterable = indices
+
+            for idx in iterable:
+                if idx >= len(arr):
+                    continue
+
+                point = arr[idx]
+                if point is None:
+                    continue
+
+                if isinstance(point, np.ndarray):
+                    if np.isnan(point).any():
+                        continue
+                    x, y = point.tolist()
+                elif isinstance(point, (list, tuple)):
+                    if len(point) < 2 or point[0] is None or point[1] is None:
+                        continue
+                    x, y = point[:2]
+                else:
+                    continue
+
+                if arr_name == "kps_body" and getattr(meta, "kps_body_p", None) is not None:
+                    if meta.kps_body_p[idx] <= 0:
+                        continue
+                if arr_name == "kps_lhand" and getattr(meta, "kps_lhand_p", None) is not None:
+                    if meta.kps_lhand_p[idx] <= 0:
+                        continue
+                if arr_name == "kps_rhand" and getattr(meta, "kps_rhand_p", None) is not None:
+                    if meta.kps_rhand_p[idx] <= 0:
+                        continue
+
+                points.append([float(x), float(y)])
+                refs.append((arr_name, idx))
+
+        if not points:
+            return
+
+        points_np = np.array(points, dtype=np.float32)
+        center = points_np.mean(axis=0, keepdims=True)
+
+        scales = np.array([scale_x, scale_y], dtype=np.float32)
+        if only_scale_up:
+            scales = np.maximum(scales, np.ones_like(scales))
+
+        offset = np.array([x_offset, y_offset], dtype=np.float32)
+        if normalized_offset:
+            offset *= np.array([width, height], dtype=np.float32)
+
+        theta = math.radians(rotation_deg)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        rotation_matrix = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float32)
+
+        transformed = (points_np - center) * scales
+        transformed = transformed @ rotation_matrix.T
+        transformed = transformed + center + offset
+
+        if limit_scale_to_canvas:
+            transformed[:, 0] = np.clip(transformed[:, 0], 0.0, float(width))
+            transformed[:, 1] = np.clip(transformed[:, 1], 0.0, float(height))
+
+        for (arr_name, idx), new_point in zip(refs, transformed.tolist()):
+            if arr_name == "kps_body":
+                meta.kps_body[idx] = new_point
+            elif arr_name == "kps_lhand":
+                meta.kps_lhand[idx] = new_point
+            elif arr_name == "kps_rhand":
+                meta.kps_rhand[idx] = new_point
+            elif arr_name == "kps_face":
+                meta.kps_face[idx] = new_point
+
+    def _resolve_selection(self, meta, target_region):
+        target = target_region.upper()
+        selections = []
+
+        if target == "ALL":
+            selections.append(("kps_body", BODY_GROUPS["ALL"]))
+            if getattr(meta, "kps_lhand", None) is not None:
+                selections.append(("kps_lhand", "ALL"))
+            if getattr(meta, "kps_rhand", None) is not None:
+                selections.append(("kps_rhand", "ALL"))
+            if getattr(meta, "kps_face", None) is not None:
+                selections.append(("kps_face", "ALL"))
+            return selections
+
+        if target == "BODY":
+            selections.append(("kps_body", BODY_GROUPS["ALL"]))
+            return selections
+
+        if target in BODY_GROUPS:
+            selections.append(("kps_body", BODY_GROUPS[target]))
+            return selections
+
+        if target in HAND_GROUPS:
+            hand_target = HAND_GROUPS[target]
+            if hand_target in ("left", "both") and getattr(meta, "kps_lhand", None) is not None:
+                selections.append(("kps_lhand", "ALL"))
+            if hand_target in ("right", "both") and getattr(meta, "kps_rhand", None) is not None:
+                selections.append(("kps_rhand", "ALL"))
+            return selections
+
+        if target in FACE_GROUP and getattr(meta, "kps_face", None) is not None:
+            selections.append(("kps_face", "ALL"))
+            return selections
+
+        return selections
+
+
 class DrawViTPose:
     @classmethod
     def INPUT_TYPES(s):
@@ -336,12 +589,14 @@ class PoseRetargetPromptHelper:
 NODE_CLASS_MAPPINGS = {
     "OnnxDetectionModelLoader": OnnxDetectionModelLoader,
     "PoseAndFaceDetection": PoseAndFaceDetection,
+    "PoseDataEditor": PoseDataEditor,
     "DrawViTPose": DrawViTPose,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OnnxDetectionModelLoader": "ONNX Detection Model Loader",
     "PoseAndFaceDetection": "Pose and Face Detection",
+    "PoseDataEditor": "Pose Data Editor",
     "DrawViTPose": "Draw ViT Pose",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
 }
