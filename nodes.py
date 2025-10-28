@@ -63,6 +63,25 @@ TARGET_OPTIONS = [
     "FACE",
 ]
 
+TORSO_LENGTH_PAIRS = [
+    (1, 2),  # neck to right shoulder
+    (1, 5),  # neck to left shoulder
+    (1, 8),  # neck to right hip
+    (1, 11),  # neck to left hip
+    (8, 11),  # hip width
+]
+
+FULL_BODY_LENGTH_PAIRS = TORSO_LENGTH_PAIRS + [
+    (2, 3),  # right shoulder to right elbow
+    (3, 4),  # right elbow to right wrist
+    (5, 6),  # left shoulder to left elbow
+    (6, 7),  # left elbow to left wrist
+    (8, 9),  # right hip to right knee
+    (9, 10),  # right knee to right ankle
+    (11, 12),  # left hip to left knee
+    (12, 13),  # left knee to left ankle
+]
+
 class OnnxDetectionModelLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -268,6 +287,8 @@ class PoseDataEditor:
                 "y_offset": ("FLOAT", {"default": 0.0, "min": -2048.0, "max": 2048.0, "step": 0.01, "tooltip": "Vertical offset applied to the selected points."}),
                 "normalized_offset": ("BOOLEAN", {"default": False, "tooltip": "Interpret offsets in normalised 0-1 space instead of pixels."}),
                 "rotation_deg": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.1, "tooltip": "Rotation angle applied around the centroid of the selected points."}),
+                "scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "Uniform scale applied when link scale axes is enabled."}),
+                "link_scale_axes": ("BOOLEAN", {"default": False, "tooltip": "When enabled, the uniform scale value drives both X and Y axes."}),
                 "scale_x": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "Scale factor along the X axis (bi-directional)."}),
                 "scale_y": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "Scale factor along the Y axis (bi-directional)."}),
                 "limit_scale_to_canvas": ("BOOLEAN", {"default": True, "tooltip": "Clamp transformed points so they stay within the canvas."}),
@@ -290,6 +311,8 @@ class PoseDataEditor:
         y_offset,
         normalized_offset,
         rotation_deg,
+        scale,
+        link_scale_axes,
         scale_x,
         scale_y,
         limit_scale_to_canvas,
@@ -301,6 +324,10 @@ class PoseDataEditor:
 
         if not pose_metas:
             return (pose_data_copy,)
+
+        if link_scale_axes:
+            scale_x = scale
+            scale_y = scale
 
         indices = (
             [person_index]
@@ -400,6 +427,7 @@ class PoseDataEditor:
 
         points_np = np.array(points, dtype=np.float32)
         center = points_np.mean(axis=0, keepdims=True)
+        original_points = points_np.copy()
 
         scales = np.array([scale_x, scale_y], dtype=np.float32)
         if only_scale_up:
@@ -416,7 +444,18 @@ class PoseDataEditor:
 
         transformed = (points_np - center) * scales
         transformed = transformed @ rotation_matrix.T
-        transformed = transformed + center + offset
+        transformed = transformed + center
+
+        leg_indices = set(BODY_GROUPS.get("LEGS", [])) | set(BODY_GROUPS.get("FEET", []))
+        affects_legs = bool(refs) and all(
+            arr_name == "kps_body" and idx in leg_indices for arr_name, idx in refs
+        )
+
+        vertical_offset_for_rest = 0.0
+        if affects_legs and only_scale_up and (scales[0] > 1.0 or scales[1] > 1.0):
+            vertical_offset_for_rest = max(0.0, float(np.min(original_points[:, 1]) - np.min(transformed[:, 1])))
+
+        transformed = transformed + offset
 
         if limit_scale_to_canvas:
             transformed[:, 0] = np.clip(transformed[:, 0], 0.0, float(width))
@@ -431,6 +470,61 @@ class PoseDataEditor:
                 meta.kps_rhand[idx] = new_point
             elif arr_name == "kps_face":
                 meta.kps_face[idx] = new_point
+
+        if vertical_offset_for_rest > 0.0:
+            self._offset_unselected_points(
+                meta,
+                vertical_offset_for_rest,
+                refs,
+                limit_scale_to_canvas,
+                float(width),
+                float(height),
+            )
+
+    def _offset_unselected_points(
+        self,
+        meta,
+        vertical_offset,
+        selected_refs,
+        limit_to_canvas,
+        width,
+        height,
+    ):
+        if vertical_offset <= 0.0:
+            return
+
+        selected_set = {(name, idx) for name, idx in selected_refs}
+
+        for arr_name in ("kps_body", "kps_lhand", "kps_rhand", "kps_face"):
+            arr = getattr(meta, arr_name, None)
+            if arr is None:
+                continue
+
+            for idx in range(len(arr)):
+                if (arr_name, idx) in selected_set:
+                    continue
+
+                point = arr[idx]
+                if point is None:
+                    continue
+
+                point_arr = np.array(point[:2], dtype=np.float32)
+                point_arr[1] -= vertical_offset
+
+                if limit_to_canvas:
+                    point_arr[0] = float(np.clip(point_arr[0], 0.0, width))
+                    point_arr[1] = float(np.clip(point_arr[1], 0.0, height))
+
+                if isinstance(arr, np.ndarray):
+                    if arr.ndim >= 2 and arr.shape[-1] >= 2:
+                        arr[idx, :2] = point_arr
+                    else:
+                        arr[idx] = point_arr
+                else:
+                    updated_point = list(point)
+                    updated_point[0] = float(point_arr[0])
+                    updated_point[1] = float(point_arr[1])
+                    arr[idx] = updated_point
 
     def _resolve_selection(self, meta, target_region):
         target = target_region.upper()
@@ -467,6 +561,299 @@ class PoseDataEditor:
             return selections
 
         return selections
+
+
+class PoseDataPostProcessor:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "length_mode": (("TORSO", "FULL_BODY"), {"default": "TORSO", "tooltip": "Select which body segments are used to stabilise lengths."}),
+                "preserve_tolerance": ("FLOAT", {"default": 0.02, "min": 0.0, "max": 1.0, "step": 0.001, "tooltip": "Skip adjustments when the median length ratio deviates from 1 by less than this tolerance."}),
+                "max_scale_change": ("FLOAT", {"default": 2.5, "min": 1.0, "max": 10.0, "step": 0.01, "tooltip": "Clamp the normalisation scale multiplier to avoid extreme corrections."}),
+                "limit_to_canvas": ("BOOLEAN", {"default": True, "tooltip": "Clamp corrected keypoints so they remain on the canvas."}),
+                "propagate_to_hands": ("BOOLEAN", {"default": True, "tooltip": "Apply the stabilisation transform to hand and face keypoints as well."}),
+            },
+            "optional": {
+                "reference_pose_data": ("POSEDATA", {"default": None, "tooltip": "Optional pose data providing the reference proportions. Defaults to the original detection data."}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Normalises pose proportions after editing so torso and limb lengths stay consistent even when detections are incomplete."
+
+    SCORE_THRESHOLD = 0.05
+    MIN_VALID_PAIRS = 2
+
+    def process(
+        self,
+        pose_data,
+        length_mode,
+        preserve_tolerance,
+        max_scale_change,
+        limit_to_canvas,
+        propagate_to_hands,
+        reference_pose_data=None,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        reference_entries, reference_is_meta = self._resolve_reference_list(
+            reference_pose_data, pose_data_copy
+        )
+
+        if reference_entries is None:
+            return (pose_data_copy,)
+
+        use_pairs = (
+            TORSO_LENGTH_PAIRS if length_mode == "TORSO" else FULL_BODY_LENGTH_PAIRS
+        )
+
+        for idx, meta in enumerate(pose_metas):
+            reference_entry = (
+                reference_entries[idx]
+                if idx < len(reference_entries)
+                else reference_entries[-1]
+            )
+
+            if reference_entry is None:
+                continue
+
+            self._stabilise_meta(
+                meta,
+                reference_entry,
+                reference_is_meta,
+                use_pairs,
+                preserve_tolerance,
+                max_scale_change,
+                limit_to_canvas,
+                propagate_to_hands,
+            )
+
+        return (pose_data_copy,)
+
+    def _resolve_reference_list(self, supplied_reference, pose_data_copy):
+        if supplied_reference not in (None,):
+            if isinstance(supplied_reference, dict):
+                ref_pose_metas = supplied_reference.get("pose_metas")
+                if ref_pose_metas:
+                    return ref_pose_metas, True
+                ref_original = supplied_reference.get("pose_metas_original")
+                if ref_original:
+                    return ref_original, False
+            return None, False
+
+        ref_original_default = pose_data_copy.get("pose_metas_original")
+        if ref_original_default:
+            return ref_original_default, False
+
+        ref_pose_metas_default = pose_data_copy.get("pose_metas")
+        if ref_pose_metas_default:
+            return ref_pose_metas_default, True
+
+        return None, False
+
+    def _stabilise_meta(
+        self,
+        meta,
+        reference_entry,
+        reference_is_meta,
+        length_pairs,
+        tolerance,
+        max_scale_change,
+        limit_to_canvas,
+        propagate_to_hands,
+    ):
+        width = getattr(meta, "width", None)
+        height = getattr(meta, "height", None)
+
+        if width in (None, 0) or height in (None, 0):
+            return
+
+        current_body = getattr(meta, "kps_body", None)
+        current_scores = getattr(meta, "kps_body_p", None)
+
+        if current_body is None or len(current_body) == 0:
+            return
+
+        reference_body, reference_scores = self._extract_reference_body(
+            reference_entry, reference_is_meta, width, height
+        )
+
+        if reference_body is None or len(reference_body) == 0:
+            return
+
+        ratios = self._compute_length_ratios(
+            reference_body,
+            reference_scores,
+            current_body,
+            current_scores,
+            length_pairs,
+        )
+
+        if len(ratios) < self.MIN_VALID_PAIRS:
+            return
+
+        median_ratio = float(np.median(ratios))
+
+        if not np.isfinite(median_ratio):
+            return
+
+        median_ratio = float(np.clip(median_ratio, 1.0 / max_scale_change, max_scale_change))
+
+        if abs(median_ratio - 1.0) <= tolerance:
+            return
+
+        anchor = self._compute_anchor(current_body, current_scores, width, height)
+
+        self._apply_scale(meta.kps_body, anchor, median_ratio, width, height, limit_to_canvas)
+
+        if propagate_to_hands:
+            self._apply_scale(meta.kps_lhand, anchor, median_ratio, width, height, limit_to_canvas)
+            self._apply_scale(meta.kps_rhand, anchor, median_ratio, width, height, limit_to_canvas)
+            self._apply_scale(meta.kps_face, anchor, median_ratio, width, height, limit_to_canvas)
+
+    def _extract_reference_body(self, reference_entry, reference_is_meta, width, height):
+        if reference_is_meta and isinstance(reference_entry, AAPoseMeta):
+            coords = np.array(reference_entry.kps_body, dtype=np.float32)
+            scores = (
+                np.array(getattr(reference_entry, "kps_body_p", None), dtype=np.float32)
+                if getattr(reference_entry, "kps_body_p", None) is not None
+                else None
+            )
+            return coords, scores
+
+        if isinstance(reference_entry, dict):
+            keypoints = reference_entry.get("keypoints_body")
+            if keypoints is None:
+                return None, None
+
+            keypoints_np = np.array(keypoints, dtype=np.float32)
+            if keypoints_np.ndim != 2 or keypoints_np.shape[1] < 2:
+                return None, None
+
+            coords = keypoints_np[:, :2] * np.array([width, height], dtype=np.float32)
+            scores = (
+                keypoints_np[:, 2]
+                if keypoints_np.shape[1] > 2
+                else None
+            )
+            return coords, scores
+
+        return None, None
+
+    def _compute_length_ratios(
+        self,
+        reference_body,
+        reference_scores,
+        current_body,
+        current_scores,
+        length_pairs,
+    ):
+        ratios = []
+
+        for idx_a, idx_b in length_pairs:
+            ref_valid = self._is_point_valid(reference_body, reference_scores, idx_a) and self._is_point_valid(
+                reference_body, reference_scores, idx_b
+            )
+            cur_valid = self._is_point_valid(current_body, current_scores, idx_a) and self._is_point_valid(
+                current_body, current_scores, idx_b
+            )
+
+            if not (ref_valid and cur_valid):
+                continue
+
+            ref_length = float(np.linalg.norm(reference_body[idx_a] - reference_body[idx_b]))
+            cur_length = float(np.linalg.norm(current_body[idx_a] - current_body[idx_b]))
+
+            if ref_length <= 1e-6 or cur_length <= 1e-6:
+                continue
+
+            ratios.append(ref_length / cur_length)
+
+        return ratios
+
+    def _is_point_valid(self, points, scores, index):
+        if points is None or index >= len(points):
+            return False
+
+        point = points[index]
+        if point is None:
+            return False
+
+        if np.any(~np.isfinite(point)):
+            return False
+
+        if scores is not None and index < len(scores):
+            return scores[index] > self.SCORE_THRESHOLD
+
+        return not (abs(point[0]) <= 1e-6 and abs(point[1]) <= 1e-6)
+
+    def _compute_anchor(self, current_body, current_scores, width, height):
+        torso_indices = BODY_GROUPS.get("TORSO", [])
+        candidates = []
+
+        for idx in torso_indices:
+            if idx >= len(current_body):
+                continue
+            if current_scores is not None and idx < len(current_scores):
+                if current_scores[idx] <= self.SCORE_THRESHOLD:
+                    continue
+            point = current_body[idx]
+            if point is None or np.any(~np.isfinite(point)):
+                continue
+            candidates.append(point)
+
+        if not candidates:
+            for idx, point in enumerate(current_body):
+                if current_scores is not None and idx < len(current_scores):
+                    if current_scores[idx] <= self.SCORE_THRESHOLD:
+                        continue
+                if point is None or np.any(~np.isfinite(point)):
+                    continue
+                candidates.append(point)
+
+        if not candidates:
+            return np.array([width * 0.5, height * 0.5], dtype=np.float32)
+
+        return np.mean(np.array(candidates, dtype=np.float32), axis=0)
+
+    def _apply_scale(self, points, anchor, scale, width, height, limit_to_canvas):
+        if points is None:
+            return
+
+        if isinstance(points, np.ndarray):
+            coords = points
+        else:
+            coords = np.array(points, dtype=np.float32)
+
+        if coords.size == 0:
+            return
+
+        if coords.ndim != 2 or coords.shape[1] < 2:
+            return
+
+        anchor_vec = np.array(anchor, dtype=np.float32)
+
+        transformed = (coords[:, :2] - anchor_vec) * scale + anchor_vec
+
+        if limit_to_canvas:
+            transformed[:, 0] = np.clip(transformed[:, 0], 0.0, float(width))
+            transformed[:, 1] = np.clip(transformed[:, 1], 0.0, float(height))
+
+        if isinstance(points, np.ndarray):
+            points[:, :2] = transformed
+        else:
+            for idx, (x, y) in enumerate(transformed):
+                points[idx][0] = float(x)
+                points[idx][1] = float(y)
 
 
 class DrawViTPose:
@@ -593,6 +980,7 @@ NODE_CLASS_MAPPINGS = {
     "OnnxDetectionModelLoader": OnnxDetectionModelLoader,
     "PoseAndFaceDetection": PoseAndFaceDetection,
     "PoseDataEditor": PoseDataEditor,
+    "PoseDataPostProcessor": PoseDataPostProcessor,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -600,5 +988,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "OnnxDetectionModelLoader": "ONNX Detection Model Loader",
     "PoseAndFaceDetection": "Pose and Face Detection",
     "PoseDataEditor": "Pose Data Editor",
+    "PoseDataPostProcessor": "Pose Data Post-Processor",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
 }
