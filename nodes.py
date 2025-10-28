@@ -293,6 +293,24 @@ class PoseDataEditor:
                 "scale_y": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "Scale factor along the Y axis (bi-directional)."}),
                 "limit_scale_to_canvas": ("BOOLEAN", {"default": True, "tooltip": "Clamp transformed points so they stay within the canvas."}),
                 "only_scale_up": ("BOOLEAN", {"default": False, "tooltip": "Prevent scale factors below 1.0 to avoid shrinking the selection."}),
+                "only_adjust_when_legs_long": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "When editing legs or feet, only apply scaling when their normalised height span exceeds the configured threshold.",
+                    },
+                ),
+                "min_leg_length_ratio": (
+                    "FLOAT",
+                    {
+                        "default": 0.35,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.01,
+                        "tooltip": "Minimum normalised leg length (relative to canvas height) required before leg scaling is applied.",
+                    },
+                ),
+                "require_visible_part": ("BOOLEAN", {"default": True, "tooltip": "Skip edits when any required keypoints for the selected region are not visible."}),
                 "person_index": ("INT", {"default": -1, "min": -1, "max": 9999, "step": 1, "tooltip": "When >= 0, only edit the matching pose entry. Use -1 to edit every pose."}),
             },
         }
@@ -317,6 +335,9 @@ class PoseDataEditor:
         scale_y,
         limit_scale_to_canvas,
         only_scale_up,
+        only_adjust_when_legs_long,
+        min_leg_length_ratio,
+        require_visible_part,
         person_index,
     ):
         pose_data_copy = copy.deepcopy(pose_data)
@@ -350,6 +371,9 @@ class PoseDataEditor:
                 scale_y,
                 limit_scale_to_canvas,
                 only_scale_up,
+                only_adjust_when_legs_long,
+                min_leg_length_ratio,
+                require_visible_part,
             )
 
         return (pose_data_copy,)
@@ -366,6 +390,9 @@ class PoseDataEditor:
         scale_y,
         limit_scale_to_canvas,
         only_scale_up,
+        only_adjust_when_legs_long,
+        min_leg_length_ratio,
+        require_visible_part,
     ):
         width = getattr(meta, "width", None)
         height = getattr(meta, "height", None)
@@ -376,6 +403,14 @@ class PoseDataEditor:
         selections = self._resolve_selection(meta, target_region)
         if not selections:
             return
+
+        target_upper = target_region.upper()
+        if require_visible_part:
+            required_refs = self._required_refs_for_visibility(meta, target_upper)
+            if required_refs and not all(
+                self._is_point_visible(meta, arr_name, idx) for arr_name, idx in required_refs
+            ):
+                return
 
         points = []
         refs = []
@@ -429,9 +464,20 @@ class PoseDataEditor:
         center = points_np.mean(axis=0, keepdims=True)
         original_points = points_np.copy()
 
+        leg_indices = set(BODY_GROUPS.get("LEGS", [])) | set(BODY_GROUPS.get("FEET", []))
+        affects_legs = bool(refs) and all(
+            arr_name == "kps_body" and idx in leg_indices for arr_name, idx in refs
+        )
+
         scales = np.array([scale_x, scale_y], dtype=np.float32)
         if only_scale_up:
             scales = np.maximum(scales, np.ones_like(scales))
+
+        if affects_legs and only_adjust_when_legs_long and height not in (None, 0):
+            leg_span = float(np.ptp(original_points[:, 1]))
+            leg_span_ratio = leg_span / float(height) if height else 0.0
+            if leg_span_ratio < max(0.0, float(min_leg_length_ratio)):
+                scales = np.ones_like(scales)
 
         offset = np.array([x_offset, y_offset], dtype=np.float32)
         if normalized_offset:
@@ -445,11 +491,6 @@ class PoseDataEditor:
         transformed = (points_np - center) * scales
         transformed = transformed @ rotation_matrix.T
         transformed = transformed + center
-
-        leg_indices = set(BODY_GROUPS.get("LEGS", [])) | set(BODY_GROUPS.get("FEET", []))
-        affects_legs = bool(refs) and all(
-            arr_name == "kps_body" and idx in leg_indices for arr_name, idx in refs
-        )
 
         vertical_offset_for_rest = 0.0
         if affects_legs and only_scale_up and (scales[0] > 1.0 or scales[1] > 1.0):
@@ -480,6 +521,42 @@ class PoseDataEditor:
                 float(width),
                 float(height),
             )
+
+    def _required_refs_for_visibility(self, meta, target_upper):
+        if target_upper in ("ALL", "BODY"):
+            return []
+
+        if target_upper in BODY_GROUPS and target_upper != "ALL":
+            return [("kps_body", idx) for idx in BODY_GROUPS[target_upper]]
+
+        return []
+
+    def _is_point_visible(self, meta, arr_name, idx):
+        arr = getattr(meta, arr_name, None)
+        if arr is None or idx >= len(arr):
+            return False
+
+        point = arr[idx]
+        if point is None:
+            return False
+
+        if isinstance(point, np.ndarray):
+            if point.shape[-1] < 2:
+                return False
+            if np.isnan(point[:2]).any():
+                return False
+        elif isinstance(point, (list, tuple)):
+            if len(point) < 2 or point[0] is None or point[1] is None:
+                return False
+        else:
+            return False
+
+        prob_attr = getattr(meta, f"{arr_name}_p", None)
+        if prob_attr is not None:
+            if idx >= len(prob_attr) or prob_attr[idx] <= 0:
+                return False
+
+        return True
 
     def _offset_unselected_points(
         self,
