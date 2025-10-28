@@ -33,6 +33,7 @@ BODY_GROUPS = {
     "FEET": [10, 13, 18, 19],
     "HEAD": [0, 14, 15, 16, 17],
     "HIP_WIDTH": [8, 11],
+    "KNEE_WIDTH": [9, 12],
 }
 
 HAND_GROUPS = {
@@ -55,6 +56,7 @@ TARGET_OPTIONS = [
     "FEET",
     "HEAD",
     "HIP_WIDTH",
+    "KNEE_WIDTH",
     "HANDS",
     "LEFT_HAND",
     "RIGHT_HAND",
@@ -587,16 +589,16 @@ class PoseRetargetPromptHelper:
         return (tpl_prompt, refer_prompt, )
 
 NODE_CLASS_MAPPINGS = {
+    "DrawViTPose": DrawViTPose,
     "OnnxDetectionModelLoader": OnnxDetectionModelLoader,
     "PoseAndFaceDetection": PoseAndFaceDetection,
     "PoseDataEditor": PoseDataEditor,
-    "DrawViTPose": DrawViTPose,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "DrawViTPose": "Draw ViT Pose",
     "OnnxDetectionModelLoader": "ONNX Detection Model Loader",
     "PoseAndFaceDetection": "Pose and Face Detection",
     "PoseDataEditor": "Pose Data Editor",
-    "DrawViTPose": "Draw ViT Pose",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
 }
