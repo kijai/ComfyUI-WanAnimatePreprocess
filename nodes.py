@@ -1013,13 +1013,13 @@ class PoseDataEditorAutomatic:
                 "leg_scaling_mode": (
                     "STRING",
                     {
-                        "default": "Scale Legs to Bottom",
+                        "default": "Stretch to Canvas Floor",
                         "choices": [
-                            "Scale Legs to Bottom",
-                            "Scale Legs (Normal)",
-                            "Scale Legs Relative to Torso-Head Distance",
+                            "Stretch to Canvas Floor",
+                            "Apply Manual Factor",
+                            "Match Torso-to-Head Multiple",
                         ],
-                        "tooltip": "Choose how to adjust the leg span: stretch to the canvas floor, apply a manual factor or match a torso-to-head multiple.",
+                        "tooltip": "Select how to extend the legs: reach the canvas floor, apply a manual scale or match a torso-to-head multiple.",
                     },
                 ),
                 "scale_legs": (
@@ -1032,14 +1032,14 @@ class PoseDataEditorAutomatic:
                         "tooltip": "Multiplier applied to the current leg span when 'Scale Legs (Normal)' is selected.",
                     },
                 ),
-                "scale_legs_relative_to_upper_body": (
+                "torso_head_multiple": (
                     "FLOAT",
                     {
                         "default": 1.5,
                         "min": 0.0,
                         "max": 10.0,
                         "step": 0.01,
-                        "tooltip": "Multiplier applied to the torso-to-head distance when 'Scale Legs Relative to Torso-Head Distance' is selected.",
+                        "tooltip": "Multiplier applied to the torso-to-head distance when 'Match Torso-to-Head Multiple' is selected.",
                     },
                 ),
                 "head_padding": (
@@ -1114,7 +1114,7 @@ class PoseDataEditorAutomatic:
         pose_data,
         leg_scaling_mode,
         scale_legs,
-        scale_legs_relative_to_upper_body,
+        torso_head_multiple,
         head_padding,
         head_padding_normalized,
         foot_padding,
@@ -1137,7 +1137,7 @@ class PoseDataEditorAutomatic:
                 meta,
                 leg_scaling_mode,
                 scale_legs,
-                scale_legs_relative_to_upper_body,
+                torso_head_multiple,
                 head_padding,
                 head_padding_normalized,
                 foot_padding,
@@ -1153,7 +1153,7 @@ class PoseDataEditorAutomatic:
         meta,
         leg_scaling_mode,
         scale_legs,
-        scale_legs_relative_to_upper_body,
+        torso_head_multiple,
         head_padding,
         head_padding_normalized,
         foot_padding,
@@ -1181,7 +1181,7 @@ class PoseDataEditorAutomatic:
             height,
             leg_scaling_mode,
             scale_legs,
-            scale_legs_relative_to_upper_body,
+            torso_head_multiple,
         )
 
         if center_horizontally:
@@ -1218,7 +1218,7 @@ class PoseDataEditorAutomatic:
         height,
         leg_scaling_mode,
         scale_legs,
-        scale_legs_relative_to_upper_body,
+        torso_head_multiple,
     ):
         anchor_y = self._compute_leg_anchor(meta)
         if anchor_y is None:
@@ -1234,16 +1234,16 @@ class PoseDataEditorAutomatic:
 
         mode_key = (leg_scaling_mode or "").strip().lower()
 
-        if mode_key == "scale legs (normal)":
+        if mode_key == "apply manual factor":
             multiplier = max(float(scale_legs), 0.0)
             if multiplier <= 0.0:
                 return
             scale = multiplier
-        elif mode_key == "scale legs relative to torso-head distance":
+        elif mode_key == "match torso-to-head multiple":
             upper_length = self._compute_upper_body_length(meta, anchor_y)
             if upper_length is None or upper_length <= 1e-6:
                 return
-            multiplier = max(float(scale_legs_relative_to_upper_body), 0.0)
+            multiplier = max(float(torso_head_multiple), 0.0)
             if multiplier <= 0.0:
                 return
             desired_span = upper_length * multiplier
