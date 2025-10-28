@@ -1010,6 +1010,28 @@ class PoseDataEditorAutomatic:
         return {
             "required": {
                 "pose_data": ("POSEDATA",),
+                "leg_scaling_mode": (
+                    "STRING",
+                    {
+                        "default": "stretch_to_canvas",
+                        "choices": [
+                            "stretch_to_canvas",
+                            "preserve_length",
+                            "ratio_to_upper_body",
+                        ],
+                        "tooltip": "How to adapt the leg length: stretch to the floor, keep the current span or scale to an upper-body multiple.",
+                    },
+                ),
+                "leg_upper_body_ratio": (
+                    "FLOAT",
+                    {
+                        "default": 1.5,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "Multiplier applied to the upper body span when the ratio-to-upper-body leg mode is selected.",
+                    },
+                ),
                 "head_padding": (
                     "FLOAT",
                     {
@@ -1080,6 +1102,8 @@ class PoseDataEditorAutomatic:
     def process(
         self,
         pose_data,
+        leg_scaling_mode,
+        leg_upper_body_ratio,
         head_padding,
         head_padding_normalized,
         foot_padding,
@@ -1100,6 +1124,8 @@ class PoseDataEditorAutomatic:
 
             self._auto_align_meta(
                 meta,
+                leg_scaling_mode,
+                leg_upper_body_ratio,
                 head_padding,
                 head_padding_normalized,
                 foot_padding,
@@ -1113,6 +1139,8 @@ class PoseDataEditorAutomatic:
     def _auto_align_meta(
         self,
         meta,
+        leg_scaling_mode,
+        leg_upper_body_ratio,
         head_padding,
         head_padding_normalized,
         foot_padding,
@@ -1133,7 +1161,14 @@ class PoseDataEditorAutomatic:
         foot_pad_px = float(np.clip(foot_pad_px, 0.0, float(height)))
 
         self._translate_head_to_padding(meta, head_pad_px, width, height)
-        self._stretch_legs_to_floor(meta, foot_pad_px, width, height)
+        self._adjust_leg_length(
+            meta,
+            foot_pad_px,
+            width,
+            height,
+            leg_scaling_mode,
+            leg_upper_body_ratio,
+        )
 
         if center_horizontally:
             self._centre_pose(meta, width)
@@ -1161,7 +1196,15 @@ class PoseDataEditorAutomatic:
 
         self._translate_pose(meta, 0.0, delta, width, height)
 
-    def _stretch_legs_to_floor(self, meta, foot_padding_px, width, height):
+    def _adjust_leg_length(
+        self,
+        meta,
+        foot_padding_px,
+        width,
+        height,
+        leg_scaling_mode,
+        leg_upper_body_ratio,
+    ):
         anchor_y = self._compute_leg_anchor(meta)
         if anchor_y is None:
             return
@@ -1170,21 +1213,53 @@ class PoseDataEditorAutomatic:
         if bottom_y is None:
             return
 
-        target_y = float(height) - float(foot_padding_px)
-        target_y = float(np.clip(target_y, 0.0, float(height)))
-
-        if target_y <= anchor_y + 1e-6:
-            return
-
         span = bottom_y - anchor_y
         if span <= 1e-6:
             return
 
-        scale = (target_y - anchor_y) / span
+        mode = (leg_scaling_mode or "").lower()
+
+        if mode == "preserve_length":
+            return
+
+        if mode == "ratio_to_upper_body":
+            upper_length = self._compute_upper_body_length(meta, anchor_y)
+            if upper_length is None or upper_length <= 1e-6:
+                return
+            multiplier = max(float(leg_upper_body_ratio), 0.0)
+            desired_span = upper_length * multiplier
+            if desired_span <= 1e-6:
+                return
+            scale = desired_span / span
+        else:
+            target_y = float(height) - float(foot_padding_px)
+            target_y = float(np.clip(target_y, 0.0, float(height)))
+
+            if target_y <= anchor_y + 1e-6:
+                return
+
+            scale = (target_y - anchor_y) / span
+
         if not np.isfinite(scale) or scale <= 0.0:
             return
 
         self._scale_leg_points(meta, anchor_y, scale)
+
+    def _compute_upper_body_length(self, meta, anchor_y):
+        top_y = self._find_head_top(meta)
+
+        if top_y is None:
+            top_y = self._find_pose_top(meta)
+
+        if top_y is None:
+            return None
+
+        length = float(anchor_y) - float(top_y)
+
+        if length <= 1e-6:
+            return None
+
+        return length
 
     def _centre_pose(self, meta, width):
         bbox = self._collect_pose_bounds(meta)
