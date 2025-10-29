@@ -2778,6 +2778,7 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
             return (None, None, None)
 
         head_delta = None
+        head_pad_px = None
         if auto_head_to_padding and head_padding_active:
             head_pad_px = self._resolve_padding(
                 head_padding,
@@ -2849,6 +2850,7 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
             self._restore_locked_feet(meta, locked_feet)
 
         foot_delta = None
+        locked_feet_after_translation = None
         if auto_feet_to_padding and foot_padding_active:
             foot_pad_px = self._resolve_padding(
                 foot_padding,
@@ -2869,7 +2871,41 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
                 delta = float(delta)
                 if abs(delta) > 1e-6:
                     self._translate_pose(meta, 0.0, delta, width, height)
+                    locked_feet_after_translation = self._capture_foot_positions(meta)
                 foot_delta = delta
+
+        anchor_feet = locked_feet_after_translation or locked_feet
+
+        if auto_head_to_padding and head_padding_active and head_pad_px is not None:
+            top_y_after = self._find_head_top(meta)
+            if top_y_after is None:
+                top_y_after = self._find_pose_top(meta)
+
+            if top_y_after is not None:
+                extra_delta = float(head_pad_px) - float(top_y_after)
+                if abs(extra_delta) > 1e-6:
+                    hip_pairs_extra = self._offset_upper_body(meta, extra_delta)
+                    if hip_pairs_extra:
+                        if hip_pairs:
+                            for hip_idx, (_, after) in hip_pairs_extra.items():
+                                if hip_idx in hip_pairs:
+                                    hip_pairs[hip_idx] = (
+                                        hip_pairs[hip_idx][0],
+                                        after,
+                                    )
+                                else:
+                                    hip_pairs[hip_idx] = hip_pairs_extra[hip_idx]
+                        else:
+                            hip_pairs.update(hip_pairs_extra)
+
+                        self._stretch_legs_to_hips(
+                            meta,
+                            hip_pairs_extra,
+                            anchor_feet,
+                        )
+
+                    if anchor_feet:
+                        self._restore_locked_feet(meta, anchor_feet)
 
         if center_horizontally:
             self._centre_pose(meta, width)
@@ -2882,6 +2918,172 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
             head_delta,
             foot_delta,
         )
+
+
+class PoseDataEditorAutoPositioning(
+    PoseDataEditorAutomaticOnlyTorsoHeadOffset
+):
+    """Automatically lifts poses so the head rests at the requested padding."""
+
+    DEFAULT_DURATION_SECONDS = 5.0
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        parent = PoseDataEditorAutomaticOnlyTorsoHeadOffset.INPUT_TYPES()
+        parent_required = parent["required"]
+
+        return {
+            "required": {
+                "pose_data": parent_required["pose_data"],
+                "head_padding": parent_required["head_padding"],
+                "head_padding_normalized": parent_required["head_padding_normalized"],
+                "head_padding_allow_overflow": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Allow the automatic offset to move the head above the canvas "
+                            "when the requested padding would otherwise clamp inside the frame."
+                        ),
+                    },
+                ),
+                "padding_active_seconds": (
+                    "FLOAT",
+                    {
+                        "default": cls.DEFAULT_DURATION_SECONDS,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long to keep nudging the pose toward the requested padding "
+                            "before leaving it in place. Use 0 to keep it active for the whole clip."
+                        ),
+                    },
+                ),
+                "center_horizontally": parent_required["center_horizontally"],
+                "limit_to_canvas": parent_required["limit_to_canvas"],
+                "fps": (
+                    "INT",
+                    {
+                        "default": 24,
+                        "min": 1,
+                        "max": 960,
+                        "step": 1,
+                        "tooltip": (
+                            "Frames per second of the input clip. Durations are converted into "
+                            "frame counts using this value."
+                        ),
+                    },
+                ),
+                "person_index": parent_required["person_index"],
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+
+    def process(
+        self,
+        pose_data,
+        head_padding,
+        head_padding_normalized,
+        head_padding_allow_overflow,
+        padding_active_seconds,
+        center_horizontally,
+        limit_to_canvas,
+        fps,
+        person_index,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        fps = int(max(1, fps))
+        active_threshold = self._seconds_to_frames(padding_active_seconds, fps)
+        if active_threshold == 0:
+            active_threshold = None
+
+        active_frames = {}
+
+        for idx, meta in enumerate(pose_metas):
+            if person_index >= 0 and idx != person_index:
+                continue
+
+            used_frames = active_frames.get(idx, 0)
+            head_active = active_threshold is None or used_frames < active_threshold
+
+            self._align_head_only(
+                meta,
+                head_padding,
+                head_padding_normalized,
+                head_padding_allow_overflow,
+                center_horizontally,
+                limit_to_canvas,
+                head_active,
+            )
+
+            if head_active and active_threshold is not None:
+                active_frames[idx] = used_frames + 1
+
+        return (pose_data_copy,)
+
+    @staticmethod
+    def _seconds_to_frames(seconds, fps):
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return 0
+
+        if seconds <= 0.0:
+            return 0
+
+        return max(1, int(round(float(fps) * seconds)))
+
+    def _align_head_only(
+        self,
+        meta,
+        head_padding,
+        head_padding_normalized,
+        head_padding_allow_overflow,
+        center_horizontally,
+        limit_to_canvas,
+        head_active,
+    ):
+        width = getattr(meta, "width", None)
+        height = getattr(meta, "height", None)
+
+        if width in (None, 0) or height in (None, 0):
+            return
+
+        head_pad_px = self._resolve_padding(
+            head_padding,
+            head_padding_normalized,
+            height,
+        )
+        if head_padding_allow_overflow:
+            head_pad_px = float(head_pad_px)
+        else:
+            head_pad_px = float(np.clip(head_pad_px, 0.0, float(height)))
+
+        if head_active:
+            top_y = self._find_head_top(meta)
+            if top_y is None:
+                top_y = self._find_pose_top(meta)
+
+            if top_y is not None:
+                delta = float(head_pad_px) - float(top_y)
+                if abs(delta) > 1e-6:
+                    self._translate_pose(meta, 0.0, delta, width, height)
+
+        if center_horizontally:
+            self._centre_pose(meta, width)
+
+        if limit_to_canvas:
+            self._clamp_pose(meta, width, height)
 
     def _estimate_offset_from_scale(self, hip_coords, body, locked_feet, locked_scale):
         offsets = []
@@ -3431,6 +3633,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditor": PoseDataEditor,
     "PoseDataEditorCutter": PoseDataEditorCutter,
     "PoseDataEditorAutomatic": PoseDataEditorAutomatic,
+    "PoseDataEditorAutoPositioning": PoseDataEditorAutoPositioning,
     "PoseDataEditorAutomaticV2": PoseDataEditorAutomaticV2,
     "PoseDataEditorAutomaticV3": PoseDataEditorAutomaticV3,
     "PoseDataEditorAutomaticV4": PoseDataEditorAutomaticV4,
@@ -3446,6 +3649,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditor": "Pose Data Editor",
     "PoseDataEditorCutter": "Pose Data Editor Cutter",
     "PoseDataEditorAutomatic": "Pose Data Editor Automatic",
+    "PoseDataEditorAutoPositioning": "Pose Data Editor Auto-Positioning",
     "PoseDataEditorAutomaticV2": "Pose Data Editor Automatic V2",
     "PoseDataEditorAutomaticV3": "Pose Data Editor Automatic V3",
     "PoseDataEditorAutomaticV4": "Pose Data Editor Automatic V4",
