@@ -1551,6 +1551,81 @@ class PoseDataEditorAutomatic:
         else:
             arr[idx] = [x, y]
 
+
+class PoseDataEditorAutomaticV2(PoseDataEditorAutomatic):
+    """Canvas-aware variant of the automatic pose editor."""
+
+    DESCRIPTION = (
+        "Automatically aligns detected poses to the canvas while ensuring leg scaling "
+        "respects the configured padding in every mode."
+    )
+
+    def _adjust_leg_length(
+        self,
+        meta,
+        foot_padding_px,
+        width,
+        height,
+        leg_mode,
+        scale_legs,
+        torso_head_multiple,
+    ):
+        anchor_y = self._compute_leg_anchor(meta)
+        if anchor_y is None:
+            return
+
+        bottom_y = self._find_leg_bottom(meta)
+        if bottom_y is None:
+            return
+
+        span = bottom_y - anchor_y
+        if span <= 1e-6:
+            return
+
+        mode_key = (leg_mode or "").strip().lower()
+
+        target_floor = float(height) - float(foot_padding_px)
+        target_floor = float(np.clip(target_floor, 0.0, float(height)))
+        available_downward = target_floor - anchor_y
+
+        if mode_key == "normal":
+            multiplier = max(float(scale_legs), 0.0)
+            if multiplier <= 0.0:
+                return
+            scale = multiplier
+        elif mode_key == "relative":
+            upper_length = self._compute_upper_body_length(meta, anchor_y)
+            if upper_length is None or upper_length <= 1e-6:
+                return
+            multiplier = max(float(torso_head_multiple), 0.0)
+            if multiplier <= 0.0:
+                return
+            desired_span = upper_length * multiplier
+            if desired_span <= 1e-6:
+                return
+            scale = desired_span / span
+        else:
+            if available_downward <= 1e-6:
+                return
+            scale = available_downward / span
+
+        if not np.isfinite(scale) or scale <= 0.0:
+            return
+
+        if mode_key != "bottom":
+            if available_downward <= 1e-6:
+                if scale >= 1.0:
+                    return
+            else:
+                max_scale = available_downward / span
+                if max_scale <= 0.0:
+                    if scale >= 1.0:
+                        return
+                elif scale > max_scale:
+                    scale = max_scale
+
+        self._scale_leg_points(meta, anchor_y, scale)
+
     def _resolve_reference_list(self, supplied_reference, pose_data_copy):
         if supplied_reference not in (None,):
             if isinstance(supplied_reference, dict):
@@ -1766,6 +1841,583 @@ class PoseDataEditorAutomatic:
             for idx, (x, y) in enumerate(transformed):
                 points[idx][0] = float(x)
                 points[idx][1] = float(y)
+
+
+class PoseDataEditorAutomaticV3(PoseDataEditorAutomaticV2):
+    """Extends the canvas-aware editor with post-scale foot alignment."""
+
+    DESCRIPTION = (
+        "Aligns poses like Automatic V2 while pushing the body down when manual or "
+        "relative leg scaling leaves extra space above the foot padding."
+    )
+
+    def _auto_align_meta(
+        self,
+        meta,
+        leg_mode,
+        scale_legs,
+        torso_head_multiple,
+        head_padding,
+        head_padding_normalized,
+        foot_padding,
+        foot_padding_normalized,
+        center_horizontally,
+        limit_to_canvas,
+    ):
+        width = getattr(meta, "width", None)
+        height = getattr(meta, "height", None)
+
+        if width in (None, 0) or height in (None, 0):
+            return
+
+        head_pad_px = self._resolve_padding(head_padding, head_padding_normalized, height)
+        foot_pad_px = self._resolve_padding(foot_padding, foot_padding_normalized, height)
+
+        head_pad_px = float(np.clip(head_pad_px, 0.0, float(height)))
+        foot_pad_px = float(np.clip(foot_pad_px, 0.0, float(height)))
+
+        self._translate_head_to_padding(meta, head_pad_px, width, height)
+        self._adjust_leg_length(
+            meta,
+            foot_pad_px,
+            width,
+            height,
+            leg_mode,
+            scale_legs,
+            torso_head_multiple,
+        )
+
+        if leg_mode in ("normal", "relative"):
+            self._shift_pose_to_foot_padding(meta, foot_pad_px, width, height)
+
+        if center_horizontally:
+            self._centre_pose(meta, width)
+
+        if limit_to_canvas:
+            self._clamp_pose(meta, width, height)
+
+    def _shift_pose_to_foot_padding(self, meta, foot_padding_px, width, height):
+        bottom_y = self._find_leg_bottom(meta)
+        if bottom_y is None:
+            return
+
+        target_floor = float(height) - float(foot_padding_px)
+        target_floor = float(np.clip(target_floor, 0.0, float(height)))
+
+        delta = target_floor - float(bottom_y)
+        if delta <= 1e-6:
+            return
+
+        self._translate_pose(meta, 0.0, delta, width, height)
+
+
+class PoseDataEditorAutomaticV4(PoseDataEditorAutomaticV3):
+    """Adds an upper-body offset leg mode to the automatic alignment workflow."""
+
+    DESCRIPTION = (
+        "Extends Automatic V3 with an 'Only Offset From Torso to Head' option that "
+        "shifts the upper body by a configurable amount before stretching the legs "
+        "to reconnect to the feet."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = copy.deepcopy(super().INPUT_TYPES())
+        required = inputs.get("required", {})
+
+        ordered = {}
+        for key, value in required.items():
+            ordered[key] = value
+            if key == "scale_legs_relative_to_body":
+                ordered["offset_upper_body_only"] = (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Enable the 'Only Offset From Torso to Head' leg mode. "
+                            "Moves the upper body without translating the feet."
+                        ),
+                    },
+                )
+                ordered["upper_body_offset"] = (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": -2048.0,
+                        "max": 2048.0,
+                        "step": 0.001,
+                        "tooltip": (
+                            "Amount to raise the torso-to-head segment when the offset "
+                            "mode is selected."
+                        ),
+                    },
+                )
+                ordered["upper_body_offset_normalized"] = (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Interpret the upper-body offset as a 0-1 ratio of the "
+                            "canvas height instead of pixels."
+                        ),
+                    },
+                )
+
+        inputs["required"] = ordered
+        return inputs
+
+    def process(
+        self,
+        pose_data,
+        scale_legs_to_bottom,
+        scale_legs_normal,
+        scale_legs_relative_to_body,
+        offset_upper_body_only,
+        upper_body_offset,
+        upper_body_offset_normalized,
+        scale_legs,
+        torso_head_multiple,
+        head_padding,
+        head_padding_normalized,
+        foot_padding,
+        foot_padding_normalized,
+        center_horizontally,
+        limit_to_canvas,
+        person_index,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        leg_mode = self._select_leg_mode(
+            scale_legs_to_bottom,
+            scale_legs_normal,
+            scale_legs_relative_to_body,
+            offset_upper_body_only,
+        )
+
+        for idx, meta in enumerate(pose_metas):
+            if person_index >= 0 and idx != person_index:
+                continue
+
+            self._auto_align_meta(
+                meta,
+                leg_mode,
+                scale_legs,
+                torso_head_multiple,
+                head_padding,
+                head_padding_normalized,
+                foot_padding,
+                foot_padding_normalized,
+                center_horizontally,
+                limit_to_canvas,
+                upper_body_offset,
+                upper_body_offset_normalized,
+            )
+
+        return (pose_data_copy,)
+
+    def _select_leg_mode(
+        self,
+        scale_legs_to_bottom,
+        scale_legs_normal,
+        scale_legs_relative_to_body,
+        offset_upper_body_only,
+    ):
+        selection = [
+            bool(scale_legs_to_bottom),
+            bool(scale_legs_normal),
+            bool(scale_legs_relative_to_body),
+            bool(offset_upper_body_only),
+        ]
+
+        if sum(selection) != 1:
+            raise ValueError(
+                "PoseDataEditorAutomatic V4 requires exactly one leg option to be enabled."
+            )
+
+        if offset_upper_body_only:
+            return "offset"
+
+        if scale_legs_to_bottom:
+            return "bottom"
+
+        if scale_legs_normal:
+            return "normal"
+
+        return "relative"
+
+    def _auto_align_meta(
+        self,
+        meta,
+        leg_mode,
+        scale_legs,
+        torso_head_multiple,
+        head_padding,
+        head_padding_normalized,
+        foot_padding,
+        foot_padding_normalized,
+        center_horizontally,
+        limit_to_canvas,
+        upper_body_offset,
+        upper_body_offset_normalized,
+    ):
+        if leg_mode != "offset":
+            super()._auto_align_meta(
+                meta,
+                leg_mode,
+                scale_legs,
+                torso_head_multiple,
+                head_padding,
+                head_padding_normalized,
+                foot_padding,
+                foot_padding_normalized,
+                center_horizontally,
+                limit_to_canvas,
+            )
+            return
+
+        width = getattr(meta, "width", None)
+        height = getattr(meta, "height", None)
+
+        if width in (None, 0) or height in (None, 0):
+            return
+
+        head_pad_px = self._resolve_padding(head_padding, head_padding_normalized, height)
+        head_pad_px = float(np.clip(head_pad_px, 0.0, float(height)))
+
+        self._translate_head_to_padding(meta, head_pad_px, width, height)
+
+        locked_feet = self._capture_foot_positions(meta)
+
+        offset_px = self._resolve_padding(
+            upper_body_offset,
+            upper_body_offset_normalized,
+            height,
+        )
+        offset_px = float(np.clip(offset_px, -float(height), float(height)))
+
+        hip_pairs = self._offset_upper_body(meta, offset_px)
+
+        if hip_pairs:
+            self._stretch_legs_to_hips(meta, hip_pairs, locked_feet)
+
+        if locked_feet:
+            self._restore_locked_feet(meta, locked_feet)
+
+        if center_horizontally:
+            self._centre_pose(meta, width)
+
+        if limit_to_canvas:
+            self._clamp_pose(meta, width, height)
+
+    def _offset_upper_body(self, meta, offset_px):
+        if abs(offset_px) <= 1e-6:
+            return {}
+
+        body = getattr(meta, "kps_body", None)
+        hip_info = {}
+
+        if body is None:
+            return hip_info
+
+        hip_indices = set(self.HIP_INDICES)
+        leg_indices = set(self.LEG_INDICES + self.FOOT_INDICES)
+
+        for hip_idx in hip_indices:
+            if hip_idx >= len(body):
+                continue
+            coords = self._extract_coords(body[hip_idx])
+            if coords is None:
+                continue
+            hip_info[hip_idx] = (
+                np.array(coords, dtype=np.float32),
+                None,
+            )
+
+        for idx in range(len(body)):
+            coords = self._extract_coords(body[idx])
+            if coords is None:
+                continue
+
+            if idx in leg_indices and idx not in hip_indices:
+                continue
+
+            new_x = coords[0]
+            new_y = coords[1] - offset_px
+            self._assign_point(body, idx, new_x, new_y)
+
+        for hip_idx in list(hip_info.keys()):
+            coords = self._extract_coords(body[hip_idx])
+            if coords is None:
+                hip_info.pop(hip_idx, None)
+                continue
+            hip_info[hip_idx] = (
+                hip_info[hip_idx][0],
+                np.array(coords, dtype=np.float32),
+            )
+
+        for arr_name in ("kps_lhand", "kps_rhand", "kps_face"):
+            arr = getattr(meta, arr_name, None)
+            if arr is None:
+                continue
+
+            for idx in range(len(arr)):
+                coords = self._extract_coords(arr[idx])
+                if coords is None:
+                    continue
+
+                new_x = coords[0]
+                new_y = coords[1] - offset_px
+                self._assign_point(arr, idx, new_x, new_y)
+
+        hip_pairs = {}
+        for hip_idx, (before, after) in hip_info.items():
+            if after is None:
+                continue
+            if np.any(~np.isfinite(before)) or np.any(~np.isfinite(after)):
+                continue
+            hip_pairs[hip_idx] = (before, after)
+
+        return hip_pairs
+
+    def _capture_foot_positions(self, meta):
+        body = getattr(meta, "kps_body", None)
+        if body is None:
+            return {}
+
+        locked = {}
+        for foot_idx in self.FOOT_INDICES:
+            if foot_idx >= len(body):
+                continue
+            coords = self._extract_coords(body[foot_idx])
+            if coords is None:
+                continue
+            locked[foot_idx] = np.array(coords, dtype=np.float32)
+
+        return locked
+
+    def _restore_locked_feet(self, meta, locked_feet):
+        if not locked_feet:
+            return
+
+        body = getattr(meta, "kps_body", None)
+        if body is None:
+            return
+
+        for foot_idx, coords in locked_feet.items():
+            if foot_idx >= len(body):
+                continue
+            if coords is None or not np.all(np.isfinite(coords)):
+                continue
+            self._assign_point(body, foot_idx, float(coords[0]), float(coords[1]))
+
+    def _stretch_legs_to_hips(self, meta, hip_pairs, locked_feet=None):
+        if not hip_pairs:
+            return
+
+        body = getattr(meta, "kps_body", None)
+        if body is None:
+            return
+
+        leg_map = {
+            8: (9, 10),
+            11: (12, 13),
+        }
+
+        for hip_idx, (before, after) in hip_pairs.items():
+            if hip_idx not in leg_map:
+                continue
+
+            knee_idx, ankle_idx = leg_map[hip_idx]
+
+            if ankle_idx >= len(body):
+                continue
+
+            if locked_feet and ankle_idx in locked_feet:
+                foot_coords = locked_feet[ankle_idx]
+            else:
+                foot_coords = self._extract_coords(body[ankle_idx])
+
+            if foot_coords is None:
+                continue
+
+            foot_coords = np.array(foot_coords, dtype=np.float32)
+            foot_vec_before = before - foot_coords
+            foot_vec_after = after - foot_coords
+
+            if np.linalg.norm(foot_vec_before) <= 1e-6:
+                continue
+
+            if np.linalg.norm(foot_vec_after) <= 1e-6:
+                continue
+
+            self._assign_point(
+                body,
+                hip_idx,
+                float(after[0]),
+                float(after[1]),
+            )
+
+            if knee_idx < len(body):
+                knee_coords = self._extract_coords(body[knee_idx])
+                if knee_coords is not None:
+                    ratio = self._project_ratio(
+                        np.array(knee_coords, dtype=np.float32),
+                        foot_coords,
+                        before,
+                    )
+                    if ratio is not None:
+                        ratio = float(np.clip(ratio, 0.0, 1.0))
+                        new_pos = foot_coords + foot_vec_after * ratio
+                        self._assign_point(
+                            body,
+                            knee_idx,
+                            float(new_pos[0]),
+                            float(new_pos[1]),
+                        )
+
+    def _project_ratio(self, point, foot, hip_before):
+        segment = hip_before - foot
+        length_sq = float(np.dot(segment, segment))
+        if length_sq <= 1e-6:
+            return None
+
+        vector = point - foot
+        return float(np.dot(vector, segment) / length_sq)
+
+
+class PoseDataEditorAutomaticOnlyTorsoHeadOffset(PoseDataEditorAutomaticV4):
+    """Provides the torso-to-head offset workflow as a dedicated node."""
+
+    DESCRIPTION = (
+        "Moves the upper body by a specified offset while keeping the feet planted. "
+        "Automatically stretches the legs so the knees and hips reconnect after the "
+        "shift, optionally recentring and clamping the pose to the canvas."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "upper_body_offset": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": -2048.0,
+                        "max": 2048.0,
+                        "step": 0.001,
+                        "tooltip": (
+                            "Amount to raise (+) or lower (-) the torso-to-head segment "
+                            "before legs are stretched to meet the hips."
+                        ),
+                    },
+                ),
+                "upper_body_offset_normalized": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Interpret the upper-body offset as a 0-1 ratio of the canvas "
+                            "height instead of raw pixels."
+                        ),
+                    },
+                ),
+                "head_padding": (
+                    "FLOAT",
+                    {
+                        "default": 0.02,
+                        "min": 0.0,
+                        "max": 2048.0,
+                        "step": 0.001,
+                        "tooltip": (
+                            "Distance to keep between the adjusted head points and the top "
+                            "edge of the canvas before applying the offset."
+                        ),
+                    },
+                ),
+                "head_padding_normalized": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Interpret the head padding as a 0-1 ratio of the canvas height "
+                            "instead of raw pixels."
+                        ),
+                    },
+                ),
+                "center_horizontally": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "When enabled, horizontally centre the pose after applying the offset.",
+                    },
+                ),
+                "limit_to_canvas": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Clamp all keypoints to the canvas bounds after adjustments are applied.",
+                    },
+                ),
+                "person_index": (
+                    "INT",
+                    {
+                        "default": -1,
+                        "min": -1,
+                        "max": 9999,
+                        "step": 1,
+                        "tooltip": "When >= 0, only process the matching pose entry. Use -1 to process every pose.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+
+    def process(
+        self,
+        pose_data,
+        upper_body_offset,
+        upper_body_offset_normalized,
+        head_padding,
+        head_padding_normalized,
+        center_horizontally,
+        limit_to_canvas,
+        person_index,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        for idx, meta in enumerate(pose_metas):
+            if person_index >= 0 and idx != person_index:
+                continue
+
+            self._auto_align_meta(
+                meta,
+                "offset",
+                1.0,
+                1.0,
+                head_padding,
+                head_padding_normalized,
+                0.0,
+                True,
+                center_horizontally,
+                limit_to_canvas,
+                upper_body_offset,
+                upper_body_offset_normalized,
+            )
+
+        return (pose_data_copy,)
 
 
 class PoseDataEditorCutter:
@@ -2239,6 +2891,10 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditor": PoseDataEditor,
     "PoseDataEditorCutter": PoseDataEditorCutter,
     "PoseDataEditorAutomatic": PoseDataEditorAutomatic,
+    "PoseDataEditorAutomaticV2": PoseDataEditorAutomaticV2,
+    "PoseDataEditorAutomaticV3": PoseDataEditorAutomaticV3,
+    "PoseDataEditorAutomaticV4": PoseDataEditorAutomaticV4,
+    "PoseDataEditorAutomaticOnlyTorsoHeadOffset": PoseDataEditorAutomaticOnlyTorsoHeadOffset,
     "PoseDataPostProcessor": PoseDataPostProcessor,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
 }
@@ -2249,6 +2905,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditor": "Pose Data Editor",
     "PoseDataEditorCutter": "Pose Data Editor Cutter",
     "PoseDataEditorAutomatic": "Pose Data Editor Automatic",
+    "PoseDataEditorAutomaticV2": "Pose Data Editor Automatic V2",
+    "PoseDataEditorAutomaticV3": "Pose Data Editor Automatic V3",
+    "PoseDataEditorAutomaticV4": "Pose Data Editor Automatic V4",
+    "PoseDataEditorAutomaticOnlyTorsoHeadOffset": "Pose Data Editor Automatic Only Torso-to-Head Offset",
     "PoseDataPostProcessor": "Pose Data Post-Processor",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
 }
