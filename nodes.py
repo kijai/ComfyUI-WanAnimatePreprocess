@@ -2469,6 +2469,20 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
                 ),
             },
         )
+        required["head_padding_active_seconds"] = (
+            "FLOAT",
+            {
+                "default": 0.0,
+                "min": 0.0,
+                "max": 3600.0,
+                "step": 0.01,
+                "tooltip": (
+                    "How long to keep applying the automatic head padding before"
+                    " disabling the translation entirely. Use 0 to keep it active"
+                    " for the full clip."
+                ),
+            },
+        )
         required["head_padding_allow_overflow"] = (
             "BOOLEAN",
             {
@@ -2525,6 +2539,20 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
                 ),
             },
         )
+        required["foot_padding_active_seconds"] = (
+            "FLOAT",
+            {
+                "default": 0.0,
+                "min": 0.0,
+                "max": 3600.0,
+                "step": 0.01,
+                "tooltip": (
+                    "How long to keep applying the automatic foot padding before"
+                    " disabling the translation entirely. Use 0 to keep it active"
+                    " for the full clip."
+                ),
+            },
+        )
         required["foot_auto_duration_seconds"] = (
             "FLOAT",
             {
@@ -2566,11 +2594,13 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
         head_padding,
         head_padding_normalized,
         auto_head_to_padding,
+        head_padding_active_seconds,
         head_padding_allow_overflow,
         head_auto_duration_seconds,
         auto_feet_to_padding,
         foot_padding,
         foot_padding_normalized,
+        foot_padding_active_seconds,
         foot_auto_duration_seconds,
         center_horizontally,
         limit_to_canvas,
@@ -2590,11 +2620,25 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
             if auto_head_to_padding
             else None
         )
+        head_active_threshold = (
+            self._seconds_to_frames(head_padding_active_seconds, fps)
+            if auto_head_to_padding
+            else None
+        )
+        if head_active_threshold == 0:
+            head_active_threshold = None
         foot_threshold = (
             self._seconds_to_frames(foot_auto_duration_seconds, fps)
             if auto_feet_to_padding
             else None
         )
+        foot_active_threshold = (
+            self._seconds_to_frames(foot_padding_active_seconds, fps)
+            if auto_feet_to_padding
+            else None
+        )
+        if foot_active_threshold == 0:
+            foot_active_threshold = None
 
         locked_scale = None
         locked_head_delta = None
@@ -2602,10 +2646,19 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
         adaptive_scale_frames = 0
         adaptive_head_frames = 0
         adaptive_foot_frames = 0
+        head_active_frames = 0
+        foot_active_frames = 0
 
         for idx, meta in enumerate(pose_metas):
             if person_index >= 0 and idx != person_index:
                 continue
+
+            head_active = auto_head_to_padding and (
+                head_active_threshold is None or head_active_frames < head_active_threshold
+            )
+            foot_active = auto_feet_to_padding and (
+                foot_active_threshold is None or foot_active_frames < foot_active_threshold
+            )
 
             use_locked_scale = (
                 locked_scale is not None
@@ -2614,6 +2667,7 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
 
             use_locked_head = (
                 auto_head_to_padding
+                and head_active
                 and locked_head_delta is not None
                 and (
                     head_threshold == 0
@@ -2626,6 +2680,7 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
 
             use_locked_feet = (
                 auto_feet_to_padding
+                and foot_active
                 and locked_foot_delta is not None
                 and (
                     foot_threshold == 0
@@ -2641,6 +2696,7 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
                 head_padding,
                 head_padding_normalized,
                 auto_head_to_padding,
+                head_active,
                 head_padding_allow_overflow,
                 center_horizontally,
                 limit_to_canvas,
@@ -2651,6 +2707,7 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
                 auto_feet_to_padding,
                 foot_padding,
                 foot_padding_normalized,
+                foot_active,
                 locked_foot_delta if use_locked_feet else None,
             )
 
@@ -2663,15 +2720,21 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
                 ):
                     locked_scale = float(scale_used)
 
-            if auto_head_to_padding and not use_locked_head:
+            if auto_head_to_padding and head_active and not use_locked_head:
                 adaptive_head_frames += 1
                 if head_delta is not None and np.isfinite(head_delta):
                     locked_head_delta = float(head_delta)
 
-            if auto_feet_to_padding and not use_locked_feet:
+            if auto_feet_to_padding and foot_active and not use_locked_feet:
                 adaptive_foot_frames += 1
                 if foot_delta is not None and np.isfinite(foot_delta):
                     locked_foot_delta = float(foot_delta)
+
+            if auto_head_to_padding and head_active_threshold is not None and head_active:
+                head_active_frames += 1
+
+            if auto_feet_to_padding and foot_active_threshold is not None and foot_active:
+                foot_active_frames += 1
 
         return (pose_data_copy,)
 
@@ -2694,6 +2757,7 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
         head_padding,
         head_padding_normalized,
         auto_head_to_padding,
+        head_padding_active,
         head_padding_allow_overflow,
         center_horizontally,
         limit_to_canvas,
@@ -2704,6 +2768,7 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
         auto_feet_to_padding,
         foot_padding,
         foot_padding_normalized,
+        foot_padding_active,
         locked_foot_delta,
     ):
         width = getattr(meta, "width", None)
@@ -2713,7 +2778,7 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
             return (None, None, None)
 
         head_delta = None
-        if auto_head_to_padding:
+        if auto_head_to_padding and head_padding_active:
             head_pad_px = self._resolve_padding(
                 head_padding,
                 head_padding_normalized,
@@ -2784,7 +2849,7 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
             self._restore_locked_feet(meta, locked_feet)
 
         foot_delta = None
-        if auto_feet_to_padding:
+        if auto_feet_to_padding and foot_padding_active:
             foot_pad_px = self._resolve_padding(
                 foot_padding,
                 foot_padding_normalized,
