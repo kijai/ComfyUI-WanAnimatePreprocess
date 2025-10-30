@@ -2349,14 +2349,17 @@ class PoseDataEditorAutomaticV5(PoseDataEditorAutomaticV4):
                     },
                 )
             if key == "limit_to_canvas":
-                ordered["lock_scale_after_duration"] = (
-                    "BOOLEAN",
+                ordered["activate_lock_scale_after_seconds"] = (
+                    "FLOAT",
                     {
-                        "default": True,
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
                         "tooltip": (
-                            "When enabled, reuse the last measured leg scale once the "
-                            "duration expires so further frames keep the same stretch "
-                            "even if it exceeds the canvas."
+                            "Time in seconds before the current leg scale is frozen. Set "
+                            "to 0 to keep adapting for the full clip. Applies to all "
+                            "leg scaling modes."
                         ),
                     },
                 )
@@ -2407,7 +2410,7 @@ class PoseDataEditorAutomaticV5(PoseDataEditorAutomaticV4):
         foot_padding_active_seconds,
         center_horizontally,
         limit_to_canvas,
-        lock_scale_after_duration,
+        activate_lock_scale_after_seconds,
         dont_offset_feet,
         fps,
         person_index,
@@ -2426,6 +2429,13 @@ class PoseDataEditorAutomaticV5(PoseDataEditorAutomaticV4):
         )
 
         fps_int = max(1, int(round(float(fps))))
+
+        lock_threshold = self._seconds_to_frames(
+            activate_lock_scale_after_seconds,
+            fps_int,
+        )
+        if lock_threshold == 0:
+            lock_threshold = None
 
         bottom_threshold = None
         if leg_mode == "bottom":
@@ -2453,6 +2463,7 @@ class PoseDataEditorAutomaticV5(PoseDataEditorAutomaticV4):
         bottom_frames = 0
         head_frames = 0
         foot_frames = 0
+        lock_frames = 0
         locked_scale = None
 
         for idx, meta in enumerate(pose_metas):
@@ -2460,20 +2471,22 @@ class PoseDataEditorAutomaticV5(PoseDataEditorAutomaticV4):
                 continue
 
             bottom_active = True
-            use_locked_scale = False
             allow_leg_adjustment = True
 
             if leg_mode == "bottom":
                 bottom_active = (
                     bottom_threshold is None or bottom_frames < bottom_threshold
                 )
-                use_locked_scale = (
-                    lock_scale_after_duration
-                    and bottom_threshold is not None
-                    and locked_scale is not None
-                    and not bottom_active
-                )
-                allow_leg_adjustment = bottom_active or use_locked_scale
+                allow_leg_adjustment = bottom_active
+
+            use_locked_scale = (
+                lock_threshold is not None
+                and lock_frames >= lock_threshold
+                and locked_scale is not None
+            )
+
+            if leg_mode == "bottom":
+                allow_leg_adjustment = allow_leg_adjustment or use_locked_scale
 
             head_active = head_threshold is None or head_frames < head_threshold
             foot_active = foot_threshold is None or foot_frames < foot_threshold
@@ -2490,8 +2503,7 @@ class PoseDataEditorAutomaticV5(PoseDataEditorAutomaticV4):
                 foot_padding_normalized,
                 foot_active,
                 center_horizontally,
-                limit_to_canvas
-                and not (lock_scale_after_duration and use_locked_scale),
+                limit_to_canvas and not use_locked_scale,
                 dont_offset_feet,
                 upper_body_offset,
                 upper_body_offset_normalized,
@@ -2502,12 +2514,6 @@ class PoseDataEditorAutomaticV5(PoseDataEditorAutomaticV4):
             if leg_mode == "bottom":
                 if bottom_active:
                     bottom_frames += 1
-                    if (
-                        scale_used is not None
-                        and np.isfinite(scale_used)
-                        and scale_used > 0.0
-                    ):
-                        locked_scale = float(scale_used)
                 elif use_locked_scale:
                     bottom_frames += 1
                 elif bottom_threshold is not None and bottom_frames < bottom_threshold:
@@ -2518,6 +2524,25 @@ class PoseDataEditorAutomaticV5(PoseDataEditorAutomaticV4):
 
             if foot_threshold is not None and foot_active:
                 foot_frames += 1
+
+            if lock_threshold is not None:
+                if lock_frames < lock_threshold:
+                    lock_frames += 1
+                    if (
+                        scale_used is not None
+                        and np.isfinite(scale_used)
+                        and scale_used > 0.0
+                    ):
+                        locked_scale = float(scale_used)
+                elif use_locked_scale:
+                    lock_frames += 1
+                elif (
+                    locked_scale is None
+                    and scale_used is not None
+                    and np.isfinite(scale_used)
+                    and scale_used > 0.0
+                ):
+                    locked_scale = float(scale_used)
 
         return (pose_data_copy,)
 
