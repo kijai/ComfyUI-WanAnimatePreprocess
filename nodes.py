@@ -2289,6 +2289,421 @@ class PoseDataEditorAutomaticV4(PoseDataEditorAutomaticV3):
         return float(np.dot(vector, segment) / length_sq)
 
 
+class PoseDataEditorAutomaticV5(PoseDataEditorAutomaticV4):
+    """Extends Automatic V4 with timed scaling, padding, and foot-lock options."""
+
+    DESCRIPTION = (
+        "Adds per-feature durations, FPS-driven scale locking, and an option to keep "
+        "feet anchored while the upper body is shifted before stretching the legs."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = copy.deepcopy(super().INPUT_TYPES())
+        required = inputs.get("required", {})
+
+        ordered = {}
+        for key, value in required.items():
+            ordered[key] = value
+            if key == "scale_legs_to_bottom":
+                ordered["scale_legs_to_bottom_active_seconds"] = (
+                    "FLOAT",
+                    {
+                        "default": 5.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Duration in seconds to keep adapting the stretch-to-bottom "
+                            "leg mode before reusing the captured scale. Use 0 for no "
+                            "time limit."
+                        ),
+                    },
+                )
+            if key == "head_padding_normalized":
+                ordered["head_padding_active_seconds"] = (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long the automatic head padding adjustments remain "
+                            "active. Use 0 to keep them enabled for the whole clip."
+                        ),
+                    },
+                )
+            if key == "foot_padding_normalized":
+                ordered["foot_padding_active_seconds"] = (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long the automatic foot padding adjustments remain "
+                            "active. Use 0 to keep them enabled for the whole clip."
+                        ),
+                    },
+                )
+            if key == "limit_to_canvas":
+                ordered["lock_scale_after_duration"] = (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "When enabled, reuse the last measured leg scale once the "
+                            "duration expires so further frames keep the same stretch "
+                            "even if it exceeds the canvas."
+                        ),
+                    },
+                )
+                ordered["dont_offset_feet"] = (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Keep feet at their original positions while the torso moves "
+                            "so legs stretch to reconnect without translating ankles."
+                        ),
+                    },
+                )
+                ordered["fps"] = (
+                    "INT",
+                    {
+                        "default": 24,
+                        "min": 1,
+                        "max": 960,
+                        "step": 1,
+                        "tooltip": (
+                            "Frames per second of the sequence. Durations are converted "
+                            "to frame counts using this value."
+                        ),
+                    },
+                )
+
+        inputs["required"] = ordered
+        return inputs
+
+    def process(
+        self,
+        pose_data,
+        scale_legs_to_bottom,
+        scale_legs_to_bottom_active_seconds,
+        scale_legs_normal,
+        scale_legs_relative_to_body,
+        offset_upper_body_only,
+        upper_body_offset,
+        upper_body_offset_normalized,
+        scale_legs,
+        torso_head_multiple,
+        head_padding,
+        head_padding_normalized,
+        head_padding_active_seconds,
+        foot_padding,
+        foot_padding_normalized,
+        foot_padding_active_seconds,
+        center_horizontally,
+        limit_to_canvas,
+        lock_scale_after_duration,
+        dont_offset_feet,
+        fps,
+        person_index,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        leg_mode = self._select_leg_mode(
+            scale_legs_to_bottom,
+            scale_legs_normal,
+            scale_legs_relative_to_body,
+            offset_upper_body_only,
+        )
+
+        fps_int = max(1, int(round(float(fps))))
+
+        bottom_threshold = None
+        if leg_mode == "bottom":
+            bottom_threshold = self._seconds_to_frames(
+                scale_legs_to_bottom_active_seconds,
+                fps_int,
+            )
+            if bottom_threshold == 0:
+                bottom_threshold = None
+
+        head_threshold = self._seconds_to_frames(
+            head_padding_active_seconds,
+            fps_int,
+        )
+        if head_threshold == 0:
+            head_threshold = None
+
+        foot_threshold = self._seconds_to_frames(
+            foot_padding_active_seconds,
+            fps_int,
+        )
+        if foot_threshold == 0:
+            foot_threshold = None
+
+        bottom_frames = 0
+        head_frames = 0
+        foot_frames = 0
+        locked_scale = None
+
+        for idx, meta in enumerate(pose_metas):
+            if person_index >= 0 and idx != person_index:
+                continue
+
+            bottom_active = True
+            use_locked_scale = False
+            allow_leg_adjustment = True
+
+            if leg_mode == "bottom":
+                bottom_active = (
+                    bottom_threshold is None or bottom_frames < bottom_threshold
+                )
+                use_locked_scale = (
+                    lock_scale_after_duration
+                    and bottom_threshold is not None
+                    and locked_scale is not None
+                    and not bottom_active
+                )
+                allow_leg_adjustment = bottom_active or use_locked_scale
+
+            head_active = head_threshold is None or head_frames < head_threshold
+            foot_active = foot_threshold is None or foot_frames < foot_threshold
+
+            scale_used = self._auto_align_meta_v5(
+                meta,
+                leg_mode,
+                scale_legs,
+                torso_head_multiple,
+                head_padding,
+                head_padding_normalized,
+                head_active,
+                foot_padding,
+                foot_padding_normalized,
+                foot_active,
+                center_horizontally,
+                limit_to_canvas
+                and not (lock_scale_after_duration and use_locked_scale),
+                dont_offset_feet,
+                upper_body_offset,
+                upper_body_offset_normalized,
+                locked_scale if use_locked_scale else None,
+                allow_leg_adjustment,
+            )
+
+            if leg_mode == "bottom":
+                if bottom_active:
+                    bottom_frames += 1
+                    if (
+                        scale_used is not None
+                        and np.isfinite(scale_used)
+                        and scale_used > 0.0
+                    ):
+                        locked_scale = float(scale_used)
+                elif use_locked_scale:
+                    bottom_frames += 1
+                elif bottom_threshold is not None and bottom_frames < bottom_threshold:
+                    bottom_frames = bottom_threshold
+
+            if head_threshold is not None and head_active:
+                head_frames += 1
+
+            if foot_threshold is not None and foot_active:
+                foot_frames += 1
+
+        return (pose_data_copy,)
+
+    def _auto_align_meta_v5(
+        self,
+        meta,
+        leg_mode,
+        scale_legs,
+        torso_head_multiple,
+        head_padding,
+        head_padding_normalized,
+        head_active,
+        foot_padding,
+        foot_padding_normalized,
+        foot_active,
+        center_horizontally,
+        limit_to_canvas,
+        dont_offset_feet,
+        upper_body_offset,
+        upper_body_offset_normalized,
+        locked_scale,
+        allow_leg_adjustment,
+    ):
+        width = getattr(meta, "width", None)
+        height = getattr(meta, "height", None)
+
+        if width in (None, 0) or height in (None, 0):
+            return None
+
+        mode_key = (leg_mode or "").strip().lower()
+
+        locked_feet = None
+        if dont_offset_feet or mode_key == "offset":
+            locked_feet = self._capture_foot_positions(meta)
+
+        if head_active:
+            head_pad_px = self._resolve_padding(
+                head_padding,
+                head_padding_normalized,
+                height,
+            )
+            head_pad_px = float(np.clip(head_pad_px, 0.0, float(height)))
+            self._translate_head_to_padding(meta, head_pad_px, width, height)
+
+        if mode_key == "offset":
+            offset_px = self._resolve_padding(
+                upper_body_offset,
+                upper_body_offset_normalized,
+                height,
+            )
+            offset_px = float(np.clip(offset_px, -float(height), float(height)))
+
+            hip_pairs = self._offset_upper_body(meta, offset_px)
+
+            if hip_pairs:
+                self._stretch_legs_to_hips(meta, hip_pairs, locked_feet)
+
+            if locked_feet:
+                self._restore_locked_feet(meta, locked_feet)
+
+            if center_horizontally:
+                self._centre_pose(meta, width)
+
+            if limit_to_canvas:
+                self._clamp_pose(meta, width, height)
+
+            return None
+
+        foot_pad_px = self._resolve_padding(
+            foot_padding,
+            foot_padding_normalized,
+            height,
+        )
+        foot_pad_px = float(np.clip(foot_pad_px, 0.0, float(height)))
+
+        scale_used = None
+        if allow_leg_adjustment:
+            scale_used = self._adjust_leg_length_with_lock(
+                meta,
+                foot_pad_px,
+                width,
+                height,
+                mode_key,
+                scale_legs,
+                torso_head_multiple,
+                locked_scale,
+            )
+
+        if dont_offset_feet and locked_feet:
+            self._restore_locked_feet(meta, locked_feet)
+
+        if mode_key in ("normal", "relative") and foot_active and not dont_offset_feet:
+            self._shift_pose_to_foot_padding(meta, foot_pad_px, width, height)
+
+        if center_horizontally:
+            self._centre_pose(meta, width)
+
+        if limit_to_canvas:
+            self._clamp_pose(meta, width, height)
+
+        return scale_used
+
+    def _adjust_leg_length_with_lock(
+        self,
+        meta,
+        foot_padding_px,
+        width,
+        height,
+        leg_mode,
+        scale_legs,
+        torso_head_multiple,
+        locked_scale,
+    ):
+        anchor_y = self._compute_leg_anchor(meta)
+        if anchor_y is None:
+            return None
+
+        bottom_y = self._find_leg_bottom(meta)
+        if bottom_y is None:
+            return None
+
+        span = bottom_y - anchor_y
+        if span <= 1e-6:
+            return None
+
+        target_floor = float(height) - float(foot_padding_px)
+        target_floor = float(np.clip(target_floor, 0.0, float(height)))
+        available_downward = target_floor - anchor_y
+
+        if locked_scale is not None:
+            scale = float(locked_scale)
+        else:
+            mode_key = (leg_mode or "").strip().lower()
+            if mode_key == "normal":
+                multiplier = max(float(scale_legs), 0.0)
+                if multiplier <= 0.0:
+                    return None
+                scale = multiplier
+            elif mode_key == "relative":
+                upper_length = self._compute_upper_body_length(meta, anchor_y)
+                if upper_length is None or upper_length <= 1e-6:
+                    return None
+                multiplier = max(float(torso_head_multiple), 0.0)
+                if multiplier <= 0.0:
+                    return None
+                desired_span = upper_length * multiplier
+                if desired_span <= 1e-6:
+                    return None
+                scale = desired_span / span
+            else:
+                if available_downward <= 1e-6:
+                    return None
+                scale = available_downward / span
+
+            if mode_key != "bottom":
+                if available_downward <= 1e-6:
+                    if scale >= 1.0:
+                        return None
+                else:
+                    max_scale = available_downward / span
+                    if max_scale <= 0.0:
+                        if scale >= 1.0:
+                            return None
+                    elif scale > max_scale:
+                        scale = max_scale
+
+        if not np.isfinite(scale) or scale <= 0.0:
+            return None
+
+        self._scale_leg_points(meta, anchor_y, scale)
+        return float(scale)
+
+    @staticmethod
+    def _seconds_to_frames(seconds, fps):
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return 0
+
+        if seconds <= 0.0:
+            return 0
+
+        fps = max(1, int(fps))
+        return max(1, int(round(fps * seconds)))
+
+
 class PoseDataEditorAutomaticOnlyTorsoHeadOffset(PoseDataEditorAutomaticV4):
     """Provides the torso-to-head offset workflow as a dedicated node."""
 
@@ -3162,6 +3577,306 @@ class PoseDataEditorAutoPositioning(
 
         return float(np.median(ratios))
 
+
+class PoseDataEditorAutomaticPositioningAndStretching(
+    PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2
+):
+    """Automatically positions the head and feet with timed leg stretching."""
+
+    DEFAULT_DURATION_SECONDS = 5.0
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        parent = PoseDataEditorAutomaticOnlyTorsoHeadOffset.INPUT_TYPES()
+        parent_required = parent["required"]
+
+        return {
+            "required": {
+                "pose_data": parent_required["pose_data"],
+                "auto_head_to_padding": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Enable automatic torso positioning so the head rests at the"
+                            " requested padding distance from the canvas top."
+                        ),
+                    },
+                ),
+                "head_padding": parent_required["head_padding"],
+                "head_padding_normalized": parent_required["head_padding_normalized"],
+                "head_padding_allow_overflow": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Allow the automatic head positioning to move beyond the canvas"
+                            " instead of clamping the padding inside the frame."
+                        ),
+                    },
+                ),
+                "head_padding_active_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long to keep translating the pose toward the head padding"
+                            " before disabling the automatic positioning entirely."
+                            " Use 0 to keep it active for the full clip."
+                        ),
+                    },
+                ),
+                "head_auto_duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": cls.DEFAULT_DURATION_SECONDS,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Number of seconds to keep adapting the head offset before"
+                            " locking the measured translation. Use 0 to lock immediately."
+                        ),
+                    },
+                ),
+                "auto_feet_to_padding": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Automatically translate the pose so the feet rest at the"
+                            " requested padding distance from the canvas bottom."
+                        ),
+                    },
+                ),
+                "foot_padding": parent_required["foot_padding"],
+                "foot_padding_normalized": parent_required["foot_padding_normalized"],
+                "foot_padding_active_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long to keep nudging the pose toward the requested foot"
+                            " padding before disabling the automatic translation."
+                            " Use 0 to keep it active for the full clip."
+                        ),
+                    },
+                ),
+                "foot_auto_duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": cls.DEFAULT_DURATION_SECONDS,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Number of seconds to keep adapting the automatic foot offset"
+                            " before locking the translation. Use 0 to lock immediately."
+                        ),
+                    },
+                ),
+                "offset_auto_duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": cls.DEFAULT_DURATION_SECONDS,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long to keep adapting the leg stretching before locking"
+                            " the measured scale factor. Use 0 to lock immediately."
+                        ),
+                    },
+                ),
+                "center_horizontally": parent_required["center_horizontally"],
+                "limit_to_canvas": parent_required["limit_to_canvas"],
+                "fps": (
+                    "FLOAT",
+                    {
+                        "default": 24.0,
+                        "min": 1.0,
+                        "max": 960.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Frames per second of the input clip. Durations are converted"
+                            " into frame counts using this value."
+                        ),
+                    },
+                ),
+                "person_index": parent_required["person_index"],
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+
+    def process(
+        self,
+        pose_data,
+        auto_head_to_padding,
+        head_padding,
+        head_padding_normalized,
+        head_padding_allow_overflow,
+        head_padding_active_seconds,
+        head_auto_duration_seconds,
+        auto_feet_to_padding,
+        foot_padding,
+        foot_padding_normalized,
+        foot_padding_active_seconds,
+        foot_auto_duration_seconds,
+        offset_auto_duration_seconds,
+        center_horizontally,
+        limit_to_canvas,
+        fps,
+        person_index,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        try:
+            fps_value = float(fps)
+        except (TypeError, ValueError):
+            fps_value = 24.0
+
+        fps_int = max(1, int(round(fps_value)))
+
+        scale_threshold = self._seconds_to_frames(offset_auto_duration_seconds, fps_int)
+        head_threshold = (
+            self._seconds_to_frames(head_auto_duration_seconds, fps_int)
+            if auto_head_to_padding
+            else None
+        )
+        head_active_threshold = (
+            self._seconds_to_frames(head_padding_active_seconds, fps_int)
+            if auto_head_to_padding
+            else None
+        )
+        if head_active_threshold == 0:
+            head_active_threshold = None
+
+        foot_threshold = (
+            self._seconds_to_frames(foot_auto_duration_seconds, fps_int)
+            if auto_feet_to_padding
+            else None
+        )
+        foot_active_threshold = (
+            self._seconds_to_frames(foot_padding_active_seconds, fps_int)
+            if auto_feet_to_padding
+            else None
+        )
+        if foot_active_threshold == 0:
+            foot_active_threshold = None
+
+        locked_scale = None
+        locked_head_delta = None
+        locked_foot_delta = None
+        adaptive_scale_frames = 0
+        adaptive_head_frames = 0
+        adaptive_foot_frames = 0
+        head_active_frames = 0
+        foot_active_frames = 0
+
+        for idx, meta in enumerate(pose_metas):
+            if person_index >= 0 and idx != person_index:
+                continue
+
+            head_active = auto_head_to_padding and (
+                head_active_threshold is None or head_active_frames < head_active_threshold
+            )
+            foot_active = auto_feet_to_padding and (
+                foot_active_threshold is None or foot_active_frames < foot_active_threshold
+            )
+
+            use_locked_scale = (
+                locked_scale is not None
+                and (scale_threshold == 0 or adaptive_scale_frames >= scale_threshold)
+            )
+
+            use_locked_head = (
+                auto_head_to_padding
+                and head_active
+                and locked_head_delta is not None
+                and (
+                    head_threshold == 0
+                    or (
+                        head_threshold is not None
+                        and adaptive_head_frames >= head_threshold
+                    )
+                )
+            )
+
+            use_locked_feet = (
+                auto_feet_to_padding
+                and foot_active
+                and locked_foot_delta is not None
+                and (
+                    foot_threshold == 0
+                    or (
+                        foot_threshold is not None
+                        and adaptive_foot_frames >= foot_threshold
+                    )
+                )
+            )
+
+            scale_used, head_delta, foot_delta = self._auto_align_with_scale_lock(
+                meta,
+                head_padding,
+                head_padding_normalized,
+                auto_head_to_padding,
+                head_active,
+                head_padding_allow_overflow,
+                center_horizontally,
+                limit_to_canvas,
+                0.0,
+                False,
+                locked_scale if use_locked_scale else None,
+                locked_head_delta if use_locked_head else None,
+                auto_feet_to_padding,
+                foot_padding,
+                foot_padding_normalized,
+                foot_active,
+                locked_foot_delta if use_locked_feet else None,
+            )
+
+            if not use_locked_scale:
+                adaptive_scale_frames += 1
+                if (
+                    scale_used is not None
+                    and np.isfinite(scale_used)
+                    and scale_used > 0.0
+                ):
+                    locked_scale = float(scale_used)
+
+            if auto_head_to_padding and head_active and not use_locked_head:
+                adaptive_head_frames += 1
+                if head_delta is not None and np.isfinite(head_delta):
+                    locked_head_delta = float(head_delta)
+
+            if auto_feet_to_padding and foot_active and not use_locked_feet:
+                adaptive_foot_frames += 1
+                if foot_delta is not None and np.isfinite(foot_delta):
+                    locked_foot_delta = float(foot_delta)
+
+            if auto_head_to_padding and head_active_threshold is not None and head_active:
+                head_active_frames += 1
+
+            if auto_feet_to_padding and foot_active_threshold is not None and foot_active:
+                foot_active_frames += 1
+
+        return (pose_data_copy,)
+
+
 class PoseDataEditorCutter:
     SCORE_THRESHOLD = 0.05
 
@@ -3634,9 +4349,11 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorCutter": PoseDataEditorCutter,
     "PoseDataEditorAutomatic": PoseDataEditorAutomatic,
     "PoseDataEditorAutoPositioning": PoseDataEditorAutoPositioning,
+    "PoseDataEditorAutomaticPositioningAndStretching": PoseDataEditorAutomaticPositioningAndStretching,
     "PoseDataEditorAutomaticV2": PoseDataEditorAutomaticV2,
     "PoseDataEditorAutomaticV3": PoseDataEditorAutomaticV3,
     "PoseDataEditorAutomaticV4": PoseDataEditorAutomaticV4,
+    "PoseDataEditorAutomaticV5": PoseDataEditorAutomaticV5,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": PoseDataEditorAutomaticOnlyTorsoHeadOffset,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2,
     "PoseDataPostProcessor": PoseDataPostProcessor,
@@ -3650,9 +4367,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorCutter": "Pose Data Editor Cutter",
     "PoseDataEditorAutomatic": "Pose Data Editor Automatic",
     "PoseDataEditorAutoPositioning": "Pose Data Editor Auto-Positioning",
+    "PoseDataEditorAutomaticPositioningAndStretching": "Pose Data Editor Automatic Positioning and Stretching",
     "PoseDataEditorAutomaticV2": "Pose Data Editor Automatic V2",
     "PoseDataEditorAutomaticV3": "Pose Data Editor Automatic V3",
     "PoseDataEditorAutomaticV4": "Pose Data Editor Automatic V4",
+    "PoseDataEditorAutomaticV5": "Pose Data Editor Automatic V5",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": "Pose Data Editor Automatic Only Torso-to-Head Offset",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": "Pose Data Editor Automatic Only Torso-to-Head Offset V2",
     "PoseDataPostProcessor": "Pose Data Post-Processor",
