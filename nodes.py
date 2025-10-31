@@ -1003,7 +1003,6 @@ class PoseDataPostProcessor:
 
         return (pose_data_copy,)
 
-
 class PoseDataEditorAutomatic:
     HEAD_INDICES = BODY_GROUPS.get("HEAD", [])
     HIP_INDICES = [idx for idx in BODY_GROUPS.get("HIP_WIDTH", []) if idx is not None]
@@ -3522,6 +3521,93 @@ class PoseDataEditorAutomaticV8(PoseDataEditorAutomaticV7):
         return (pose_data_copy,)
 
 
+class PoseDataEditorAutomaticV9(PoseDataEditorAutomaticV8):
+    """Keeps leg proportions aligned by stretching thighs together with calves."""
+
+    LEG_FOOT_MAP = {
+        8: (9, 10),
+        11: (12, 13),
+    }
+
+    DESCRIPTION = (
+        "Builds on Automatic V8 by reprojecting knees along the hip-to-ankle axis so "
+        "the entire leg — thigh and calf — scales uniformly during automatic "
+        "stretching."
+    )
+
+    def _scale_leg_points(self, meta, anchor_y, scale):
+        body = getattr(meta, "kps_body", None)
+        if body is None:
+            return
+
+        tracked_indices = set(self.LEG_INDICES + self.FOOT_INDICES + self.HIP_INDICES)
+        originals = {}
+        for idx in tracked_indices:
+            if idx >= len(body):
+                continue
+            coords = self._extract_coords(body[idx])
+            if coords is None:
+                continue
+            originals[idx] = np.array(coords, dtype=np.float32)
+
+        super()._scale_leg_points(meta, anchor_y, scale)
+
+        if not originals:
+            return
+
+        for hip_idx, mapping in self.LEG_FOOT_MAP.items():
+            if hip_idx >= len(body):
+                continue
+
+            hip_before = originals.get(hip_idx)
+            if hip_before is None:
+                continue
+
+            hip_after = self._extract_coords(body[hip_idx])
+            if hip_after is None:
+                continue
+
+            knee_idx, ankle_idx = mapping
+
+            if ankle_idx >= len(body):
+                continue
+
+            ankle_before = originals.get(ankle_idx)
+            knee_before = originals.get(knee_idx)
+
+            if ankle_before is None or knee_before is None:
+                continue
+
+            ankle_after = self._extract_coords(body[ankle_idx])
+            if ankle_after is None:
+                continue
+
+            ratio = self._project_ratio(
+                knee_before,
+                ankle_before,
+                hip_before,
+            )
+
+            if ratio is None:
+                continue
+
+            ratio = float(np.clip(ratio, 0.0, 1.0))
+
+            ankle_after = np.array(ankle_after, dtype=np.float32)
+            hip_after = np.array(hip_after, dtype=np.float32)
+
+            foot_vec_after = hip_after - ankle_after
+            if np.linalg.norm(foot_vec_after) <= 1e-6:
+                continue
+
+            new_pos = ankle_after + foot_vec_after * ratio
+            self._assign_point(
+                body,
+                knee_idx,
+                float(new_pos[0]),
+                float(new_pos[1]),
+            )
+
 class PoseDataEditorAutomaticOnlyTorsoHeadOffset(PoseDataEditorAutomaticV4):
     """Provides the torso-to-head offset workflow as a dedicated node."""
 
@@ -5175,6 +5261,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorAutomaticV6": PoseDataEditorAutomaticV6,
     "PoseDataEditorAutomaticV7": PoseDataEditorAutomaticV7,
     "PoseDataEditorAutomaticV8": PoseDataEditorAutomaticV8,
+    "PoseDataEditorAutomaticV9": PoseDataEditorAutomaticV9,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": PoseDataEditorAutomaticOnlyTorsoHeadOffset,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2,
     "PoseDataPostProcessor": PoseDataPostProcessor,
@@ -5196,6 +5283,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorAutomaticV6": "Pose Data Editor Automatic V6",
     "PoseDataEditorAutomaticV7": "Pose Data Editor Automatic V7",
     "PoseDataEditorAutomaticV8": "Pose Data Editor Automatic V8",
+    "PoseDataEditorAutomaticV9": "Pose Data Editor Automatic V9",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": "Pose Data Editor Automatic Only Torso-to-Head Offset",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": "Pose Data Editor Automatic Only Torso-to-Head Offset V2",
     "PoseDataPostProcessor": "Pose Data Post-Processor",
