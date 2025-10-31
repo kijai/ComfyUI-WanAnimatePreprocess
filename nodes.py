@@ -2783,6 +2783,19 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
                     "while stretching the legs to reconnect without moving the feet."
                 )
                 ordered["scale_offset_upper_body_only"] = (dtype, new_opts)
+                ordered["active_seconds_to_scale_offset_upper_body_only"] = (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long to keep adapting the upper-body offset mode before "
+                            "reusing the captured shift. Use 0 for no time limit."
+                        ),
+                    },
+                )
                 continue
 
             if key == "head_padding_active_seconds":
@@ -2813,6 +2826,16 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
                     "are frozen and reused. Set to 0 to keep adapting throughout the clip."
                 )
                 ordered["activate_lock_scale_offset_after_seconds"] = (dtype, new_opts)
+                ordered["allow_upper_body_overflow"] = (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Permit the torso offset to push points outside the canvas "
+                            "instead of clamping them, so the upper body can leave the frame."
+                        ),
+                    },
+                )
                 continue
 
             ordered[key] = value
@@ -2828,6 +2851,7 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
         scale_legs_normal,
         scale_legs_relative_to_body,
         scale_offset_upper_body_only,
+        active_seconds_to_scale_offset_upper_body_only,
         upper_body_offset,
         upper_body_offset_normalized,
         scale_legs,
@@ -2841,6 +2865,7 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
         center_horizontally,
         limit_to_canvas,
         activate_lock_scale_offset_after_seconds,
+        allow_upper_body_overflow,
         dont_offset_feet,
         fps,
         person_index,
@@ -2866,6 +2891,15 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
         )
         if lock_threshold == 0:
             lock_threshold = None
+
+        offset_threshold = None
+        if leg_mode == "offset":
+            offset_threshold = self._seconds_to_frames(
+                active_seconds_to_scale_offset_upper_body_only,
+                fps_int,
+            )
+            if offset_threshold == 0:
+                offset_threshold = None
 
         bottom_threshold = None
         if leg_mode == "bottom":
@@ -2894,9 +2928,11 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
         head_frames = 0
         foot_frames = 0
         lock_frames = 0
+        offset_frames = 0
         locked_scale = None
         locked_head_delta = None
         locked_foot_delta = None
+        locked_offset_delta = None
 
         for idx, meta in enumerate(pose_metas):
             if person_index >= 0 and idx != person_index:
@@ -2904,12 +2940,18 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
 
             bottom_active = True
             allow_leg_adjustment = True
+            offset_active = True
 
             if leg_mode == "bottom":
                 bottom_active = (
                     bottom_threshold is None or bottom_frames < bottom_threshold
                 )
                 allow_leg_adjustment = bottom_active
+
+            if leg_mode == "offset":
+                offset_active = (
+                    offset_threshold is None or offset_frames < offset_threshold
+                )
 
             head_adapt_allowed = head_threshold is None or head_frames < head_threshold
             foot_adapt_allowed = foot_threshold is None or foot_frames < foot_threshold
@@ -2935,7 +2977,7 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
             head_locked_delta = None if head_adapt_allowed else locked_head_delta
             foot_locked_delta = None if foot_adapt_allowed else locked_foot_delta
 
-            scale_used, head_delta, foot_delta = self._auto_align_meta_v6(
+            scale_used, head_delta, foot_delta, offset_delta = self._auto_align_meta_v6(
                 meta,
                 leg_mode,
                 scale_legs,
@@ -2955,6 +2997,9 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
                 upper_body_offset_normalized,
                 locked_scale if use_locked_scale else None,
                 allow_leg_adjustment,
+                offset_active,
+                locked_offset_delta,
+                allow_upper_body_overflow,
             )
 
             if leg_mode == "bottom":
@@ -2971,6 +3016,15 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
             if foot_threshold is not None and foot_adapt_allowed:
                 foot_frames += 1
 
+            if leg_mode == "offset":
+                if offset_threshold is not None and offset_active:
+                    offset_frames += 1
+                elif (
+                    offset_threshold is not None
+                    and offset_frames < offset_threshold
+                ):
+                    offset_frames = offset_threshold
+
             if head_delta is not None:
                 if head_adapt_allowed or locked_head_delta is None:
                     locked_head_delta = float(head_delta)
@@ -2978,6 +3032,10 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
             if foot_delta is not None and not dont_offset_feet:
                 if foot_adapt_allowed or locked_foot_delta is None:
                     locked_foot_delta = float(foot_delta)
+
+            if leg_mode == "offset" and offset_delta is not None:
+                if offset_active or locked_offset_delta is None:
+                    locked_offset_delta = float(offset_delta)
 
             if lock_threshold is not None:
                 if lock_frames < lock_threshold:
@@ -3010,6 +3068,12 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
                         and not dont_offset_feet
                     ):
                         locked_foot_delta = float(foot_delta)
+                    if (
+                        locked_offset_delta is None
+                        and offset_delta is not None
+                        and leg_mode == "offset"
+                    ):
+                        locked_offset_delta = float(offset_delta)
 
         return (pose_data_copy,)
 
@@ -3034,12 +3098,15 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
         upper_body_offset_normalized,
         locked_scale,
         allow_leg_adjustment,
+        offset_adapt_allowed,
+        locked_offset_delta,
+        allow_upper_body_overflow,
     ):
         width = getattr(meta, "width", None)
         height = getattr(meta, "height", None)
 
         if width in (None, 0) or height in (None, 0):
-            return (None, None, None)
+            return (None, None, None, None)
 
         mode_key = (leg_mode or "").strip().lower()
 
@@ -3072,12 +3139,15 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
             )
 
         if mode_key == "offset":
-            offset_px = self._resolve_padding(
-                upper_body_offset,
-                upper_body_offset_normalized,
-                height,
-            )
-            offset_px = float(np.clip(offset_px, -float(height), float(height)))
+            if offset_adapt_allowed or locked_offset_delta is None:
+                offset_px = self._resolve_padding(
+                    upper_body_offset,
+                    upper_body_offset_normalized,
+                    height,
+                )
+                offset_px = float(np.clip(offset_px, -float(height), float(height)))
+            else:
+                offset_px = float(locked_offset_delta)
 
             hip_pairs = self._offset_upper_body(meta, offset_px)
 
@@ -3090,10 +3160,10 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
             if center_horizontally:
                 self._centre_pose(meta, width)
 
-            if limit_to_canvas:
+            if limit_to_canvas and not allow_upper_body_overflow:
                 self._clamp_pose(meta, width, height)
 
-            return (None, head_delta, None)
+            return (None, head_delta, None, offset_px)
 
         foot_pad_px = self._resolve_padding(
             foot_padding,
@@ -3142,7 +3212,7 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
         if limit_to_canvas:
             self._clamp_pose(meta, width, height)
 
-        return (scale_used, head_delta, foot_delta)
+        return (scale_used, head_delta, foot_delta, None)
 
     def _select_leg_mode(
         self,
@@ -3157,6 +3227,16 @@ class PoseDataEditorAutomaticV6(PoseDataEditorAutomaticV5):
             scale_legs_relative_to_body,
             scale_offset_upper_body_only,
         )
+
+
+class PoseDataEditorAutomaticV7(PoseDataEditorAutomaticV6):
+    """Adds timed torso offsets and overflow control on top of Automatic V6."""
+
+    DESCRIPTION = (
+        "Builds on Automatic V6 by introducing a duration control for the upper-body "
+        "offset mode and an overflow toggle that lets the torso move beyond the "
+        "canvas instead of being clamped."
+    )
 
 
 class PoseDataEditorAutomaticOnlyTorsoHeadOffset(PoseDataEditorAutomaticV4):
@@ -4810,6 +4890,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorAutomaticV4": PoseDataEditorAutomaticV4,
     "PoseDataEditorAutomaticV5": PoseDataEditorAutomaticV5,
     "PoseDataEditorAutomaticV6": PoseDataEditorAutomaticV6,
+    "PoseDataEditorAutomaticV7": PoseDataEditorAutomaticV7,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": PoseDataEditorAutomaticOnlyTorsoHeadOffset,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2,
     "PoseDataPostProcessor": PoseDataPostProcessor,
@@ -4829,6 +4910,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorAutomaticV4": "Pose Data Editor Automatic V4",
     "PoseDataEditorAutomaticV5": "Pose Data Editor Automatic V5",
     "PoseDataEditorAutomaticV6": "Pose Data Editor Automatic V6",
+    "PoseDataEditorAutomaticV7": "Pose Data Editor Automatic V7",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": "Pose Data Editor Automatic Only Torso-to-Head Offset",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": "Pose Data Editor Automatic Only Torso-to-Head Offset V2",
     "PoseDataPostProcessor": "Pose Data Post-Processor",
