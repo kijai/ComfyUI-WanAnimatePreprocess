@@ -3239,6 +3239,289 @@ class PoseDataEditorAutomaticV7(PoseDataEditorAutomaticV6):
     )
 
 
+class PoseDataEditorAutomaticV8(PoseDataEditorAutomaticV7):
+    """Allows head padding to be disabled or to expire without reapplying offsets."""
+
+    DESCRIPTION = (
+        "Extends Automatic V7 by adding a toggle to disable head padding entirely "
+        "and ensuring the head offset stops once the active duration elapses instead "
+        "of remaining locked against the canvas."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = copy.deepcopy(super().INPUT_TYPES())
+        required = inputs.get("required", {})
+
+        if "head_padding" in required and "enable_head_padding" not in required:
+            reordered = {}
+            for key, value in required.items():
+                if key == "head_padding":
+                    reordered["enable_head_padding"] = (
+                        "BOOLEAN",
+                        {
+                            "default": True,
+                            "tooltip": (
+                                "Disable to skip automatic head padding entirely, even when "
+                                "a duration is provided."
+                            ),
+                        },
+                    )
+                reordered[key] = value
+            inputs["required"] = reordered
+
+        return inputs
+
+    def process(
+        self,
+        pose_data,
+        scale_legs_to_bottom,
+        scale_legs_to_bottom_active_seconds,
+        scale_legs_normal,
+        scale_legs_relative_to_body,
+        scale_offset_upper_body_only,
+        active_seconds_to_scale_offset_upper_body_only,
+        upper_body_offset,
+        upper_body_offset_normalized,
+        scale_legs,
+        torso_head_multiple,
+        enable_head_padding,
+        head_padding,
+        head_padding_normalized,
+        head_padding_active_seconds,
+        foot_padding,
+        foot_padding_normalized,
+        foot_padding_active_seconds,
+        center_horizontally,
+        limit_to_canvas,
+        activate_lock_scale_offset_after_seconds,
+        allow_upper_body_overflow,
+        dont_offset_feet,
+        fps,
+        person_index,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        leg_mode = self._select_leg_mode(
+            scale_legs_to_bottom,
+            scale_legs_normal,
+            scale_legs_relative_to_body,
+            scale_offset_upper_body_only,
+        )
+
+        fps_int = max(1, int(round(float(fps))))
+
+        lock_threshold = self._seconds_to_frames(
+            activate_lock_scale_offset_after_seconds,
+            fps_int,
+        )
+        if lock_threshold == 0:
+            lock_threshold = None
+
+        offset_threshold = None
+        if leg_mode == "offset":
+            offset_threshold = self._seconds_to_frames(
+                active_seconds_to_scale_offset_upper_body_only,
+                fps_int,
+            )
+            if offset_threshold == 0:
+                offset_threshold = None
+
+        bottom_threshold = None
+        if leg_mode == "bottom":
+            bottom_threshold = self._seconds_to_frames(
+                scale_legs_to_bottom_active_seconds,
+                fps_int,
+            )
+            if bottom_threshold == 0:
+                bottom_threshold = None
+
+        head_threshold = None
+        if enable_head_padding:
+            head_threshold = self._seconds_to_frames(
+                head_padding_active_seconds,
+                fps_int,
+            )
+            if head_threshold == 0:
+                head_threshold = None
+
+        foot_threshold = self._seconds_to_frames(
+            foot_padding_active_seconds,
+            fps_int,
+        )
+        if foot_threshold == 0:
+            foot_threshold = None
+
+        bottom_frames = 0
+        head_frames = 0
+        foot_frames = 0
+        lock_frames = 0
+        offset_frames = 0
+        locked_scale = None
+        locked_head_delta = None
+        locked_foot_delta = None
+        locked_offset_delta = None
+
+        for idx, meta in enumerate(pose_metas):
+            if person_index >= 0 and idx != person_index:
+                continue
+
+            bottom_active = True
+            allow_leg_adjustment = True
+            offset_active = True
+
+            if leg_mode == "bottom":
+                bottom_active = (
+                    bottom_threshold is None or bottom_frames < bottom_threshold
+                )
+                allow_leg_adjustment = bottom_active
+
+            if leg_mode == "offset":
+                offset_active = (
+                    offset_threshold is None or offset_frames < offset_threshold
+                )
+
+            head_window_active = enable_head_padding and (
+                head_threshold is None or head_frames < head_threshold
+            )
+            foot_adapt_allowed = foot_threshold is None or foot_frames < foot_threshold
+
+            use_locked_scale = (
+                lock_threshold is not None
+                and lock_frames >= lock_threshold
+                and locked_scale is not None
+            )
+
+            lock_offsets_active = lock_threshold is not None and lock_frames >= lock_threshold
+
+            if leg_mode == "bottom":
+                allow_leg_adjustment = allow_leg_adjustment or use_locked_scale
+
+            head_adapt_allowed = head_window_active and not lock_offsets_active
+
+            if lock_offsets_active:
+                foot_adapt_allowed = False
+
+            if dont_offset_feet:
+                foot_adapt_allowed = False
+
+            head_locked_delta = None
+            if not head_adapt_allowed and head_window_active and locked_head_delta is not None:
+                head_locked_delta = float(locked_head_delta)
+
+            foot_locked_delta = None if foot_adapt_allowed else locked_foot_delta
+
+            scale_used, head_delta, foot_delta, offset_delta = self._auto_align_meta_v6(
+                meta,
+                leg_mode,
+                scale_legs,
+                torso_head_multiple,
+                head_padding,
+                head_padding_normalized,
+                head_adapt_allowed,
+                head_locked_delta,
+                foot_padding,
+                foot_padding_normalized,
+                foot_adapt_allowed,
+                foot_locked_delta,
+                center_horizontally,
+                limit_to_canvas and not use_locked_scale,
+                dont_offset_feet,
+                upper_body_offset,
+                upper_body_offset_normalized,
+                locked_scale if use_locked_scale else None,
+                allow_leg_adjustment,
+                offset_active,
+                locked_offset_delta,
+                allow_upper_body_overflow,
+            )
+
+            if leg_mode == "bottom":
+                if bottom_active:
+                    bottom_frames += 1
+                elif use_locked_scale:
+                    bottom_frames += 1
+                elif bottom_threshold is not None and bottom_frames < bottom_threshold:
+                    bottom_frames = bottom_threshold
+
+            if head_window_active:
+                head_frames += 1
+            else:
+                locked_head_delta = None
+
+            if foot_threshold is not None and foot_adapt_allowed:
+                foot_frames += 1
+
+            if leg_mode == "offset":
+                if offset_threshold is not None and offset_active:
+                    offset_frames += 1
+                elif (
+                    offset_threshold is not None
+                    and offset_frames < offset_threshold
+                ):
+                    offset_frames = offset_threshold
+
+            if head_delta is not None and enable_head_padding:
+                if head_window_active or locked_head_delta is None:
+                    locked_head_delta = float(head_delta)
+
+            if foot_delta is not None and not dont_offset_feet:
+                if foot_adapt_allowed or locked_foot_delta is None:
+                    locked_foot_delta = float(foot_delta)
+
+            if leg_mode == "offset" and offset_delta is not None:
+                if offset_active or locked_offset_delta is None:
+                    locked_offset_delta = float(offset_delta)
+
+            if lock_threshold is not None:
+                if lock_frames < lock_threshold:
+                    lock_frames += 1
+                    if (
+                        scale_used is not None
+                        and np.isfinite(scale_used)
+                        and scale_used > 0.0
+                    ):
+                        locked_scale = float(scale_used)
+                    if head_delta is not None and enable_head_padding:
+                        locked_head_delta = float(head_delta)
+                    if foot_delta is not None and not dont_offset_feet:
+                        locked_foot_delta = float(foot_delta)
+                elif use_locked_scale or lock_offsets_active:
+                    lock_frames += 1
+                else:
+                    if (
+                        locked_scale is None
+                        and scale_used is not None
+                        and np.isfinite(scale_used)
+                        and scale_used > 0.0
+                    ):
+                        locked_scale = float(scale_used)
+                    if (
+                        locked_head_delta is None
+                        and head_delta is not None
+                        and enable_head_padding
+                    ):
+                        locked_head_delta = float(head_delta)
+                    if (
+                        locked_foot_delta is None
+                        and foot_delta is not None
+                        and not dont_offset_feet
+                    ):
+                        locked_foot_delta = float(foot_delta)
+                    if (
+                        locked_offset_delta is None
+                        and offset_delta is not None
+                        and leg_mode == "offset"
+                    ):
+                        locked_offset_delta = float(offset_delta)
+
+        return (pose_data_copy,)
+
+
 class PoseDataEditorAutomaticOnlyTorsoHeadOffset(PoseDataEditorAutomaticV4):
     """Provides the torso-to-head offset workflow as a dedicated node."""
 
@@ -4891,6 +5174,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorAutomaticV5": PoseDataEditorAutomaticV5,
     "PoseDataEditorAutomaticV6": PoseDataEditorAutomaticV6,
     "PoseDataEditorAutomaticV7": PoseDataEditorAutomaticV7,
+    "PoseDataEditorAutomaticV8": PoseDataEditorAutomaticV8,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": PoseDataEditorAutomaticOnlyTorsoHeadOffset,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2,
     "PoseDataPostProcessor": PoseDataPostProcessor,
@@ -4911,6 +5195,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorAutomaticV5": "Pose Data Editor Automatic V5",
     "PoseDataEditorAutomaticV6": "Pose Data Editor Automatic V6",
     "PoseDataEditorAutomaticV7": "Pose Data Editor Automatic V7",
+    "PoseDataEditorAutomaticV8": "Pose Data Editor Automatic V8",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": "Pose Data Editor Automatic Only Torso-to-Head Offset",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": "Pose Data Editor Automatic Only Torso-to-Head Offset V2",
     "PoseDataPostProcessor": "Pose Data Post-Processor",
