@@ -22,6 +22,7 @@ from .pose_utils.pose2d_utils import load_pose_metas_from_kp2ds_seq, crop, bbox_
 from .utils import get_face_bboxes, padding_resize, resize_by_area, resize_to_bounds
 from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new, draw_aaface_by_meta
 from .retarget_pose import get_retarget_pose
+from .pose_data_editor_alone_automatic import PoseDataEditorAloneAutomaticChatyNode
 
 
 BODY_GROUPS = {
@@ -5264,6 +5265,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorAutomaticV9": PoseDataEditorAutomaticV9,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": PoseDataEditorAutomaticOnlyTorsoHeadOffset,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2,
+    "PoseDataEditorAloneAutomaticChaty": PoseDataEditorAloneAutomaticChatyNode,
     "PoseDataPostProcessor": PoseDataPostProcessor,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
 }
@@ -5286,6 +5288,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorAutomaticV9": "Pose Data Editor Automatic V9",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": "Pose Data Editor Automatic Only Torso-to-Head Offset",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": "Pose Data Editor Automatic Only Torso-to-Head Offset V2",
+    "PoseDataEditorAloneAutomaticChaty": "Pose Data Editor Alone Automatic Chaty",
     "PoseDataPostProcessor": "Pose Data Post-Processor",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
 }
