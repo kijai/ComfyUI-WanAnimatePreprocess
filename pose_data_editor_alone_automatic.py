@@ -7,10 +7,31 @@ body towards the canvas top while optionally stretching the legs so the hips
 remain connected to the anchored feet. Head and foot paddings can be toggled on
 independent timers, and all adaptive adjustments lock after a configurable
 number of seconds derived from the provided FPS value.
-
-No external dependencies are required; the implementation works directly with
-built-in Python data structures.
 """
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, MutableMapping, Optional, Tuple
+
+
+@dataclass
+class _AdaptiveState:
+    """Tracks the adaptive offsets and scale factors for a single person."""
+
+    frames: int = 0
+    duration_frames: Optional[int] = None
+    head_limit: Optional[int] = None
+    foot_limit: Optional[int] = None
+    head_counter: int = 0
+    foot_counter: int = 0
+    current_upper_offset: float = 0.0
+    current_foot_offset: float = 0.0
+    locked_upper_offset: Optional[float] = None
+    locked_foot_offset: Optional[float] = None
+    locked_leg_scales: Optional[Dict[str, float]] = None
+    current_leg_scales: Dict[str, float] = field(default_factory=lambda: {"left": 1.0, "right": 1.0})
 
 
 class PoseDataEditorAloneAutomatic:
@@ -44,12 +65,12 @@ class PoseDataEditorAloneAutomatic:
         self.lock_feet = bool(lock_feet)
         self.scale_legs = bool(scale_legs)
         self.fps = int(round(float(fps))) if float(fps) > 0 else 1
-        self._states = {}
+        self._states: Dict[str, _AdaptiveState] = {}
 
     def process(self, pose_data):
         """Return a modified copy of ``pose_data`` with offsets applied."""
 
-        if not isinstance(pose_data, dict):
+        if not isinstance(pose_data, MutableMapping):
             raise TypeError("pose_data must be a dictionary")
 
         width, height = self._extract_canvas_size(pose_data)
@@ -59,7 +80,7 @@ class PoseDataEditorAloneAutomatic:
         width = float(width)
         height = float(height)
 
-        cloned = self._clone_pose_data(pose_data)
+        cloned = copy.deepcopy(pose_data)
         frames = cloned.get("keypoints")
         if not isinstance(frames, list):
             return cloned
@@ -70,12 +91,15 @@ class PoseDataEditorAloneAutomatic:
             if not isinstance(frame, dict):
                 continue
             for person_id, keypoints in frame.items():
+                if not isinstance(keypoints, list):
+                    continue
+
                 state = self._states.get(person_id)
                 if state is None:
                     state = self._create_state()
                     self._states[person_id] = state
-                if isinstance(keypoints, list):
-                    self._process_person(keypoints, state, width, height)
+
+                self._process_person(keypoints, state, width, height)
 
         return cloned
 
@@ -84,33 +108,20 @@ class PoseDataEditorAloneAutomatic:
         if duration_frames == 0:
             duration_frames = None
 
+        head_frames = self._seconds_to_frames(self.head_padding_active_seconds)
         if self.head_padding_active_seconds < 0.0:
-            head_frames = -1
-        else:
-            head_frames = self._seconds_to_frames(self.head_padding_active_seconds)
+            head_frames = None
 
+        foot_frames = self._seconds_to_frames(self.foot_padding_active_seconds)
         if self.foot_padding_active_seconds < 0.0:
-            foot_frames = -1
-        else:
-            foot_frames = self._seconds_to_frames(self.foot_padding_active_seconds)
+            foot_frames = None
 
-        return {
-            "frames": 0,
-            "duration_frames": duration_frames,
-            "head_limit": head_frames,
-            "foot_limit": foot_frames,
-            "head_counter": 0,
-            "foot_counter": 0,
-            "current_upper_offset": 0.0,
-            "current_foot_offset": 0.0,
-            "locked_upper_offset": None,
-            "locked_foot_offset": None,
-            "locked_leg_scales": None,
-            "current_leg_scales": {
-                "left": 1.0,
-                "right": 1.0,
-            },
-        }
+        return _AdaptiveState(
+            frames=0,
+            duration_frames=duration_frames,
+            head_limit=head_frames,
+            foot_limit=foot_frames,
+        )
 
     def _seconds_to_frames(self, seconds):
         value = float(seconds)
@@ -122,78 +133,82 @@ class PoseDataEditorAloneAutomatic:
         return frames
 
     def _process_person(self, keypoints, state, width, height):
-        frames = state["frames"]
-        duration_frames = state["duration_frames"]
+        frames = state.frames
+        duration_frames = state.duration_frames
         duration_exceeded = duration_frames is not None and frames >= duration_frames
 
         if duration_exceeded:
-            upper_offset = state["locked_upper_offset"]
-            foot_offset = state["locked_foot_offset"]
-            if upper_offset is None:
-                upper_offset = state["current_upper_offset"]
-            if foot_offset is None:
-                foot_offset = state["current_foot_offset"]
+            upper_offset = (
+                state.locked_upper_offset
+                if state.locked_upper_offset is not None
+                else state.current_upper_offset
+            )
+            foot_offset = (
+                state.locked_foot_offset
+                if state.locked_foot_offset is not None
+                else state.current_foot_offset
+            )
         else:
             self._update_offsets(keypoints, state, width, height)
-            upper_offset = state["current_upper_offset"]
-            foot_offset = state["current_foot_offset"]
+            upper_offset = state.current_upper_offset
+            foot_offset = state.current_foot_offset
 
-        if duration_exceeded and state["locked_leg_scales"]:
-            state["current_leg_scales"] = {
-                "left": state["locked_leg_scales"].get("left", 1.0),
-                "right": state["locked_leg_scales"].get("right", 1.0),
-            }
+        locked_scales: Optional[Dict[str, float]] = None
+        if duration_exceeded and state.locked_leg_scales:
+            locked_scales = state.locked_leg_scales
 
         self._apply_offsets(keypoints, upper_offset, foot_offset)
         if self.scale_legs:
-            self._adjust_legs(keypoints, state, upper_offset, foot_offset)
+            self._adjust_legs(keypoints, state, upper_offset, foot_offset, locked_scales)
 
-        state["frames"] = frames + 1
+        state.frames = frames + 1
 
-        if not duration_exceeded and duration_frames is not None and state["frames"] >= duration_frames:
-            state["locked_upper_offset"] = state["current_upper_offset"]
-            state["locked_foot_offset"] = state["current_foot_offset"]
+        if (not duration_exceeded) and duration_frames is not None and state.frames >= duration_frames:
+            state.locked_upper_offset = state.current_upper_offset
+            state.locked_foot_offset = state.current_foot_offset
             if self.scale_legs:
-                state["locked_leg_scales"] = {
-                    "left": state["current_leg_scales"].get("left", 1.0),
-                    "right": state["current_leg_scales"].get("right", 1.0),
+                state.locked_leg_scales = {
+                    "left": state.current_leg_scales.get("left", 1.0),
+                    "right": state.current_leg_scales.get("right", 1.0),
                 }
 
     def _update_offsets(self, keypoints, state, width, height):
-        head_limit = state["head_limit"]
-        foot_limit = state["foot_limit"]
+        head_limit = state.head_limit
+        foot_limit = state.foot_limit
 
         head_active = False
-        if head_limit < 0:
+        if head_limit is None:
             head_active = True
-        elif head_limit > 0:
-            head_active = state["head_counter"] < head_limit
+        elif head_limit > 0 and state.head_counter < head_limit:
+            head_active = True
 
         foot_active = False
-        if foot_limit < 0:
+        if foot_limit is None:
             foot_active = True
-        elif foot_limit > 0:
-            foot_active = state["foot_counter"] < foot_limit
+        elif foot_limit > 0 and state.foot_counter < foot_limit:
+            foot_active = True
 
-        head_padding_value = self.head_padding
-        foot_padding_value = self.foot_padding
-        if self.normalize:
-            head_padding_value = head_padding_value * height
-            foot_padding_value = foot_padding_value * height
+        head_padding_value = self._resolve_padding(self.head_padding, height)
+        foot_padding_value = self._resolve_padding(self.foot_padding, height)
 
         head_position = self._min_y(keypoints, self.HEAD_INDICES)
-        foot_position = self._max_y(keypoints, self.ANKLE_INDICES + self.FOOT_EXTRA_INDICES)
+        foot_indices: Tuple[int, ...] = self.ANKLE_INDICES + self.FOOT_EXTRA_INDICES
+        foot_position = self._max_y(keypoints, foot_indices)
 
         if head_active and head_position is not None:
-            state["current_upper_offset"] = head_padding_value - head_position
-            state["head_counter"] = state["head_counter"] + 1
+            state.current_upper_offset = head_padding_value - head_position
+            state.head_counter += 1
+        else:
+            state.current_upper_offset = 0.0
 
         if self.lock_feet:
-            state["current_foot_offset"] = 0.0
+            state.current_foot_offset = 0.0
         elif foot_active and foot_position is not None:
             target = height - foot_padding_value
-            state["current_foot_offset"] = target - foot_position
-            state["foot_counter"] = state["foot_counter"] + 1
+            state.current_foot_offset = target - foot_position
+            state.foot_counter += 1
+        else:
+            state.current_foot_offset = 0.0
 
     def _apply_offsets(self, keypoints, upper_offset, foot_offset):
         if upper_offset is None:
@@ -216,7 +231,14 @@ class PoseDataEditorAloneAutomatic:
                     if self._valid_point(point):
                         point[0] = point[0] + foot_offset
 
-    def _adjust_legs(self, keypoints, state, upper_offset, foot_offset):
+    def _adjust_legs(
+        self,
+        keypoints: List[List[float]],
+        state: _AdaptiveState,
+        upper_offset: float,
+        foot_offset: float,
+        locked_scales: Optional[Dict[str, float]],
+    ):
         leg_ids = ((12, 15, 17), (13, 16, 18))
         for name, indices in (("left", leg_ids[0]), ("right", leg_ids[1])):
             hip_idx, knee_idx, ankle_idx = indices
@@ -227,68 +249,61 @@ class PoseDataEditorAloneAutomatic:
             if not self._valid_point(hip) or not self._valid_point(ankle):
                 continue
 
-            hip_original = [hip[0] - upper_offset, hip[1]]
-            ankle_original = [ankle[0] - foot_offset if not self.lock_feet else ankle[0], ankle[1]]
+            hip_original_y = hip[0] - upper_offset
+            ankle_original_y = ankle[0] - (0.0 if self.lock_feet else foot_offset)
 
-            hip_adjusted = [hip_original[0] + upper_offset, hip_original[1]]
-            ankle_adjusted = [ankle_original[0] + (foot_offset if not self.lock_feet else 0.0), ankle_original[1]]
+            hip_adjusted_y = hip_original_y + upper_offset
+            ankle_adjusted_y = ankle_original_y + (0.0 if self.lock_feet else foot_offset)
+
+            hip_original = [hip_original_y, hip[1]]
+            ankle_original = [ankle_original_y, ankle[1]]
+            hip_adjusted = [hip_adjusted_y, hip[1]]
+            ankle_adjusted = [ankle_adjusted_y, ankle[1]]
 
             length_original = self._distance(hip_original, ankle_original)
             length_adjusted = self._distance(hip_adjusted, ankle_adjusted)
+
+            target_scale = None
+            if locked_scales is not None:
+                target_scale = locked_scales.get(name)
+
             scale = 1.0
             if length_original > 0.0 and length_adjusted > 0.0:
-                scale = length_adjusted / length_original
-            state["current_leg_scales"][name] = scale
+                if target_scale is not None and target_scale > 0.0:
+                    scale = float(target_scale)
+                    length_adjusted = length_original * scale
+                else:
+                    scale = length_adjusted / length_original
+
+            state.current_leg_scales[name] = scale
 
             if knee_idx >= len(keypoints):
                 continue
+
             knee = keypoints[knee_idx]
             if not self._valid_point(knee):
                 continue
 
-            knee_original = [knee[0] - upper_offset, knee[1]]
-            knee_distance = self._distance(knee_original, ankle_original)
+            knee_original_y = knee[0] - upper_offset
+            knee_original = [knee_original_y, knee[1]]
+
             ratio = 0.0
             if length_original > 0.0:
-                ratio = knee_distance / length_original
-            if ratio < 0.0:
-                ratio = 0.0
-            if ratio > 1.0:
-                ratio = 1.0
+                ratio = self._distance(knee_original, ankle_original) / length_original
+            ratio = max(0.0, min(1.0, ratio))
 
             leg_vector_y = hip_adjusted[0] - ankle_adjusted[0]
             leg_vector_x = hip_adjusted[1] - ankle_adjusted[1]
+
+            if target_scale is not None and target_scale > 0.0:
+                leg_vector_y = (hip_original[0] - ankle_original[0]) * target_scale
+                leg_vector_x = (hip_original[1] - ankle_original[1]) * target_scale
 
             knee_new_y = ankle_adjusted[0] + leg_vector_y * ratio
             knee_new_x = ankle_adjusted[1] + leg_vector_x * ratio
 
             knee[0] = knee_new_y
             knee[1] = knee_new_x
-
-    def _clone_pose_data(self, pose_data):
-        cloned = {}
-        for key, value in pose_data.items():
-            if key == "keypoints" and isinstance(value, list):
-                frames = []
-                for frame in value:
-                    if isinstance(frame, dict):
-                        persons = {}
-                        for person_id, points in frame.items():
-                            if isinstance(points, list):
-                                new_points = []
-                                for point in points:
-                                    if isinstance(point, list) and len(point) >= 3:
-                                        new_points.append([float(point[0]), float(point[1]), float(point[2])])
-                                    else:
-                                        new_points.append(point)
-                                persons[person_id] = new_points
-                        frames.append(persons)
-                    else:
-                        frames.append(frame)
-                cloned[key] = frames
-            else:
-                cloned[key] = value
-        return cloned
 
     def _extract_canvas_size(self, pose_data):
         width = pose_data.get("canvas_width")
@@ -315,6 +330,12 @@ class PoseDataEditorAloneAutomatic:
             and point[2] > 0.0
         )
 
+    def _resolve_padding(self, padding: float, height: float) -> float:
+        value = float(padding)
+        if self.normalize:
+            value *= height
+        return value
+
     def _min_y(self, keypoints, indices):
         minimum = None
         for index in indices:
@@ -326,7 +347,7 @@ class PoseDataEditorAloneAutomatic:
                         minimum = value
         return minimum
 
-    def _max_y(self, keypoints, indices):
+    def _max_y(self, keypoints, indices: Iterable[int]):
         maximum = None
         for index in indices:
             if index < len(keypoints):
