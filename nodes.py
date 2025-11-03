@@ -4240,6 +4240,321 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
         )
 
 
+class PoseDataEditorAdaptiveUpperBodyOffset(
+    PoseDataEditorAutomaticOnlyTorsoHeadOffset
+):
+    """Adaptively offsets the upper body while maintaining configurable paddings."""
+
+    DESCRIPTION = (
+        "Gradually measures how far the torso-to-head segment needs to shift so the "
+        "pose respects the requested head and foot paddings. The adjustment runs for "
+        "a configurable duration before locking the measured offset. Once locked, the "
+        "captured offset keeps being applied while the pose data can freely move "
+        "outside the canvas."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        parent = PoseDataEditorAutomaticOnlyTorsoHeadOffset.INPUT_TYPES()
+        parent_required = parent["required"]
+
+        return {
+            "required": {
+                "pose_data": parent_required["pose_data"],
+                "duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 5.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Total time in seconds spent adapting the automatic offset. "
+                            "When the duration elapses the measured offset is locked and "
+                            "reapplied to later frames."
+                        ),
+                    },
+                ),
+                "head_padding": parent_required["head_padding"],
+                "foot_padding": (
+                    "FLOAT",
+                    {
+                        "default": 0.02,
+                        "min": 0.0,
+                        "max": 2048.0,
+                        "step": 0.001,
+                        "tooltip": (
+                            "Distance to keep between the lowest feet keypoints and the "
+                            "canvas bottom while the adaptive phase is active."
+                        ),
+                    },
+                ),
+                "normalize": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Interpret head and foot padding values as a 0-1 ratio of the "
+                            "canvas height instead of raw pixels."
+                        ),
+                    },
+                ),
+                "head_padding_active_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long the automatic head padding remains active. Use 0 to "
+                            "keep it enabled for the full adaptive duration."
+                        ),
+                    },
+                ),
+                "foot_padding_active_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long the automatic foot padding remains active. Use 0 to "
+                            "keep it enabled for the full adaptive duration."
+                        ),
+                    },
+                ),
+                "lock_feet": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Keep the feet anchored in place while the torso offset is "
+                            "measured. When disabled, the pose may be translated to honour "
+                            "foot padding."
+                        ),
+                    },
+                ),
+                "scale_legs": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Stretch thighs and calves together so the legs reconnect with "
+                            "the hips after the upper body is moved."
+                        ),
+                    },
+                ),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 24,
+                        "min": 1,
+                        "max": 960,
+                        "step": 1,
+                        "tooltip": (
+                            "Frame rate of the source clip. Durations are converted into "
+                            "frame counts using this value."
+                        ),
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+
+    def process(
+        self,
+        pose_data,
+        duration_seconds,
+        head_padding,
+        foot_padding,
+        normalize,
+        head_padding_active_seconds,
+        foot_padding_active_seconds,
+        lock_feet,
+        scale_legs,
+        fps,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        fps_int = max(1, int(round(float(fps))))
+        duration_frames = self._seconds_to_frames(duration_seconds, fps_int)
+        if duration_frames == 0:
+            duration_frames = None
+
+        head_active_limit = self._seconds_to_frames(
+            head_padding_active_seconds,
+            fps_int,
+        )
+        if head_active_limit == 0:
+            head_active_limit = None
+
+        foot_active_limit = self._seconds_to_frames(
+            foot_padding_active_seconds,
+            fps_int,
+        )
+        if foot_active_limit == 0:
+            foot_active_limit = None
+
+        locked_offset = None
+        frame_counter = 0
+        head_active_counter = 0
+        foot_active_counter = 0
+
+        for meta in pose_metas:
+            adapt_active = duration_frames is None or frame_counter < duration_frames
+
+            head_active = adapt_active and (
+                head_active_limit is None or head_active_counter < head_active_limit
+            )
+            foot_active = (
+                adapt_active
+                and not lock_feet
+                and (
+                    foot_active_limit is None or foot_active_counter < foot_active_limit
+                )
+            )
+
+            offset_applied = self._apply_adaptive_offset(
+                meta,
+                head_padding,
+                foot_padding,
+                normalize,
+                head_active,
+                foot_active,
+                adapt_active,
+                lock_feet,
+                scale_legs,
+                locked_offset,
+            )
+
+            if adapt_active and offset_applied is not None:
+                locked_offset = float(offset_applied)
+
+            if head_active:
+                head_active_counter += 1
+
+            if foot_active:
+                foot_active_counter += 1
+
+            frame_counter += 1
+
+        return (pose_data_copy,)
+
+    @staticmethod
+    def _seconds_to_frames(seconds, fps):
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return 0
+
+        if seconds <= 0.0:
+            return 0
+
+        fps = max(1, int(round(float(fps))))
+        return max(1, int(round(fps * seconds)))
+
+    def _apply_adaptive_offset(
+        self,
+        meta,
+        head_padding,
+        foot_padding,
+        normalize,
+        head_active,
+        foot_active,
+        adapt_active,
+        lock_feet,
+        scale_legs,
+        locked_offset,
+    ):
+        width = getattr(meta, "width", None)
+        height = getattr(meta, "height", None)
+
+        if width in (None, 0) or height in (None, 0):
+            return locked_offset
+
+        height_float = float(height)
+
+        head_pad_px = self._resolve_padding(head_padding, normalize, height_float)
+        head_pad_px = float(np.clip(head_pad_px, 0.0, height_float))
+
+        foot_pad_px = self._resolve_padding(foot_padding, normalize, height_float)
+        foot_pad_px = float(np.clip(foot_pad_px, 0.0, height_float))
+
+        if foot_active:
+            bottom_y = self._find_leg_bottom(meta)
+            if bottom_y is not None:
+                target_floor = height_float - foot_pad_px
+                target_floor = float(np.clip(target_floor, 0.0, height_float))
+                delta = target_floor - float(bottom_y)
+                if abs(delta) > 1e-6:
+                    self._translate_pose(meta, 0.0, delta, width, height)
+
+        offset_px = None
+        update_offset = adapt_active and head_active
+
+        if update_offset:
+            top_y = self._find_head_top(meta)
+            if top_y is None:
+                top_y = self._find_pose_top(meta)
+            if top_y is not None:
+                offset_px = float(top_y) - head_pad_px
+
+        if offset_px is None:
+            if locked_offset is None:
+                return locked_offset
+            offset_px = float(locked_offset)
+
+        offset_px = float(np.clip(offset_px, -height_float, height_float))
+
+        if abs(offset_px) <= 1e-6:
+            return 0.0 if update_offset else locked_offset
+
+        locked_feet = self._capture_foot_positions(meta) if lock_feet else None
+
+        hip_pairs = self._offset_upper_body(meta, offset_px)
+
+        if scale_legs and hip_pairs:
+            self._stretch_legs_to_hips(meta, hip_pairs, locked_feet)
+
+        if lock_feet and locked_feet:
+            self._restore_locked_feet(meta, locked_feet)
+
+        if update_offset:
+            top_y_after = self._find_head_top(meta)
+            if top_y_after is None:
+                top_y_after = self._find_pose_top(meta)
+
+            if top_y_after is not None:
+                extra_delta = float(top_y_after) - head_pad_px
+                if abs(extra_delta) > 1e-6:
+                    extra_delta = float(np.clip(extra_delta, -height_float, height_float))
+                    extra_locked_feet = (
+                        self._capture_foot_positions(meta) if lock_feet else None
+                    )
+                    extra_pairs = self._offset_upper_body(meta, extra_delta)
+                    if scale_legs and extra_pairs:
+                        self._stretch_legs_to_hips(
+                            meta,
+                            extra_pairs,
+                            extra_locked_feet,
+                        )
+                    if lock_feet and extra_locked_feet:
+                        self._restore_locked_feet(meta, extra_locked_feet)
+                    offset_px += extra_delta
+
+        return offset_px
+
+
 class PoseDataEditorAutoPositioning(
     PoseDataEditorAutomaticOnlyTorsoHeadOffset
 ):
@@ -5265,6 +5580,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorAutomaticV9": PoseDataEditorAutomaticV9,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": PoseDataEditorAutomaticOnlyTorsoHeadOffset,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2,
+    "PoseDataEditorAdaptiveUpperBodyOffset": PoseDataEditorAdaptiveUpperBodyOffset,
     "PoseDataEditorAloneAutomaticChaty": PoseDataEditorAloneAutomaticChatyNode,
     "PoseDataPostProcessor": PoseDataPostProcessor,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
@@ -5288,6 +5604,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorAutomaticV9": "Pose Data Editor Automatic V9",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": "Pose Data Editor Automatic Only Torso-to-Head Offset",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": "Pose Data Editor Automatic Only Torso-to-Head Offset V2",
+    "PoseDataEditorAdaptiveUpperBodyOffset": "Pose Data Editor Adaptive Upper Body Offset",
     "PoseDataEditorAloneAutomaticChaty": "Pose Data Editor Alone Automatic Chaty",
     "PoseDataPostProcessor": "Pose Data Post-Processor",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
