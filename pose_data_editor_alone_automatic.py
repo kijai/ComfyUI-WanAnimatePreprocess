@@ -203,10 +203,13 @@ class PoseDataEditorAloneAutomaticChaty:
         )
 
         if not self._locked:
-            remaining = max(1, self.duration_frames - self._frame_index)
-            alpha = 1.0 / remaining
-            self._current_scale += (target_scale - self._current_scale) * alpha
-            self._current_offset += (target_offset - self._current_offset) * alpha
+            # During the adaptive window we follow the freshly computed target
+            # transform immediately so that the padding constraints are met in
+            # the same frame.  The duration still defines how long the editor
+            # keeps reacting to new frame statistics before the transform is
+            # locked.
+            self._current_scale = target_scale
+            self._current_offset = target_offset
 
         for track_id, points in mutable_frame.items():
             pivot = stats.pivots.get(track_id, stats.fallback_pivot)
