@@ -32,7 +32,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
 
 Keypoint = Tuple[float, float, float]
@@ -42,79 +42,35 @@ SequenceKeypoints = Iterable[FrameKeypoints]
 
 
 @dataclass(frozen=True)
-class _RegionDefinition:
-    """Named tuple describing index groupings for a skeleton layout."""
-
-    head: Tuple[int, ...]
-    upper_body: Tuple[int, ...]
-    hips: Tuple[int, ...]
-    legs: Tuple[int, ...]
-    feet: Tuple[int, ...]
-    left_leg: Tuple[int, ...]
-    right_leg: Tuple[int, ...]
-    left_foot: Tuple[int, ...]
-    right_foot: Tuple[int, ...]
-    left_hip: Tuple[int, ...]
-    right_hip: Tuple[int, ...]
-
-
 class BodyRegions:
-    """Provides region definitions for the supported skeleton formats.
+    """Grouped index definitions for the COCO-25 skeleton.
 
-    Two layouts are recognised:
-
-    ``coco_25``
-        The 25 keypoint body layout used by the Johnson format.
-
-    ``wholebody_133``
-        The extended 133 keypoint layout (body + face + hands).
-
-    At runtime the layout is selected based on the length of the keypoint
-    list.  Everything at or above 91 points is treated as a whole-body
-    layout so that the additional face/hand keypoints receive the same upper
-    body offset as the torso.
+    The indices mirror the mapping that is declared in ``Visualization.py``
+    and provide a stable reference for the transformation logic.  Only the
+    indices that are relevant for vertical adjustments are included.
     """
 
-    def __init__(self) -> None:
-        head_wholebody = tuple(list(range(0, 5)) + list(range(23, 91)))
-        upper_body_wholebody = tuple(
-            sorted(set(range(0, 13)) | set(range(23, 133)))
-        )
-
-        self._wholebody = _RegionDefinition(
-            head=head_wholebody,
-            upper_body=upper_body_wholebody,
-            hips=(11, 12),
-            legs=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
-            feet=(15, 16, 17, 18, 19, 20, 21, 22),
-            left_leg=(13, 15, 17, 18, 19),
-            right_leg=(14, 16, 20, 21, 22),
-            left_foot=(15, 17, 18, 19),
-            right_foot=(16, 20, 21, 22),
-            left_hip=(11,),
-            right_hip=(12,),
-        )
-
-        self._coco25 = _RegionDefinition(
-            head=(0, 1, 2, 3, 4, 5),
-            upper_body=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14),
-            hips=(12, 13, 14),
-            legs=(15, 16, 17, 18, 19, 20, 21, 22, 23, 24),
-            feet=(17, 18, 19, 20, 21, 22, 23, 24),
-            left_leg=(15, 17, 19, 20, 21),
-            right_leg=(16, 18, 22, 23, 24),
-            left_foot=(17, 19, 20, 21),
-            right_foot=(18, 22, 23, 24),
-            left_hip=(12, 14),
-            right_hip=(13, 14),
-        )
-
-    def resolve(self, keypoint_count: int) -> _RegionDefinition:
-        """Return the region definition that matches ``keypoint_count``."""
-
-        if keypoint_count >= 91:
-            return self._wholebody
-        return self._coco25
+    head: Tuple[int, ...] = (0, 1, 2, 3, 4, 5)
+    upper_body: Tuple[int, ...] = (
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+    )
+    hips: Tuple[int, ...] = (12, 13, 14)
+    legs: Tuple[int, ...] = (15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+    feet: Tuple[int, ...] = (17, 18, 19, 20, 21, 22, 23, 24)
 
 
 class PoseDataEditorAloneAutomaticChaty:
@@ -145,7 +101,7 @@ class PoseDataEditorAloneAutomaticChaty:
         Frame rate that is used to convert durations to frame counts.
     """
 
-    _region_helper = BodyRegions()
+    _regions = BodyRegions()
 
     def __init__(
         self,
@@ -260,47 +216,19 @@ class PoseDataEditorAloneAutomaticChaty:
             if pivot is None:
                 continue
 
-            region = self._region_helper.resolve(len(points))
-            original_points = list(points)
-            apply_body_transform = lambda value: self._apply_transform(value, pivot)
-
-            left_leg_params: Optional[Tuple[float, float]] = None
-            right_leg_params: Optional[Tuple[float, float]] = None
-            if self.scale_legs and self.lock_feet:
-                left_leg_params = self._compute_leg_params(
-                    original_points,
-                    hip_indices=region.left_hip,
-                    foot_indices=region.left_foot,
-                    transform=apply_body_transform,
-                )
-                right_leg_params = self._compute_leg_params(
-                    original_points,
-                    hip_indices=region.right_hip,
-                    foot_indices=region.right_foot,
-                    transform=apply_body_transform,
-                )
-
             for idx, kp in enumerate(points):
                 if not kp or len(kp) < 2:
                     continue
 
                 y, x, *rest = kp
 
-                new_y = y
-                if idx in region.upper_body:
-                    new_y = apply_body_transform(y)
-                elif self.scale_legs and idx in region.legs:
-                    if self.lock_feet and idx in region.feet:
-                        new_y = y
-                    elif self.lock_feet:
-                        if idx in region.left_leg and left_leg_params is not None:
-                            new_y = left_leg_params[0] * y + left_leg_params[1]
-                        elif idx in region.right_leg and right_leg_params is not None:
-                            new_y = right_leg_params[0] * y + right_leg_params[1]
-                        else:
-                            new_y = apply_body_transform(y)
-                    else:
-                        new_y = apply_body_transform(y)
+                if idx in self._regions.upper_body or (self.scale_legs and idx in self._regions.legs):
+                    new_y = pivot + (y - pivot) * self._current_scale + self._current_offset
+                else:
+                    new_y = y
+
+                if self.lock_feet and idx in self._regions.feet:
+                    new_y = y
 
                 points[idx] = (float(new_y), float(x), *rest)
 
@@ -330,7 +258,6 @@ class PoseDataEditorAloneAutomaticChaty:
         fallback_values: List[float] = []
 
         for track_id, keypoints in frame.items():
-            region = self._region_helper.resolve(len(keypoints))
             head_positions: List[float] = []
             hip_positions: List[float] = []
             foot_positions: List[float] = []
@@ -347,11 +274,11 @@ class PoseDataEditorAloneAutomaticChaty:
 
                 all_positions.append(y)
 
-                if index in region.head:
+                if index in self._regions.head:
                     head_positions.append(y)
-                if index in region.hips:
+                if index in self._regions.hips:
                     hip_positions.append(y)
-                if index in region.feet:
+                if index in self._regions.feet:
                     foot_positions.append(y)
 
             track_head = min(head_positions) if head_positions else None
@@ -373,59 +300,6 @@ class PoseDataEditorAloneAutomaticChaty:
 
         fallback_pivot = sum(fallback_values) / len(fallback_values) if fallback_values else None
         return self._FrameStats(head_min=head_min, foot_max=foot_max, pivots=pivots, fallback_pivot=fallback_pivot)
-
-    def _apply_transform(self, value: float, pivot: float) -> float:
-        """Apply the current scale/offset to ``value`` using ``pivot`` as anchor."""
-
-        return pivot + (value - pivot) * self._current_scale + self._current_offset
-
-    def _compute_leg_params(
-        self,
-        points: List[Optional[Keypoint]],
-        *,
-        hip_indices: Tuple[int, ...],
-        foot_indices: Tuple[int, ...],
-        transform: Callable[[float], float],
-    ) -> Optional[Tuple[float, float]]:
-        """Return scale/offset parameters for a leg when feet are locked."""
-
-        hip_original = self._average_visible_y(points, hip_indices)
-        foot_original = self._average_visible_y(points, foot_indices)
-
-        if hip_original is None or foot_original is None:
-            return None
-
-        hip_target = transform(hip_original)
-        foot_target = foot_original
-
-        denom = hip_original - foot_original
-        if abs(denom) < 1e-6:
-            return None
-
-        scale = (hip_target - foot_target) / denom
-        offset = hip_target - scale * hip_original
-        return scale, offset
-
-    def _average_visible_y(
-        self, points: List[Optional[Keypoint]], indices: Tuple[int, ...]
-    ) -> Optional[float]:
-        """Average the Y coordinate for all visible keypoints in ``indices``."""
-
-        values: List[float] = []
-        for index in indices:
-            if index >= len(points):
-                continue
-            kp = points[index]
-            if not kp or len(kp) < 1:
-                continue
-            score = kp[2] if len(kp) > 2 else 1.0
-            if score <= 0:
-                continue
-            values.append(kp[0])
-
-        if not values:
-            return None
-        return sum(values) / len(values)
 
     def _compute_target_transform(
         self,
