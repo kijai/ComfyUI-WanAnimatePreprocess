@@ -83,6 +83,65 @@ FULL_BODY_LENGTH_PAIRS = TORSO_LENGTH_PAIRS + [
     (12, 13),  # left knee to left ankle
 ]
 
+
+BODY_GROUPS = {
+    "ALL": list(range(20)),
+    "TORSO": [1, 2, 5, 8, 11],
+    "SHOULDERS": [2, 5],
+    "ARMS": [2, 3, 4, 5, 6, 7],
+    "LEGS": [8, 9, 10, 11, 12, 13],
+    "FEET": [10, 13, 18, 19],
+    "HEAD": [0, 14, 15, 16, 17],
+    "HIP_WIDTH": [8, 11],
+    "KNEE_WIDTH": [9, 12],
+}
+
+HAND_GROUPS = {
+    "LEFT_HAND": "left",
+    "RIGHT_HAND": "right",
+    "HANDS": "both",
+}
+
+FACE_GROUP = {
+    "FACE": True,
+}
+
+TARGET_OPTIONS = [
+    "ALL",
+    "BODY",
+    "TORSO",
+    "SHOULDERS",
+    "ARMS",
+    "LEGS",
+    "FEET",
+    "HEAD",
+    "HIP_WIDTH",
+    "KNEE_WIDTH",
+    "HANDS",
+    "LEFT_HAND",
+    "RIGHT_HAND",
+    "FACE",
+]
+
+TORSO_LENGTH_PAIRS = [
+    (1, 2),  # neck to right shoulder
+    (1, 5),  # neck to left shoulder
+    (1, 8),  # neck to right hip
+    (1, 11),  # neck to left hip
+    (8, 11),  # hip width
+]
+
+FULL_BODY_LENGTH_PAIRS = TORSO_LENGTH_PAIRS + [
+    (2, 3),  # right shoulder to right elbow
+    (3, 4),  # right elbow to right wrist
+    (5, 6),  # left shoulder to left elbow
+    (6, 7),  # left elbow to left wrist
+    (8, 9),  # right hip to right knee
+    (9, 10),  # right knee to right ankle
+    (11, 12),  # left hip to left knee
+    (12, 13),  # left knee to left ankle
+]
+
 class OnnxDetectionModelLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -5265,7 +5324,6 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorAutomaticV9": PoseDataEditorAutomaticV9,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": PoseDataEditorAutomaticOnlyTorsoHeadOffset,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2,
-    "PoseDataEditorAloneAutomaticChaty": PoseDataEditorAloneAutomaticChatyNode,
     "PoseDataPostProcessor": PoseDataPostProcessor,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
 }
@@ -5288,7 +5346,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorAutomaticV9": "Pose Data Editor Automatic V9",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": "Pose Data Editor Automatic Only Torso-to-Head Offset",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": "Pose Data Editor Automatic Only Torso-to-Head Offset V2",
-    "PoseDataEditorAloneAutomaticChaty": "Pose Data Editor Alone Automatic Chaty",
     "PoseDataPostProcessor": "Pose Data Post-Processor",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
 }
