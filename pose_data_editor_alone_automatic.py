@@ -1,6 +1,6 @@
 """Standalone pose data editor for adaptive upper body offsetting.
 
-This module implements the :class:`PoseDataEditorAloneAutomatic` component
+This module implements the :class:`PoseDataEditorAloneAutomaticChaty` component
 which adjusts pose keypoints so that the upper body maintains configurable
 padding distances to the canvas.  The implementation is completely
 independent from the rest of the repository and only relies on the Python
@@ -29,13 +29,15 @@ It smoothly adjusts the vertical offset/scale during the configured
 
 from __future__ import annotations
 
+import copy
+import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
 
 Keypoint = Tuple[float, float, float]
-FrameKeypoints = Mapping[str, Iterable[Keypoint]]
-MutableFrameKeypoints = MutableMapping[str, List[Keypoint]]
+FrameKeypoints = Mapping[str, Iterable[Optional[Keypoint]]]
+MutableFrameKeypoints = MutableMapping[str, List[Optional[Keypoint]]]
 SequenceKeypoints = Iterable[FrameKeypoints]
 
 
@@ -71,7 +73,7 @@ class BodyRegions:
     feet: Tuple[int, ...] = (17, 18, 19, 20, 21, 22, 23, 24)
 
 
-class PoseDataEditorAloneAutomatic:
+class PoseDataEditorAloneAutomaticChaty:
     """Adaptive pose editor that offsets the upper body.
 
     Parameters
@@ -177,10 +179,15 @@ class PoseDataEditorAloneAutomatic:
 
         del canvas_width  # width is currently not required but kept for API symmetry
 
-        mutable_frame: MutableFrameKeypoints = {
-            track_id: [tuple(point) for point in points]
-            for track_id, points in frame.items()
-        }
+        mutable_frame: MutableFrameKeypoints = {}
+        for track_id, points in frame.items():
+            mutable_points: List[Optional[Keypoint]] = []
+            for point in points:
+                if point is None:
+                    mutable_points.append(None)
+                else:
+                    mutable_points.append(tuple(point))
+            mutable_frame[track_id] = mutable_points
 
         canvas_height = float(canvas_height)
         head_padding_value = self._padding_to_pixels(self.head_padding, canvas_height) if self.head_padding_frames else 0.0
@@ -241,7 +248,7 @@ class PoseDataEditorAloneAutomatic:
     def _padding_to_pixels(self, padding: float, canvas_height: float) -> float:
         return padding * canvas_height if self.normalize else padding
 
-    def _collect_statistics(self, frame: MutableFrameKeypoints) -> "PoseDataEditorAloneAutomatic._FrameStats":
+    def _collect_statistics(self, frame: MutableFrameKeypoints) -> "PoseDataEditorAloneAutomaticChaty._FrameStats":
         head_min: Optional[float] = None
         foot_max: Optional[float] = None
         pivots: Dict[str, Optional[float]] = {}
@@ -294,7 +301,7 @@ class PoseDataEditorAloneAutomatic:
     def _compute_target_transform(
         self,
         *,
-        stats: "PoseDataEditorAloneAutomatic._FrameStats",
+        stats: "PoseDataEditorAloneAutomaticChaty._FrameStats",
         canvas_height: float,
         head_padding: float,
         foot_padding: float,
@@ -341,5 +348,233 @@ class PoseDataEditorAloneAutomatic:
         return 1.0, 0.0
 
 
-__all__ = ["PoseDataEditorAloneAutomatic"]
+class PoseDataEditorAloneAutomaticChatyNode:
+    """ComfyUI compatible wrapper around :class:`PoseDataEditorAloneAutomaticChaty`."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "duration": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 60.0,
+                        "step": 0.01,
+                        "tooltip": "Total duration in seconds before the adaptive offset/scale locks.",
+                    },
+                ),
+                "head_padding": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 2048.0,
+                        "step": 0.01,
+                        "tooltip": "Distance to keep between the top-most keypoint and the canvas edge.",
+                    },
+                ),
+                "foot_padding": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 2048.0,
+                        "step": 0.01,
+                        "tooltip": "Distance to keep between the feet and the canvas floor when scaling legs.",
+                    },
+                ),
+                "normalize": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Interpret padding values as a fraction of the canvas height.",
+                    },
+                ),
+                "head_padding_active_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 60.0,
+                        "step": 0.01,
+                        "tooltip": "How long to enforce the head padding before releasing it.",
+                    },
+                ),
+                "foot_padding_active_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 60.0,
+                        "step": 0.01,
+                        "tooltip": "How long to enforce the foot padding before releasing it.",
+                    },
+                ),
+                "lock_feet": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Prevent any adjustments to foot keypoints even when scaling the body.",
+                    },
+                ),
+                "scale_legs": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Apply the adaptive transform to the legs so hip-to-foot distances remain constant.",
+                    },
+                ),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 30,
+                        "min": 1,
+                        "max": 240,
+                        "step": 1,
+                        "tooltip": "Frame rate used to convert time based parameters to frame counts.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Adaptive upper-body offset that keeps configurable head and foot padding while processing pose sequences."
+
+    def process(
+        self,
+        pose_data,
+        duration,
+        head_padding,
+        foot_padding,
+        normalize,
+        head_padding_active_seconds,
+        foot_padding_active_seconds,
+        lock_feet,
+        scale_legs,
+        fps,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas")
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        editor = PoseDataEditorAloneAutomaticChaty(
+            duration=float(duration),
+            head_padding=float(head_padding),
+            foot_padding=float(foot_padding),
+            normalize=bool(normalize),
+            head_padding_active_seconds=float(head_padding_active_seconds),
+            foot_padding_active_seconds=float(foot_padding_active_seconds),
+            lock_feet=bool(lock_feet),
+            scale_legs=bool(scale_legs),
+            fps=int(fps),
+        )
+
+        editor.reset()
+
+        for meta in pose_metas:
+            canvas_height = self._to_float(getattr(meta, "height", None))
+            canvas_width = self._to_float(getattr(meta, "width", None))
+
+            if not math.isfinite(canvas_height) or canvas_height <= 0:
+                continue
+
+            canvas_width_value: Optional[float]
+            if math.isfinite(canvas_width) and canvas_width > 0:
+                canvas_width_value = canvas_width
+            else:
+                canvas_width_value = None
+
+            frame = self._meta_to_frame(meta)
+            if not frame:
+                editor.process_frame({}, canvas_height=canvas_height, canvas_width=canvas_width_value)
+                continue
+
+            processed = editor.process_frame(frame, canvas_height=canvas_height, canvas_width=canvas_width_value)
+            self._apply_processed_frame(meta, processed)
+
+        pose_data_copy["pose_metas"] = pose_metas
+
+        return (pose_data_copy,)
+
+    @staticmethod
+    def _to_float(value) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    @classmethod
+    def _meta_to_frame(cls, meta) -> MutableFrameKeypoints:
+        body = getattr(meta, "kps_body", None)
+        confidences = getattr(meta, "kps_body_p", None)
+
+        if body is None:
+            return {}
+
+        points: List[Optional[Keypoint]] = []
+        for index in range(len(body)):
+            coords = body[index]
+            score = None
+            if confidences is not None and index < len(confidences):
+                score = cls._to_float(confidences[index])
+
+            if coords is None or len(coords) < 2:
+                points.append(None)
+                continue
+
+            x_value = cls._to_float(coords[0])
+            y_value = cls._to_float(coords[1])
+
+            if not math.isfinite(x_value) or not math.isfinite(y_value):
+                points.append(None)
+                continue
+
+            confidence = score if score is not None and math.isfinite(score) else 1.0
+            points.append((y_value, x_value, confidence))
+
+        return {"0": points}
+
+    @classmethod
+    def _apply_processed_frame(cls, meta, processed: MutableFrameKeypoints) -> None:
+        body = getattr(meta, "kps_body", None)
+        if body is None:
+            return
+
+        points = processed.get("0")
+        if not points:
+            return
+
+        limit = min(len(body), len(points))
+        for index in range(limit):
+            kp = points[index]
+            if not kp or len(kp) < 1:
+                continue
+
+            new_y = cls._to_float(kp[0])
+            if not math.isfinite(new_y):
+                continue
+
+            try:
+                if isinstance(body[index], list):
+                    body[index][1] = new_y
+                elif isinstance(body[index], tuple):
+                    mutable = list(body[index])
+                    mutable[1] = new_y
+                    body[index] = mutable
+                else:
+                    body[index][1] = new_y
+            except Exception:
+                # Fallback for unexpected container types.
+                continue
+
+
+__all__ = ["PoseDataEditorAloneAutomaticChaty", "PoseDataEditorAloneAutomaticChatyNode"]
 
