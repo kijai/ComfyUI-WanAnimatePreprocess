@@ -4240,6 +4240,321 @@ class PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2(
         )
 
 
+class PoseDataEditorAdaptiveUpperBodyOffset(
+    PoseDataEditorAutomaticOnlyTorsoHeadOffset
+):
+    """Adaptively offsets the upper body while maintaining configurable paddings."""
+
+    DESCRIPTION = (
+        "Gradually measures how far the torso-to-head segment needs to shift so the "
+        "pose respects the requested head and foot paddings. The adjustment runs for "
+        "a configurable duration before locking the measured offset. Once locked, the "
+        "captured offset keeps being applied while the pose data can freely move "
+        "outside the canvas."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        parent = PoseDataEditorAutomaticOnlyTorsoHeadOffset.INPUT_TYPES()
+        parent_required = parent["required"]
+
+        return {
+            "required": {
+                "pose_data": parent_required["pose_data"],
+                "duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 5.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Total time in seconds spent adapting the automatic offset. "
+                            "When the duration elapses the measured offset is locked and "
+                            "reapplied to later frames."
+                        ),
+                    },
+                ),
+                "head_padding": parent_required["head_padding"],
+                "foot_padding": (
+                    "FLOAT",
+                    {
+                        "default": 0.02,
+                        "min": 0.0,
+                        "max": 2048.0,
+                        "step": 0.001,
+                        "tooltip": (
+                            "Distance to keep between the lowest feet keypoints and the "
+                            "canvas bottom while the adaptive phase is active."
+                        ),
+                    },
+                ),
+                "normalize": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Interpret head and foot padding values as a 0-1 ratio of the "
+                            "canvas height instead of raw pixels."
+                        ),
+                    },
+                ),
+                "head_padding_active_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long the automatic head padding remains active. Use 0 to "
+                            "keep it enabled for the full adaptive duration."
+                        ),
+                    },
+                ),
+                "foot_padding_active_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "How long the automatic foot padding remains active. Use 0 to "
+                            "keep it enabled for the full adaptive duration."
+                        ),
+                    },
+                ),
+                "lock_feet": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Keep the feet anchored in place while the torso offset is "
+                            "measured. When disabled, the pose may be translated to honour "
+                            "foot padding."
+                        ),
+                    },
+                ),
+                "scale_legs": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Stretch thighs and calves together so the legs reconnect with "
+                            "the hips after the upper body is moved."
+                        ),
+                    },
+                ),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 24,
+                        "min": 1,
+                        "max": 960,
+                        "step": 1,
+                        "tooltip": (
+                            "Frame rate of the source clip. Durations are converted into "
+                            "frame counts using this value."
+                        ),
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+
+    def process(
+        self,
+        pose_data,
+        duration_seconds,
+        head_padding,
+        foot_padding,
+        normalize,
+        head_padding_active_seconds,
+        foot_padding_active_seconds,
+        lock_feet,
+        scale_legs,
+        fps,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        fps_int = max(1, int(round(float(fps))))
+        duration_frames = self._seconds_to_frames(duration_seconds, fps_int)
+        if duration_frames == 0:
+            duration_frames = None
+
+        head_active_limit = self._seconds_to_frames(
+            head_padding_active_seconds,
+            fps_int,
+        )
+        if head_active_limit == 0:
+            head_active_limit = None
+
+        foot_active_limit = self._seconds_to_frames(
+            foot_padding_active_seconds,
+            fps_int,
+        )
+        if foot_active_limit == 0:
+            foot_active_limit = None
+
+        locked_offset = None
+        frame_counter = 0
+        head_active_counter = 0
+        foot_active_counter = 0
+
+        for meta in pose_metas:
+            adapt_active = duration_frames is None or frame_counter < duration_frames
+
+            head_active = adapt_active and (
+                head_active_limit is None or head_active_counter < head_active_limit
+            )
+            foot_active = (
+                adapt_active
+                and not lock_feet
+                and (
+                    foot_active_limit is None or foot_active_counter < foot_active_limit
+                )
+            )
+
+            offset_applied = self._apply_adaptive_offset(
+                meta,
+                head_padding,
+                foot_padding,
+                normalize,
+                head_active,
+                foot_active,
+                adapt_active,
+                lock_feet,
+                scale_legs,
+                locked_offset,
+            )
+
+            if adapt_active and offset_applied is not None:
+                locked_offset = float(offset_applied)
+
+            if head_active:
+                head_active_counter += 1
+
+            if foot_active:
+                foot_active_counter += 1
+
+            frame_counter += 1
+
+        return (pose_data_copy,)
+
+    @staticmethod
+    def _seconds_to_frames(seconds, fps):
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return 0
+
+        if seconds <= 0.0:
+            return 0
+
+        fps = max(1, int(round(float(fps))))
+        return max(1, int(round(fps * seconds)))
+
+    def _apply_adaptive_offset(
+        self,
+        meta,
+        head_padding,
+        foot_padding,
+        normalize,
+        head_active,
+        foot_active,
+        adapt_active,
+        lock_feet,
+        scale_legs,
+        locked_offset,
+    ):
+        width = getattr(meta, "width", None)
+        height = getattr(meta, "height", None)
+
+        if width in (None, 0) or height in (None, 0):
+            return locked_offset
+
+        height_float = float(height)
+
+        head_pad_px = self._resolve_padding(head_padding, normalize, height_float)
+        head_pad_px = float(np.clip(head_pad_px, 0.0, height_float))
+
+        foot_pad_px = self._resolve_padding(foot_padding, normalize, height_float)
+        foot_pad_px = float(np.clip(foot_pad_px, 0.0, height_float))
+
+        if foot_active:
+            bottom_y = self._find_leg_bottom(meta)
+            if bottom_y is not None:
+                target_floor = height_float - foot_pad_px
+                target_floor = float(np.clip(target_floor, 0.0, height_float))
+                delta = target_floor - float(bottom_y)
+                if abs(delta) > 1e-6:
+                    self._translate_pose(meta, 0.0, delta, width, height)
+
+        offset_px = None
+        update_offset = adapt_active and head_active
+
+        if update_offset:
+            top_y = self._find_head_top(meta)
+            if top_y is None:
+                top_y = self._find_pose_top(meta)
+            if top_y is not None:
+                offset_px = float(top_y) - head_pad_px
+
+        if offset_px is None:
+            if locked_offset is None:
+                return locked_offset
+            offset_px = float(locked_offset)
+
+        offset_px = float(np.clip(offset_px, -height_float, height_float))
+
+        if abs(offset_px) <= 1e-6:
+            return 0.0 if update_offset else locked_offset
+
+        locked_feet = self._capture_foot_positions(meta) if lock_feet else None
+
+        hip_pairs = self._offset_upper_body(meta, offset_px)
+
+        if scale_legs and hip_pairs:
+            self._stretch_legs_to_hips(meta, hip_pairs, locked_feet)
+
+        if lock_feet and locked_feet:
+            self._restore_locked_feet(meta, locked_feet)
+
+        if update_offset:
+            top_y_after = self._find_head_top(meta)
+            if top_y_after is None:
+                top_y_after = self._find_pose_top(meta)
+
+            if top_y_after is not None:
+                extra_delta = float(top_y_after) - head_pad_px
+                if abs(extra_delta) > 1e-6:
+                    extra_delta = float(np.clip(extra_delta, -height_float, height_float))
+                    extra_locked_feet = (
+                        self._capture_foot_positions(meta) if lock_feet else None
+                    )
+                    extra_pairs = self._offset_upper_body(meta, extra_delta)
+                    if scale_legs and extra_pairs:
+                        self._stretch_legs_to_hips(
+                            meta,
+                            extra_pairs,
+                            extra_locked_feet,
+                        )
+                    if lock_feet and extra_locked_feet:
+                        self._restore_locked_feet(meta, extra_locked_feet)
+                    offset_px += extra_delta
+
+        return offset_px
+
+
 class PoseDataEditorAutoPositioning(
     PoseDataEditorAutomaticOnlyTorsoHeadOffset
 ):
@@ -5127,6 +5442,453 @@ class PoseDataEditorCutter:
         meta_dict["height"] = new_height
 
 
+class PoseDataEditorBlackout:
+    SCORE_THRESHOLD = 0.05
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "images": ("IMAGE",),
+                "enable_static_bar": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Draw a fixed blackout bar at the top of every frame.",
+                    },
+                ),
+                "static_bar_height": (
+                    "FLOAT",
+                    {
+                        "default": 0.05,
+                        "min": 0.0,
+                        "max": 2048.0,
+                        "step": 0.001,
+                        "tooltip": "Height of the fixed blackout bar (pixels unless normalised).",
+                    },
+                ),
+                "static_bar_normalized": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Interpret the fixed blackout height as a 0-1 ratio of the frame height.",
+                    },
+                ),
+                "enable_dynamic_blackout": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Automatically hide the area that keeps pressing against the canvas ceiling.",
+                    },
+                ),
+                "press_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.01,
+                        "min": 0.0,
+                        "max": 2048.0,
+                        "step": 0.001,
+                        "tooltip": "How close the pose must be to the canvas top before it counts as pressing (pixels unless normalised).",
+                    },
+                ),
+                "press_threshold_normalized": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Interpret the press threshold as a 0-1 ratio of the pose height.",
+                    },
+                ),
+                "press_duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.5,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": "How long the pose must keep pressing before the blackout activates.",
+                    },
+                ),
+                "dynamic_margin": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 2048.0,
+                        "step": 0.001,
+                        "tooltip": "Extra height added below the detected press zone (pixels unless normalised).",
+                    },
+                ),
+                "dynamic_margin_normalized": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Interpret the dynamic margin as a 0-1 ratio of the pose height.",
+                    },
+                ),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 24,
+                        "min": 1,
+                        "max": 960,
+                        "step": 1,
+                        "tooltip": "Frame-rate used to convert the press duration into frame counts.",
+                    },
+                ),
+            },
+            "optional": {
+                "reference_pose_data": (
+                    "POSEDATA",
+                    {
+                        "default": None,
+                        "tooltip": "Optional reference pose describing the unconstrained keypoint positions.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA", "IMAGE")
+    RETURN_NAMES = ("pose_data", "images")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = (
+        "Adds a configurable blackout bar to the top of the canvas. The bar can be a fixed height and/or "
+        "trigger dynamically when pose keypoints remain pressed against the canvas ceiling."
+    )
+
+    def process(
+        self,
+        pose_data,
+        images,
+        enable_static_bar,
+        static_bar_height,
+        static_bar_normalized,
+        enable_dynamic_blackout,
+        press_threshold,
+        press_threshold_normalized,
+        press_duration_seconds,
+        dynamic_margin,
+        dynamic_margin_normalized,
+        fps,
+        reference_pose_data=None,
+    ):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if isinstance(images, torch.Tensor):
+            images_np = images.detach().cpu().numpy()
+            images_device = images.device
+            images_dtype = images.dtype
+        else:
+            images_np = np.asarray(images)
+            images_device = None
+            images_dtype = None
+
+        if images_np.size == 0:
+            return (pose_data_copy, images)
+
+        single_image = False
+        if images_np.ndim == 3:
+            images_np = images_np[None, ...]
+            single_image = True
+
+        image_count = images_np.shape[0]
+
+        if not pose_metas or image_count == 0:
+            result_tensor = self._to_tensor(images_np, images_dtype, images_device, single_image)
+            return (pose_data_copy, result_tensor)
+
+        if not enable_static_bar and not enable_dynamic_blackout:
+            result_tensor = self._to_tensor(images_np, images_dtype, images_device, single_image)
+            return (pose_data_copy, result_tensor)
+
+        blackout_images = images_np.copy()
+
+        static_bar_pixels = [0.0] * image_count
+        if enable_static_bar:
+            for idx in range(image_count):
+                image_height = float(blackout_images[idx].shape[0])
+                static_bar_pixels[idx] = self._resolve_length(
+                    static_bar_height,
+                    static_bar_normalized,
+                    image_height,
+                )
+
+        dynamic_pixels = [0.0] * image_count
+        if enable_dynamic_blackout:
+            reference_entries, reference_is_meta = self._resolve_reference_list(
+                reference_pose_data,
+                pose_data_copy,
+            )
+
+            frame_count = min(len(pose_metas), image_count)
+            press_frames = self._seconds_to_frames(press_duration_seconds, fps)
+            press_counter = 0
+
+            for idx in range(frame_count):
+                meta = pose_metas[idx]
+                canvas_height = getattr(meta, "height", None)
+                if canvas_height in (None, 0):
+                    canvas_height = float(blackout_images[idx].shape[0])
+                canvas_height = float(canvas_height)
+
+                if canvas_height <= 0.0:
+                    press_counter = 0
+                    continue
+
+                top_y = self._find_meta_top(meta)
+                if top_y is None:
+                    press_counter = 0
+                    continue
+
+                threshold_px = self._resolve_length(
+                    press_threshold,
+                    press_threshold_normalized,
+                    canvas_height,
+                )
+
+                if top_y <= threshold_px:
+                    press_counter += 1
+                else:
+                    press_counter = 0
+
+                if press_counter < press_frames:
+                    continue
+
+                margin_px = self._resolve_length(
+                    dynamic_margin,
+                    dynamic_margin_normalized,
+                    canvas_height,
+                )
+
+                if canvas_height <= 0.0:
+                    continue
+
+                top_ratio = float(np.clip(top_y / canvas_height, 0.0, 1.0))
+                margin_ratio = float(np.clip(margin_px / canvas_height, 0.0, 1.0))
+                dynamic_ratio = float(np.clip(top_ratio + margin_ratio, 0.0, 1.0))
+
+                if reference_entries:
+                    ref_entry = reference_entries[
+                        idx if idx < len(reference_entries) else len(reference_entries) - 1
+                    ]
+                    ref_ratio = self._compute_reference_top_ratio(ref_entry, reference_is_meta)
+                    if ref_ratio is not None:
+                        dynamic_ratio = max(
+                            dynamic_ratio,
+                            float(np.clip(ref_ratio + margin_ratio, 0.0, 1.0)),
+                        )
+
+                image_height = float(blackout_images[idx].shape[0])
+                dynamic_pixels[idx] = float(
+                    np.clip(dynamic_ratio * image_height, 0.0, image_height)
+                )
+
+        for idx in range(image_count):
+            image_height = blackout_images[idx].shape[0]
+            static_px = static_bar_pixels[idx] if enable_static_bar else 0.0
+            dynamic_px = dynamic_pixels[idx] if enable_dynamic_blackout else 0.0
+            blackout_px = float(np.clip(max(static_px, dynamic_px), 0.0, float(image_height)))
+            blackout_span = int(np.ceil(blackout_px))
+
+            if blackout_span > 0:
+                blackout_images[idx, 0:blackout_span, ...] = 0
+
+        result_tensor = self._to_tensor(blackout_images, images_dtype, images_device, single_image)
+        return (pose_data_copy, result_tensor)
+
+    def _to_tensor(self, images_np, images_dtype, images_device, single_image):
+        if single_image and images_np.ndim == 4 and images_np.shape[0] == 1:
+            images_np = images_np[0]
+
+        result_tensor = torch.from_numpy(images_np)
+
+        if images_dtype is not None:
+            result_tensor = result_tensor.to(dtype=images_dtype)
+
+        if images_device is not None:
+            result_tensor = result_tensor.to(device=images_device)
+
+        if single_image:
+            result_tensor = result_tensor.unsqueeze(0)
+
+        return result_tensor
+
+    def _resolve_length(self, value, normalized, reference):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+        reference = float(reference)
+        if reference <= 0.0:
+            return 0.0
+
+        if normalized:
+            numeric = float(np.clip(numeric, 0.0, 1.0)) * reference
+
+        return float(np.clip(numeric, 0.0, reference))
+
+    def _seconds_to_frames(self, seconds, fps):
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            seconds = 0.0
+
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            fps = 1.0
+
+        if seconds <= 0.0 or fps <= 0.0:
+            return 1
+
+        return max(1, int(round(seconds * fps)))
+
+    def _find_meta_top(self, meta):
+        if meta is None:
+            return None
+
+        best = None
+        for array in self._iter_meta_arrays(meta):
+            if array is None:
+                continue
+            for point in array:
+                coords, score = self._extract_coords(point)
+                if coords is None:
+                    continue
+                if score is not None and score < self.SCORE_THRESHOLD:
+                    continue
+                y_val = float(coords[1])
+                if not np.isfinite(y_val):
+                    continue
+                if best is None or y_val < best:
+                    best = y_val
+
+        return best
+
+    def _compute_reference_top_ratio(self, entry, reference_is_meta):
+        if entry is None:
+            return None
+
+        if reference_is_meta:
+            if not isinstance(entry, AAPoseMeta):
+                return None
+
+            height = getattr(entry, "height", None)
+            top_y = self._find_meta_top(entry)
+
+            if height in (None, 0) or top_y is None:
+                return None
+
+            return float(np.clip(top_y / float(height), 0.0, 1.0))
+
+        if not isinstance(entry, dict):
+            return None
+
+        height = entry.get("height")
+        if height in (None, 0):
+            return None
+
+        key_names = (
+            "keypoints_body",
+            "keypoints_left_hand",
+            "keypoints_right_hand",
+            "keypoints_face",
+        )
+
+        best = None
+        for key in key_names:
+            points = entry.get(key)
+            if points is None:
+                continue
+
+            points_np = np.asarray(points, dtype=np.float32)
+            if points_np.ndim != 2 or points_np.shape[1] < 2:
+                continue
+
+            coords = points_np[:, :2].copy()
+            scores = points_np[:, 2] if points_np.shape[1] > 2 else None
+
+            coords[:, 0] *= float(entry.get("width", 0) or 0)
+            coords[:, 1] *= float(height)
+
+            for idx in range(coords.shape[0]):
+                score_val = float(scores[idx]) if scores is not None else 1.0
+                if not np.isfinite(score_val):
+                    score_val = 1.0
+                if score_val < self.SCORE_THRESHOLD:
+                    continue
+                y_val = float(coords[idx, 1])
+                if not np.isfinite(y_val):
+                    continue
+                if best is None or y_val < best:
+                    best = y_val
+
+        if best is None:
+            return None
+
+        return float(np.clip(best / float(height), 0.0, 1.0))
+
+    def _iter_meta_arrays(self, meta):
+        return (
+            getattr(meta, name, None)
+            for name in ("kps_body", "kps_lhand", "kps_rhand", "kps_face")
+        )
+
+    def _extract_coords(self, point):
+        if point is None:
+            return None, None
+
+        score = 1.0
+
+        if isinstance(point, np.ndarray):
+            if point.size < 2:
+                return None, None
+            coords = point[:2]
+            if point.size > 2:
+                score = float(point[2])
+        elif isinstance(point, (list, tuple)):
+            if len(point) < 2:
+                return None, None
+            coords = point[:2]
+            if len(point) > 2:
+                score = float(point[2])
+        else:
+            return None, None
+
+        coords = np.asarray(coords, dtype=np.float32)
+        if not np.all(np.isfinite(coords)):
+            return None, None
+
+        if not np.isfinite(score):
+            score = 1.0
+
+        return coords, score
+
+    def _resolve_reference_list(self, supplied_reference, pose_data_copy):
+        if supplied_reference not in (None,):
+            if isinstance(supplied_reference, dict):
+                ref_pose_metas = supplied_reference.get("pose_metas")
+                if ref_pose_metas:
+                    return ref_pose_metas, True
+                ref_original = supplied_reference.get("pose_metas_original")
+                if ref_original:
+                    return ref_original, False
+            return None, False
+
+        ref_original_default = pose_data_copy.get("pose_metas_original")
+        if ref_original_default:
+            return ref_original_default, False
+
+        ref_pose_metas_default = pose_data_copy.get("pose_metas")
+        if ref_pose_metas_default:
+            return ref_pose_metas_default, True
+
+        return None, False
+
+
 class DrawViTPose:
     @classmethod
     def INPUT_TYPES(s):
@@ -5252,6 +6014,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetection": PoseAndFaceDetection,
     "PoseDataEditor": PoseDataEditor,
     "PoseDataEditorCutter": PoseDataEditorCutter,
+    "PoseDataEditorBlackout": PoseDataEditorBlackout,
     "PoseDataEditorAutomatic": PoseDataEditorAutomatic,
     "PoseDataEditorAutoPositioning": PoseDataEditorAutoPositioning,
     "PoseDataEditorAutomaticPositioningAndStretching": PoseDataEditorAutomaticPositioningAndStretching,
@@ -5265,6 +6028,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorAutomaticV9": PoseDataEditorAutomaticV9,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": PoseDataEditorAutomaticOnlyTorsoHeadOffset,
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2,
+    "PoseDataEditorAdaptiveUpperBodyOffset": PoseDataEditorAdaptiveUpperBodyOffset,
     "PoseDataEditorAloneAutomaticChaty": PoseDataEditorAloneAutomaticChatyNode,
     "PoseDataPostProcessor": PoseDataPostProcessor,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
@@ -5275,6 +6039,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAndFaceDetection": "Pose and Face Detection",
     "PoseDataEditor": "Pose Data Editor",
     "PoseDataEditorCutter": "Pose Data Editor Cutter",
+    "PoseDataEditorBlackout": "Pose Data Editor Blackout",
     "PoseDataEditorAutomatic": "Pose Data Editor Automatic",
     "PoseDataEditorAutoPositioning": "Pose Data Editor Auto-Positioning",
     "PoseDataEditorAutomaticPositioningAndStretching": "Pose Data Editor Automatic Positioning and Stretching",
@@ -5288,6 +6053,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorAutomaticV9": "Pose Data Editor Automatic V9",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffset": "Pose Data Editor Automatic Only Torso-to-Head Offset",
     "PoseDataEditorAutomaticOnlyTorsoHeadOffsetV2": "Pose Data Editor Automatic Only Torso-to-Head Offset V2",
+    "PoseDataEditorAdaptiveUpperBodyOffset": "Pose Data Editor Adaptive Upper Body Offset",
     "PoseDataEditorAloneAutomaticChaty": "Pose Data Editor Alone Automatic Chaty",
     "PoseDataPostProcessor": "Pose Data Post-Processor",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
