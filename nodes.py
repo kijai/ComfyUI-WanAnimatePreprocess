@@ -5180,6 +5180,16 @@ class PoseDataEditorCutter:
                         "tooltip": "Time offset before the automatic cutter begins analysing pose extents.",
                     },
                 ),
+                "analyze_stop_seconds_reversed": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": "Duration counted from the clip end after which analysis stops.",
+                    },
+                ),
                 "fps": (
                     "FLOAT",
                     {
@@ -5211,6 +5221,7 @@ class PoseDataEditorCutter:
         keep_aspect_ratio,
         preserve_aspect_ratio,
         analyze_start_seconds,
+        analyze_stop_seconds_reversed,
         fps,
     ):
         pose_data_copy = copy.deepcopy(pose_data)
@@ -5220,9 +5231,27 @@ class PoseDataEditorCutter:
             return (pose_data_copy, images)
 
         analyze_start_seconds = max(0.0, float(analyze_start_seconds))
+        analyze_stop_seconds_reversed = max(0.0, float(analyze_stop_seconds_reversed))
         fps = max(0.0, float(fps))
+        total_frames = len(pose_metas)
+
         start_frame = int(analyze_start_seconds * fps) if fps > 0.0 else 0
         start_frame = max(0, start_frame)
+        if total_frames:
+            start_frame = min(start_frame, total_frames - 1)
+        else:
+            start_frame = 0
+
+        stop_offset_frames = int(analyze_stop_seconds_reversed * fps) if fps > 0.0 else 0
+        stop_offset_frames = max(0, stop_offset_frames)
+        stop_frame = total_frames - stop_offset_frames
+        stop_frame = max(0, min(total_frames, stop_frame))
+
+        if total_frames and stop_frame <= start_frame:
+            if stop_frame < total_frames:
+                stop_frame = min(total_frames, start_frame + 1)
+            else:
+                start_frame = max(0, stop_frame - 1)
 
         if isinstance(images, torch.Tensor):
             images_np = images.detach().cpu().numpy()
@@ -5253,6 +5282,7 @@ class PoseDataEditorCutter:
             padding_normalized,
             bool(preserve_aspect_ratio or keep_aspect_ratio),
             start_frame,
+            stop_frame,
         )
 
         if crop_bounds is None:
@@ -5296,6 +5326,7 @@ class PoseDataEditorCutter:
             {
                 "preserve_aspect_ratio": bool(preserve_aspect_ratio or keep_aspect_ratio),
                 "analyze_start_seconds": float(analyze_start_seconds),
+                "analyze_stop_seconds_reversed": float(analyze_stop_seconds_reversed),
                 "fps": float(fps),
                 "bounding_box": [int(x0), int(y0), int(new_width), int(new_height)],
             }
@@ -5315,6 +5346,7 @@ class PoseDataEditorCutter:
         padding_normalized,
         preserve_aspect_ratio,
         start_frame,
+        stop_frame,
     ):
         largest_bbox = None
         largest_area = -1.0
@@ -5322,6 +5354,8 @@ class PoseDataEditorCutter:
         for index, meta in enumerate(pose_metas):
             if index < start_frame:
                 continue
+            if index >= stop_frame:
+                break
             bbox = self._compute_bbox(meta)
             if bbox is None:
                 continue
@@ -5370,6 +5404,62 @@ class PoseDataEditorCutter:
     ):
         crop_width = x1 - x0
         crop_height = y1 - y0
+
+        if (
+            crop_width <= 0.0
+            or crop_height <= 0.0
+            or target_ratio <= 0.0
+            or canvas_width <= 0.0
+            or canvas_height <= 0.0
+        ):
+            return x0, y0, x1, y1
+
+        current_ratio = crop_width / crop_height
+        if abs(current_ratio - target_ratio) <= 1e-6:
+            return x0, y0, x1, y1
+
+        center_x = (x0 + x1) * 0.5
+        center_y = (y0 + y1) * 0.5
+
+        if current_ratio > target_ratio:
+            new_width = crop_width
+            new_height = crop_width / target_ratio
+        else:
+            new_height = crop_height
+            new_width = crop_height * target_ratio
+
+        max_width = float(canvas_width)
+        max_height = float(canvas_height)
+
+        new_width = min(new_width, max_width)
+        new_height = min(new_height, max_height)
+
+        new_x0 = center_x - new_width * 0.5
+        new_y0 = center_y - new_height * 0.5
+
+        max_x0 = max_width - new_width
+        max_y0 = max_height - new_height
+
+        if max_x0 < 0.0:
+            new_x0 = 0.0
+            new_x1 = max_width
+        else:
+            new_x0 = min(max(new_x0, 0.0), max_x0)
+            new_x1 = new_x0 + new_width
+
+        if max_y0 < 0.0:
+            new_y0 = 0.0
+            new_y1 = max_height
+        else:
+            new_y0 = min(max(new_y0, 0.0), max_y0)
+            new_y1 = new_y0 + new_height
+
+        return new_x0, new_y0, new_x1, new_y1
+
+    def _resolve_padding(self, value, normalized, size_reference):
+        if normalized:
+            return float(value) * float(size_reference)
+        return float(value)
 
         if (
             crop_width <= 0.0
