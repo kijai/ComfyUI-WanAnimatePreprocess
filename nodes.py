@@ -5461,6 +5461,62 @@ class PoseDataEditorCutter:
             return float(value) * float(size_reference)
         return float(value)
 
+        if (
+            crop_width <= 0.0
+            or crop_height <= 0.0
+            or target_ratio <= 0.0
+            or canvas_width <= 0.0
+            or canvas_height <= 0.0
+        ):
+            return x0, y0, x1, y1
+
+        current_ratio = crop_width / crop_height
+        if abs(current_ratio - target_ratio) <= 1e-6:
+            return x0, y0, x1, y1
+
+        center_x = (x0 + x1) * 0.5
+        center_y = (y0 + y1) * 0.5
+
+        if current_ratio > target_ratio:
+            new_width = crop_width
+            new_height = crop_width / target_ratio
+        else:
+            new_height = crop_height
+            new_width = crop_height * target_ratio
+
+        max_width = float(canvas_width)
+        max_height = float(canvas_height)
+
+        new_width = min(new_width, max_width)
+        new_height = min(new_height, max_height)
+
+        new_x0 = center_x - new_width * 0.5
+        new_y0 = center_y - new_height * 0.5
+
+        max_x0 = max_width - new_width
+        max_y0 = max_height - new_height
+
+        if max_x0 < 0.0:
+            new_x0 = 0.0
+            new_x1 = max_width
+        else:
+            new_x0 = min(max(new_x0, 0.0), max_x0)
+            new_x1 = new_x0 + new_width
+
+        if max_y0 < 0.0:
+            new_y0 = 0.0
+            new_y1 = max_height
+        else:
+            new_y0 = min(max(new_y0, 0.0), max_y0)
+            new_y1 = new_y0 + new_height
+
+        return new_x0, new_y0, new_x1, new_y1
+
+    def _resolve_padding(self, value, normalized, size_reference):
+        if normalized:
+            return float(value) * float(size_reference)
+        return float(value)
+
     def _compute_bbox(self, meta):
         keypoint_sets = []
 
