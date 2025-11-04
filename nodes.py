@@ -5115,7 +5115,7 @@ class PoseDataEditorCutter:
                         "default": 0.0,
                         "min": 0.0,
                         "max": 2048.0,
-                        "step": 0.1,
+                        "step": 0.01,
                         "tooltip": "Extra space to keep on the left side of the cropped canvas (pixels unless normalised).",
                     },
                 ),
@@ -5125,7 +5125,7 @@ class PoseDataEditorCutter:
                         "default": 0.0,
                         "min": 0.0,
                         "max": 2048.0,
-                        "step": 0.1,
+                        "step": 0.01,
                         "tooltip": "Extra space to keep on the right side of the cropped canvas (pixels unless normalised).",
                     },
                 ),
@@ -5135,7 +5135,7 @@ class PoseDataEditorCutter:
                         "default": 0.0,
                         "min": 0.0,
                         "max": 2048.0,
-                        "step": 0.1,
+                        "step": 0.01,
                         "tooltip": "Extra space to keep above the pose in the cropped canvas (pixels unless normalised).",
                     },
                 ),
@@ -5145,7 +5145,7 @@ class PoseDataEditorCutter:
                         "default": 0.0,
                         "min": 0.0,
                         "max": 2048.0,
-                        "step": 0.1,
+                        "step": 0.01,
                         "tooltip": "Extra space to keep below the pose in the cropped canvas (pixels unless normalised).",
                     },
                 ),
@@ -5154,6 +5154,36 @@ class PoseDataEditorCutter:
                     {
                         "default": False,
                         "tooltip": "Interpret padding values as 0-1 ratios of the image dimensions instead of pixels.",
+                    },
+                ),
+                "min_crop_size": (
+                    "VEC2",
+                    {
+                        "default": [0.0, 0.0],
+                        "min": 0.0,
+                        "max": 8192.0,
+                        "step": 1.0,
+                        "tooltip": "Minimum crop width and height (pixels). Set either axis to 0 to disable the limit.",
+                    },
+                ),
+                "crop_expand": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "Uniformly scale the padded bounding box before clamping (1.0 keeps the original size).",
+                    },
+                ),
+                "max_crop_expand": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "Maximum allowed expansion factor relative to the detected content (0 disables the limit).",
                     },
                 ),
                 "keep_aspect_ratio": (
@@ -5168,6 +5198,13 @@ class PoseDataEditorCutter:
                     {
                         "default": False,
                         "tooltip": "Expand the crop so it preserves the original canvas aspect ratio when possible.",
+                    },
+                ),
+                "start_at_canvas_bottom": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Anchor the crop to the canvas bottom so it grows upward.",
                     },
                 ),
                 "analyze_start_seconds": (
@@ -5218,8 +5255,12 @@ class PoseDataEditorCutter:
         padding_top,
         padding_bottom,
         padding_normalized,
+        min_crop_size,
+        crop_expand,
+        max_crop_expand,
         keep_aspect_ratio,
         preserve_aspect_ratio,
+        start_at_canvas_bottom,
         analyze_start_seconds,
         analyze_stop_seconds_reversed,
         fps,
@@ -5280,7 +5321,11 @@ class PoseDataEditorCutter:
             padding_top,
             padding_bottom,
             padding_normalized,
+            min_crop_size,
+            crop_expand,
+            max_crop_expand,
             bool(preserve_aspect_ratio or keep_aspect_ratio),
+            bool(start_at_canvas_bottom),
             start_frame,
             stop_frame,
         )
@@ -5322,12 +5367,17 @@ class PoseDataEditorCutter:
             cutter_metadata = {}
             pose_data_copy["cutter_metadata"] = cutter_metadata
 
+        min_crop_w, min_crop_h = self._vec2_to_pair(min_crop_size)
         cutter_metadata.update(
             {
                 "preserve_aspect_ratio": bool(preserve_aspect_ratio or keep_aspect_ratio),
+                "start_at_canvas_bottom": bool(start_at_canvas_bottom),
                 "analyze_start_seconds": float(analyze_start_seconds),
                 "analyze_stop_seconds_reversed": float(analyze_stop_seconds_reversed),
                 "fps": float(fps),
+                "min_crop_size": [float(min_crop_w), float(min_crop_h)],
+                "crop_expand": float(crop_expand),
+                "max_crop_expand": float(max_crop_expand),
                 "bounding_box": [int(x0), int(y0), int(new_width), int(new_height)],
             }
         )
@@ -5344,7 +5394,11 @@ class PoseDataEditorCutter:
         padding_top,
         padding_bottom,
         padding_normalized,
+        min_crop_size,
+        crop_expand,
+        max_crop_expand,
         preserve_aspect_ratio,
+        start_at_canvas_bottom,
         start_frame,
         stop_frame,
     ):
@@ -5372,15 +5426,83 @@ class PoseDataEditorCutter:
         if largest_bbox is None:
             return None
 
+        content_left = float(largest_bbox[0])
+        content_top = float(largest_bbox[1])
+        content_right = float(largest_bbox[2])
+        content_bottom = float(largest_bbox[3])
+
+        content_width = max(0.0, content_right - content_left)
+        content_height = max(0.0, content_bottom - content_top)
+
         pad_left_px = self._resolve_padding(padding_left, padding_normalized, width)
         pad_right_px = self._resolve_padding(padding_right, padding_normalized, width)
         pad_top_px = self._resolve_padding(padding_top, padding_normalized, height)
         pad_bottom_px = self._resolve_padding(padding_bottom, padding_normalized, height)
 
-        x0 = max(0.0, float(largest_bbox[0]) - pad_left_px)
-        y0 = max(0.0, float(largest_bbox[1]) - pad_top_px)
-        x1 = min(float(width), float(largest_bbox[2]) + pad_right_px)
-        y1 = min(float(height), float(largest_bbox[3]) + pad_bottom_px)
+        x0 = content_left - pad_left_px
+        y0 = content_top - pad_top_px
+        x1 = content_right + pad_right_px
+        y1 = content_bottom + pad_bottom_px
+
+        crop_expand = max(0.0, float(crop_expand))
+        if crop_expand <= 0.0:
+            crop_expand = 1.0
+        if not math.isclose(crop_expand, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+            center_x = (x0 + x1) * 0.5
+            center_y = (y0 + y1) * 0.5
+            half_w = (x1 - x0) * 0.5 * crop_expand
+            half_h = (y1 - y0) * 0.5 * crop_expand
+            x0 = center_x - half_w
+            x1 = center_x + half_w
+            y0 = center_y - half_h
+            y1 = center_y + half_h
+
+        min_width, min_height = self._vec2_to_pair(min_crop_size)
+        min_width = float(min_width)
+        min_height = float(min_height)
+
+        center_x = (x0 + x1) * 0.5
+        center_y = (y0 + y1) * 0.5
+        current_width = x1 - x0
+        current_height = y1 - y0
+
+        if min_width > 0.0 and current_width < min_width:
+            half = min_width * 0.5
+            x0 = center_x - half
+            x1 = center_x + half
+            current_width = x1 - x0
+            center_x = (x0 + x1) * 0.5
+
+        if min_height > 0.0 and current_height < min_height:
+            half = min_height * 0.5
+            y0 = center_y - half
+            y1 = center_y + half
+            current_height = y1 - y0
+            center_y = (y0 + y1) * 0.5
+
+        max_expand = float(max_crop_expand)
+        if max_expand > 0.0:
+            center_x = (x0 + x1) * 0.5
+            center_y = (y0 + y1) * 0.5
+            if content_width > 0.0:
+                allowed_width = content_width * max_expand
+                if current_width > allowed_width:
+                    half = allowed_width * 0.5
+                    x0 = center_x - half
+                    x1 = center_x + half
+                    current_width = x1 - x0
+            if content_height > 0.0:
+                allowed_height = content_height * max_expand
+                if current_height > allowed_height:
+                    half = allowed_height * 0.5
+                    y0 = center_y - half
+                    y1 = center_y + half
+                    current_height = y1 - y0
+
+        x0 = max(0.0, x0)
+        y0 = max(0.0, y0)
+        x1 = min(float(width), x1)
+        y1 = min(float(height), y1)
 
         if preserve_aspect_ratio and width > 0 and height > 0:
             target_ratio = float(width) / float(height)
@@ -5393,6 +5515,13 @@ class PoseDataEditorCutter:
         y0 = int(max(0.0, math.floor(y0)))
         x1 = int(min(float(width), math.ceil(x1)))
         y1 = int(min(float(height), math.ceil(y1)))
+
+        if start_at_canvas_bottom:
+            desired_height = y1 - y0
+            if desired_height <= 0:
+                return None
+            y1 = int(height)
+            y0 = max(0, y1 - desired_height)
 
         if x1 <= x0 or y1 <= y0:
             return None
@@ -5461,61 +5590,398 @@ class PoseDataEditorCutter:
             return float(value) * float(size_reference)
         return float(value)
 
-        if (
-            crop_width <= 0.0
-            or crop_height <= 0.0
-            or target_ratio <= 0.0
-            or canvas_width <= 0.0
-            or canvas_height <= 0.0
-        ):
-            return x0, y0, x1, y1
+    def _vec2_to_pair(self, value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().flatten().tolist()
+        elif isinstance(value, np.ndarray):
+            value = value.flatten().tolist()
 
-        current_ratio = crop_width / crop_height
-        if abs(current_ratio - target_ratio) <= 1e-6:
-            return x0, y0, x1, y1
+        if isinstance(value, (list, tuple)):
+            if len(value) >= 2:
+                return float(value[0]), float(value[1])
+            if len(value) == 1:
+                scalar = float(value[0])
+                return scalar, scalar
 
-        center_x = (x0 + x1) * 0.5
-        center_y = (y0 + y1) * 0.5
+        try:
+            scalar = float(value)
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+        return scalar, scalar
 
-        if current_ratio > target_ratio:
-            new_width = crop_width
-            new_height = crop_width / target_ratio
+
+class PoseDataEditorWithMaskCutter(PoseDataEditorCutter):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "masks": ("MASK",),
+                "padding_left": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 4096.0,
+                        "step": 0.01,
+                        "tooltip": "Extra space to keep on the left side of the combined mask (pixels unless normalised).",
+                    },
+                ),
+                "padding_right": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 4096.0,
+                        "step": 0.01,
+                        "tooltip": "Extra space to keep on the right side of the combined mask (pixels unless normalised).",
+                    },
+                ),
+                "padding_top": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 4096.0,
+                        "step": 0.01,
+                        "tooltip": "Extra space to keep above the combined mask (pixels unless normalised).",
+                    },
+                ),
+                "padding_bottom": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 4096.0,
+                        "step": 0.01,
+                        "tooltip": "Extra space to keep below the combined mask (pixels unless normalised).",
+                    },
+                ),
+                "normalize": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Interpret padding values as ratios of the mask dimensions instead of pixels.",
+                    },
+                ),
+                "expand_mask": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 2048.0,
+                        "step": 0.01,
+                        "tooltip": "Uniform amount to expand the combined mask in every direction (pixels unless normalised).",
+                    },
+                ),
+                "expand_normalize": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Interpret the expand value as a ratio of the mask size instead of pixels.",
+                    },
+                ),
+                "mask_to_bottom": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Extend the filled mask down to the canvas bottom before cropping.",
+                    },
+                ),
+                "min_crop_size": (
+                    "VEC2",
+                    {
+                        "default": [0.0, 0.0],
+                        "min": 0.0,
+                        "max": 8192.0,
+                        "step": 1.0,
+                        "tooltip": "Minimum crop width and height (pixels). Set either axis to 0 to disable the limit.",
+                    },
+                ),
+                "max_crop_expand": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "Maximum allowed expansion factor relative to the detected mask bounds (0 disables the limit).",
+                    },
+                ),
+            },
+            "optional": {
+                "images": (
+                    "IMAGE",
+                    {
+                        "default": None,
+                        "tooltip": "Optional image frames to crop alongside the pose data.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "MASK")
+    RETURN_NAMES = ("pose_data", "images", "mask")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Combines multiple masks into a filled rectangle and crops pose data (and optional images) to that region."
+
+    def process(
+        self,
+        pose_data,
+        masks,
+        padding_left,
+        padding_right,
+        padding_top,
+        padding_bottom,
+        normalize,
+        expand_mask,
+        expand_normalize,
+        mask_to_bottom,
+        min_crop_size,
+        max_crop_expand,
+        images=None,
+    ):
+        if isinstance(pose_data, dict):
+            pose_data_copy = copy.deepcopy(pose_data)
         else:
-            new_height = crop_height
-            new_width = crop_height * target_ratio
+            pose_data_copy = pose_data
 
-        max_width = float(canvas_width)
-        max_height = float(canvas_height)
+        pose_metas = pose_data_copy.get("pose_metas", []) if isinstance(pose_data_copy, dict) else []
 
-        new_width = min(new_width, max_width)
-        new_height = min(new_height, max_height)
+        mask_stack, mask_device, mask_dtype = self._coerce_mask_stack(masks)
+        if mask_stack.size == 0:
+            empty_mask = torch.zeros((1, 0, 0), dtype=torch.float32)
+            if mask_device is not None:
+                empty_mask = empty_mask.to(device=mask_device)
+            if mask_dtype is not None:
+                empty_mask = empty_mask.to(dtype=mask_dtype)
+            return pose_data_copy, images, empty_mask
 
-        new_x0 = center_x - new_width * 0.5
-        new_y0 = center_y - new_height * 0.5
+        combined_mask = self._combine_masks(mask_stack)
+        bbox = self._mask_bounding_box(combined_mask)
 
-        max_x0 = max_width - new_width
-        max_y0 = max_height - new_height
+        if bbox is None:
+            filled_mask_tensor = self._to_mask_tensor(np.zeros_like(combined_mask, dtype=np.float32), mask_device, mask_dtype)
+            return pose_data_copy, images, filled_mask_tensor
 
-        if max_x0 < 0.0:
-            new_x0 = 0.0
-            new_x1 = max_width
+        mask_height, mask_width = combined_mask.shape
+        content_x0, content_y0, content_x1, content_y1 = bbox
+
+        pad_left = self._resolve_padding(padding_left, normalize, mask_width)
+        pad_right = self._resolve_padding(padding_right, normalize, mask_width)
+        pad_top = self._resolve_padding(padding_top, normalize, mask_height)
+        pad_bottom = self._resolve_padding(padding_bottom, normalize, mask_height)
+
+        expand_x = self._resolve_padding(expand_mask, expand_normalize, mask_width)
+        expand_y = self._resolve_padding(expand_mask, expand_normalize, mask_height)
+
+        x0 = content_x0 - pad_left - expand_x
+        x1 = content_x1 + pad_right + expand_x
+        y0 = content_y0 - pad_top - expand_y
+        y1 = content_y1 + pad_bottom + expand_y
+
+        if mask_to_bottom:
+            y1 = float(mask_height)
+
+        min_crop_w, min_crop_h = self._vec2_to_pair(min_crop_size)
+        min_crop_w = float(min_crop_w)
+        min_crop_h = float(min_crop_h)
+
+        current_width = x1 - x0
+        current_height = y1 - y0
+
+        if min_crop_w > 0.0 and current_width < min_crop_w:
+            deficit = (min_crop_w - current_width) * 0.5
+            x0 -= deficit
+            x1 += deficit
+            current_width = x1 - x0
+
+        if min_crop_h > 0.0 and current_height < min_crop_h:
+            deficit = (min_crop_h - current_height) * 0.5
+            y0 -= deficit
+            y1 += deficit
+            current_height = y1 - y0
+
+        max_expand = float(max_crop_expand)
+        content_width = content_x1 - content_x0
+        content_height = content_y1 - content_y0
+
+        if max_expand > 0.0:
+            center_x = (x0 + x1) * 0.5
+            center_y = (y0 + y1) * 0.5
+
+            if content_width > 0.0:
+                allowed_width = content_width * max_expand
+                if current_width > allowed_width:
+                    half = allowed_width * 0.5
+                    x0 = center_x - half
+                    x1 = center_x + half
+                    current_width = x1 - x0
+
+            if content_height > 0.0:
+                allowed_height = content_height * max_expand
+                if current_height > allowed_height:
+                    half = allowed_height * 0.5
+                    y0 = center_y - half
+                    y1 = center_y + half
+                    current_height = y1 - y0
+
+        x0 = max(0.0, x0)
+        y0 = max(0.0, y0)
+        x1 = min(float(mask_width), x1)
+        y1 = min(float(mask_height), y1)
+
+        if x1 <= x0 or y1 <= y0:
+            filled_mask_tensor = self._to_mask_tensor(np.zeros_like(combined_mask, dtype=np.float32), mask_device, mask_dtype)
+            return pose_data_copy, images, filled_mask_tensor
+
+        x0_int = int(max(0, math.floor(x0)))
+        y0_int = int(max(0, math.floor(y0)))
+        x1_int = int(min(mask_width, math.ceil(x1)))
+        y1_int = int(min(mask_height, math.ceil(y1)))
+
+        if x1_int <= x0_int or y1_int <= y0_int:
+            filled_mask_tensor = self._to_mask_tensor(np.zeros_like(combined_mask, dtype=np.float32), mask_device, mask_dtype)
+            return pose_data_copy, images, filled_mask_tensor
+
+        new_width = x1_int - x0_int
+        new_height = y1_int - y0_int
+
+        final_mask = np.zeros((mask_height, mask_width), dtype=np.float32)
+        final_mask[y0_int:y1_int, x0_int:x1_int] = 1.0
+        cropped_mask = final_mask[y0_int:y1_int, x0_int:x1_int]
+        mask_tensor = self._to_mask_tensor(cropped_mask, mask_device, mask_dtype)
+
+        images_result = images
+        images_np = None
+        images_device = None
+        images_dtype = None
+        images_available = False
+
+        if isinstance(images, torch.Tensor):
+            images_np = images.detach().cpu().numpy()
+            images_device = images.device
+            images_dtype = images.dtype
+            images_available = images_np.size > 0
+        elif isinstance(images, np.ndarray):
+            images_np = images
+            images_available = images_np.size > 0
+        elif images is not None:
+            try:
+                images_np = np.asarray(images)
+                images_available = images_np.size > 0
+            except Exception:
+                images_np = None
+
+        if images_available and images_np is not None:
+            cropped_np = images_np[:, y0_int:y1_int, x0_int:x1_int, ...]
+            if isinstance(images, torch.Tensor):
+                images_result = torch.from_numpy(cropped_np).to(device=images_device, dtype=images_dtype)
+            else:
+                images_result = torch.from_numpy(cropped_np)
+        elif isinstance(images, torch.Tensor):
+            images_result = images
+        elif images is None:
+            images_result = torch.zeros((0, 0, 0, 3), dtype=torch.float32)
+
+        if pose_metas:
+            for meta in pose_metas:
+                self._offset_aapose_meta(meta, x0_int, y0_int, new_width, new_height)
+
+            if isinstance(pose_data_copy, dict):
+                refer_meta = pose_data_copy.get("refer_pose_meta")
+                if isinstance(refer_meta, AAPoseMeta):
+                    self._offset_aapose_meta(refer_meta, x0_int, y0_int, new_width, new_height)
+
+                original_metas = pose_data_copy.get("pose_metas_original", [])
+                for original in original_metas or []:
+                    self._offset_original_meta(original, x0_int, y0_int, new_width, new_height)
+
+        if isinstance(pose_data_copy, dict):
+            metadata = pose_data_copy.get("mask_cutter_metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                pose_data_copy["mask_cutter_metadata"] = metadata
+
+            metadata.update(
+                {
+                    "normalize": bool(normalize),
+                    "expand_mask": float(expand_mask),
+                    "expand_normalize": bool(expand_normalize),
+                    "mask_to_bottom": bool(mask_to_bottom),
+                    "min_crop_size": [float(min_crop_w), float(min_crop_h)],
+                    "max_crop_expand": float(max_crop_expand),
+                    "padding": {
+                        "left": float(padding_left),
+                        "right": float(padding_right),
+                        "top": float(padding_top),
+                        "bottom": float(padding_bottom),
+                    },
+                    "bounding_box": [int(x0_int), int(y0_int), int(new_width), int(new_height)],
+                }
+            )
+
+        return pose_data_copy, images_result, mask_tensor
+
+    def _coerce_mask_stack(self, masks):
+        mask_device = None
+        mask_dtype = None
+
+        if isinstance(masks, torch.Tensor):
+            mask_device = masks.device
+            mask_dtype = masks.dtype
+            mask_stack = masks.detach().cpu().numpy()
         else:
-            new_x0 = min(max(new_x0, 0.0), max_x0)
-            new_x1 = new_x0 + new_width
+            mask_stack = np.asarray(masks)
 
-        if max_y0 < 0.0:
-            new_y0 = 0.0
-            new_y1 = max_height
+        mask_stack = np.asarray(mask_stack)
+        if mask_stack.ndim == 0:
+            return np.array([], dtype=np.float32), mask_device, mask_dtype
+
+        if mask_stack.ndim == 2:
+            mask_stack = mask_stack[None, ...]
+        elif mask_stack.ndim == 4:
+            mask_stack = mask_stack[..., 0]
+        elif mask_stack.ndim > 4:
+            mask_stack = mask_stack.reshape(mask_stack.shape[0], mask_stack.shape[-2], mask_stack.shape[-1])
+
+        mask_stack = mask_stack.astype(np.float32)
+        return mask_stack, mask_device, mask_dtype
+
+    def _combine_masks(self, mask_stack):
+        if mask_stack.ndim == 2:
+            combined = mask_stack
         else:
-            new_y0 = min(max(new_y0, 0.0), max_y0)
-            new_y1 = new_y0 + new_height
+            combined = np.max(mask_stack, axis=0)
+        return (combined > 0.0).astype(np.float32)
 
-        return new_x0, new_y0, new_x1, new_y1
+    def _mask_bounding_box(self, combined_mask):
+        active = combined_mask > 0.0
+        if not np.any(active):
+            return None
 
-    def _resolve_padding(self, value, normalized, size_reference):
-        if normalized:
-            return float(value) * float(size_reference)
-        return float(value)
+        rows = np.where(np.any(active, axis=1))[0]
+        cols = np.where(np.any(active, axis=0))[0]
+
+        if rows.size == 0 or cols.size == 0:
+            return None
+
+        y0 = float(rows[0])
+        y1 = float(rows[-1] + 1)
+        x0 = float(cols[0])
+        x1 = float(cols[-1] + 1)
+        return x0, y0, x1, y1
+
+    def _to_mask_tensor(self, mask, device, dtype):
+        if mask.ndim == 2:
+            mask = mask[None, ...]
+        tensor = torch.from_numpy(mask.astype(np.float32))
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        if device is not None:
+            tensor = tensor.to(device=device)
+        return tensor
 
     def _compute_bbox(self, meta):
         keypoint_sets = []
@@ -6514,6 +6980,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetection": PoseAndFaceDetection,
     "PoseDataEditor": PoseDataEditor,
     "PoseDataEditorCutter": PoseDataEditorCutter,
+    "PoseDataEditorWithMaskCutter": PoseDataEditorWithMaskCutter,
     "PoseDataEditorBlackout": PoseDataEditorBlackout,
     "PoseDataEditorAutomatic": PoseDataEditorAutomatic,
     "PoseDataEditorAutoPositioning": PoseDataEditorAutoPositioning,
@@ -6538,7 +7005,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "OnnxDetectionModelLoader": "ONNX Detection Model Loader",
     "PoseAndFaceDetection": "Pose and Face Detection",
     "PoseDataEditor": "Pose Data Editor",
-    "PoseDataEditorCutter": "Pose Data Editor Cutter",
+    "PoseDataEditorCutter": "Pose Data Editor Cutter v2",
+    "PoseDataEditorWithMaskCutter": "Pose Data Editor With Mask Cutter",
     "PoseDataEditorBlackout": "Pose Data Editor Blackout",
     "PoseDataEditorAutomatic": "Pose Data Editor Automatic",
     "PoseDataEditorAutoPositioning": "Pose Data Editor Auto-Positioning",
