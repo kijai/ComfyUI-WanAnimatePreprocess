@@ -5156,24 +5156,14 @@ class PoseDataEditorCutter:
                         "tooltip": "Interpret padding values as 0-1 ratios of the image dimensions instead of pixels.",
                     },
                 ),
-                "min_crop_width": (
-                    "FLOAT",
+                "min_crop_size": (
+                    "VEC2",
                     {
-                        "default": 0.0,
+                        "default": [0.0, 0.0],
                         "min": 0.0,
                         "max": 8192.0,
                         "step": 1.0,
-                        "tooltip": "Minimum crop width in pixels. Set to 0 to disable the width constraint.",
-                    },
-                ),
-                "min_crop_height": (
-                    "FLOAT",
-                    {
-                        "default": 0.0,
-                        "min": 0.0,
-                        "max": 8192.0,
-                        "step": 1.0,
-                        "tooltip": "Minimum crop height in pixels. Set to 0 to disable the height constraint.",
+                        "tooltip": "Minimum crop width and height (pixels). Set either axis to 0 to disable the limit.",
                     },
                 ),
                 "crop_expand": (
@@ -5248,18 +5238,6 @@ class PoseDataEditorCutter:
                     },
                 ),
             },
-            "optional": {
-                "min_crop_size": (
-                    "VEC2",
-                    {
-                        "default": [0.0, 0.0],
-                        "min": 0.0,
-                        "max": 8192.0,
-                        "step": 1.0,
-                        "tooltip": "Legacy combined minimum crop size. Overrides the width/height fields when provided.",
-                    },
-                ),
-            },
         }
 
     RETURN_TYPES = ("POSEDATA", "IMAGE")
@@ -5277,8 +5255,7 @@ class PoseDataEditorCutter:
         padding_top,
         padding_bottom,
         padding_normalized,
-        min_crop_width,
-        min_crop_height,
+        min_crop_size,
         crop_expand,
         max_crop_expand,
         keep_aspect_ratio,
@@ -5287,7 +5264,6 @@ class PoseDataEditorCutter:
         analyze_start_seconds,
         analyze_stop_seconds_reversed,
         fps,
-        min_crop_size=None,
     ):
         pose_data_copy = copy.deepcopy(pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
@@ -5336,13 +5312,6 @@ class PoseDataEditorCutter:
         if width in (None, 0) or height in (None, 0):
             return (pose_data_copy, images)
 
-        min_crop_w = float(min_crop_width)
-        min_crop_h = float(min_crop_height)
-        if min_crop_size is not None:
-            legacy_w, legacy_h = self._vec2_to_pair(min_crop_size)
-            min_crop_w = float(legacy_w)
-            min_crop_h = float(legacy_h)
-
         crop_bounds = self._determine_crop_bounds(
             pose_metas,
             width,
@@ -5352,8 +5321,7 @@ class PoseDataEditorCutter:
             padding_top,
             padding_bottom,
             padding_normalized,
-            min_crop_w,
-            min_crop_h,
+            min_crop_size,
             crop_expand,
             max_crop_expand,
             bool(preserve_aspect_ratio or keep_aspect_ratio),
@@ -5399,6 +5367,7 @@ class PoseDataEditorCutter:
             cutter_metadata = {}
             pose_data_copy["cutter_metadata"] = cutter_metadata
 
+        min_crop_w, min_crop_h = self._vec2_to_pair(min_crop_size)
         cutter_metadata.update(
             {
                 "preserve_aspect_ratio": bool(preserve_aspect_ratio or keep_aspect_ratio),
@@ -5406,8 +5375,6 @@ class PoseDataEditorCutter:
                 "analyze_start_seconds": float(analyze_start_seconds),
                 "analyze_stop_seconds_reversed": float(analyze_stop_seconds_reversed),
                 "fps": float(fps),
-                "min_crop_width": float(min_crop_w),
-                "min_crop_height": float(min_crop_h),
                 "min_crop_size": [float(min_crop_w), float(min_crop_h)],
                 "crop_expand": float(crop_expand),
                 "max_crop_expand": float(max_crop_expand),
@@ -5427,8 +5394,7 @@ class PoseDataEditorCutter:
         padding_top,
         padding_bottom,
         padding_normalized,
-        min_crop_width,
-        min_crop_height,
+        min_crop_size,
         crop_expand,
         max_crop_expand,
         preserve_aspect_ratio,
@@ -5491,13 +5457,14 @@ class PoseDataEditorCutter:
             y0 = center_y - half_h
             y1 = center_y + half_h
 
+        min_width, min_height = self._vec2_to_pair(min_crop_size)
+        min_width = float(min_width)
+        min_height = float(min_height)
+
         center_x = (x0 + x1) * 0.5
         center_y = (y0 + y1) * 0.5
         current_width = x1 - x0
         current_height = y1 - y0
-
-        min_width = float(min_crop_width)
-        min_height = float(min_crop_height)
 
         if min_width > 0.0 and current_width < min_width:
             half = min_width * 0.5
@@ -5721,24 +5688,14 @@ class PoseDataEditorWithMaskCutter(PoseDataEditorCutter):
                         "tooltip": "Extend the filled mask down to the canvas bottom before cropping.",
                     },
                 ),
-                "min_crop_width": (
-                    "FLOAT",
+                "min_crop_size": (
+                    "VEC2",
                     {
-                        "default": 0.0,
+                        "default": [0.0, 0.0],
                         "min": 0.0,
                         "max": 8192.0,
                         "step": 1.0,
-                        "tooltip": "Minimum crop width in pixels. Set to 0 to disable the width constraint.",
-                    },
-                ),
-                "min_crop_height": (
-                    "FLOAT",
-                    {
-                        "default": 0.0,
-                        "min": 0.0,
-                        "max": 8192.0,
-                        "step": 1.0,
-                        "tooltip": "Minimum crop height in pixels. Set to 0 to disable the height constraint.",
+                        "tooltip": "Minimum crop width and height (pixels). Set either axis to 0 to disable the limit.",
                     },
                 ),
                 "max_crop_expand": (
@@ -5753,16 +5710,6 @@ class PoseDataEditorWithMaskCutter(PoseDataEditorCutter):
                 ),
             },
             "optional": {
-                "min_crop_size": (
-                    "VEC2",
-                    {
-                        "default": [0.0, 0.0],
-                        "min": 0.0,
-                        "max": 8192.0,
-                        "step": 1.0,
-                        "tooltip": "Legacy combined minimum crop size. Overrides the width/height fields when provided.",
-                    },
-                ),
                 "images": (
                     "IMAGE",
                     {
@@ -5791,11 +5738,9 @@ class PoseDataEditorWithMaskCutter(PoseDataEditorCutter):
         expand_mask,
         expand_normalize,
         mask_to_bottom,
-        min_crop_width,
-        min_crop_height,
+        min_crop_size,
         max_crop_expand,
         images=None,
-        min_crop_size=None,
     ):
         if isinstance(pose_data, dict):
             pose_data_copy = copy.deepcopy(pose_data)
@@ -5839,12 +5784,9 @@ class PoseDataEditorWithMaskCutter(PoseDataEditorCutter):
         if mask_to_bottom:
             y1 = float(mask_height)
 
-        min_crop_w = float(min_crop_width)
-        min_crop_h = float(min_crop_height)
-        if min_crop_size is not None:
-            legacy_w, legacy_h = self._vec2_to_pair(min_crop_size)
-            min_crop_w = float(legacy_w)
-            min_crop_h = float(legacy_h)
+        min_crop_w, min_crop_h = self._vec2_to_pair(min_crop_size)
+        min_crop_w = float(min_crop_w)
+        min_crop_h = float(min_crop_h)
 
         current_width = x1 - x0
         current_height = y1 - y0
@@ -5968,8 +5910,6 @@ class PoseDataEditorWithMaskCutter(PoseDataEditorCutter):
                     "expand_mask": float(expand_mask),
                     "expand_normalize": bool(expand_normalize),
                     "mask_to_bottom": bool(mask_to_bottom),
-                    "min_crop_width": float(min_crop_w),
-                    "min_crop_height": float(min_crop_h),
                     "min_crop_size": [float(min_crop_w), float(min_crop_h)],
                     "max_crop_expand": float(max_crop_expand),
                     "padding": {
