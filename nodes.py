@@ -8503,6 +8503,188 @@ class PoseDataEditorKeypointDeleter:
             return float("nan")
 
 
+class PoseDataEditorKneeCutter:
+    KNEE_INDICES = (14, 15)
+    BODY_KEYPOINT_NAMES = {14: "left_knee", 15: "right_knee"}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 30,
+                        "min": 1,
+                        "max": 240,
+                        "step": 1,
+                        "tooltip": "Frame rate of the pose data sequence (reserved for future use).",
+                    },
+                ),
+                "normalize": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Set to true if knee coordinates are normalized (0-1).",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING")
+    RETURN_NAMES = ("pose_data", "log")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = (
+        "Removes knee keypoints immediately when they touch or cross the canvas bottom boundary."
+    )
+
+    def process(self, pose_data, fps, normalize):  # pylint: disable=unused-argument
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas") or []
+        pose_metas_original = pose_data_copy.get("pose_metas_original") or []
+
+        if not pose_metas and not pose_metas_original:
+            return (pose_data_copy, "No pose frames available.")
+
+        removal_log = []
+        removed_any = False
+
+        if pose_metas:
+            removed_any |= self._process_pose_metas(pose_metas, normalize, removal_log)
+
+        if pose_metas_original:
+            removed_any |= self._process_original_metas(
+                pose_metas_original, normalize, removal_log
+            )
+
+        if not removed_any:
+            removal_log.append("No knees touched the canvas bottom.")
+
+        return (pose_data_copy, "\n".join(removal_log))
+
+    def _process_pose_metas(self, pose_metas, normalize, removal_log):
+        removed_any = False
+        for frame_idx, meta in enumerate(pose_metas):
+            if not isinstance(meta, AAPoseMeta):
+                continue
+
+            height = self._to_float(getattr(meta, "height", None))
+            coords = getattr(meta, "kps_body", None)
+            scores = getattr(meta, "kps_body_p", None)
+            removed = self._prune_body_coords(
+                coords,
+                scores,
+                height,
+                normalize,
+                frame_idx,
+                removal_log,
+            )
+
+            if removed:
+                removed_any = True
+
+        return removed_any
+
+    def _process_original_metas(self, pose_metas_original, normalize, removal_log):
+        removed_any = False
+        for frame_idx, entry in enumerate(pose_metas_original):
+            if not isinstance(entry, dict):
+                continue
+
+            height = self._to_float(entry.get("height"))
+            keypoints_body = entry.get("keypoints_body")
+            if keypoints_body is None:
+                continue
+
+            points_np = np.asarray(keypoints_body, dtype=np.float32)
+            if points_np.ndim != 2 or points_np.shape[1] < 3:
+                continue
+
+            removed = False
+            for knee_index in self.KNEE_INDICES:
+                if knee_index >= points_np.shape[0]:
+                    continue
+
+                y_coord = self._to_float(points_np[knee_index, 1])
+                if not math.isfinite(y_coord):
+                    continue
+
+                if not normalize:
+                    if not math.isfinite(height) or height <= 0.0:
+                        continue
+                    threshold = height
+                else:
+                    threshold = 1.0
+
+                if y_coord >= threshold - 1e-6:
+                    points_np[knee_index, 2] = 0.0
+                    if points_np.shape[1] > 0:
+                        points_np[knee_index, 0] = 0.0
+                    if points_np.shape[1] > 1:
+                        points_np[knee_index, 1] = 0.0
+                    removal_log.append(
+                        self._format_log_entry(frame_idx, knee_index, normalize, y_coord)
+                    )
+                    removed = True
+
+            if removed:
+                entry["keypoints_body"] = points_np.tolist()
+                removed_any = True
+
+        return removed_any
+
+    def _prune_body_coords(self, coords, scores, height, normalize, frame_idx, removal_log):
+        if coords is None or scores is None:
+            return False
+
+        removed_any = False
+        for knee_index in self.KNEE_INDICES:
+            if knee_index >= len(coords) or knee_index >= len(scores):
+                continue
+
+            coord_pair = coords[knee_index]
+            if coord_pair is None or len(coord_pair) < 2:
+                continue
+
+            y_coord = self._to_float(coord_pair[1])
+            if not math.isfinite(y_coord):
+                continue
+
+            if not normalize:
+                if not math.isfinite(height) or height <= 0.0:
+                    continue
+                threshold = height
+            else:
+                threshold = 1.0
+
+            if y_coord >= threshold - 1e-6:
+                scores[knee_index] = 0.0
+                coord_pair[0] = 0.0
+                coord_pair[1] = 0.0
+                removal_log.append(
+                    self._format_log_entry(frame_idx, knee_index, normalize, y_coord)
+                )
+                removed_any = True
+
+        return removed_any
+
+    def _format_log_entry(self, frame_idx, knee_index, normalize, original_value):
+        name = self.BODY_KEYPOINT_NAMES.get(knee_index, f"index_{knee_index}")
+        value_type = "normalized" if normalize else "pixel"
+        return (
+            f"Frame {frame_idx}: removed {name} (y={original_value:.4f} {value_type}) for crossing the canvas bottom."
+        )
+
+    @staticmethod
+    def _to_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+
 class BlackStripeImage:
     @classmethod
     def INPUT_TYPES(cls):
@@ -8719,6 +8901,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorWithMaskCutter": PoseDataEditorWithMaskCutter,
     "PoseDataEditorBlackout": PoseDataEditorBlackout,
     "PoseDataEditorKeypointDeleter": PoseDataEditorKeypointDeleter,
+    "PoseDataEditorKneeCutter": PoseDataEditorKneeCutter,
     "PoseDataEditorAutomatic": PoseDataEditorAutomatic,
     "PoseDataEditorAutoPositioning": PoseDataEditorAutoPositioning,
     "PoseDataEditorAutomaticPositioningAndStretching": PoseDataEditorAutomaticPositioningAndStretching,
@@ -8747,6 +8930,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorWithMaskCutter": "Pose Data Editor With Mask Cutter",
     "PoseDataEditorBlackout": "Pose Data Editor Blackout",
     "PoseDataEditorKeypointDeleter": "Pose Data Editor Keypoint Deleter",
+    "PoseDataEditorKneeCutter": "Pose Data Editor Knee Cutter",
     "PoseDataEditorAutomatic": "Pose Data Editor Automatic",
     "PoseDataEditorAutoPositioning": "Pose Data Editor Auto-Positioning",
     "PoseDataEditorAutomaticPositioningAndStretching": "Pose Data Editor Automatic Positioning and Stretching",
