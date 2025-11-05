@@ -8012,13 +8012,6 @@ class DrawViTPose:
 
 
 class PoseDataEditorKeypointDeleter:
-    TARGET_CHOICES = ("Knees", "Feet", "Head", "Hands")
-    GROUP_SPECS = {
-        "KNEES": {"body": {13, 14, 15, 16}},
-        "FEET": {"body": {15, 16, 17, 18, 19, 20, 21, 22, 23, 24}},
-        "HEAD": {"body": {0, 1, 2, 3, 4, 5}, "face": None},
-        "HANDS": {"body": {9, 10, 11}, "lhand": None, "rhand": None},
-    }
     BODY_KEYPOINT_NAMES = {
         0: "nose",
         1: "left_eye",
@@ -8080,11 +8073,10 @@ class PoseDataEditorKeypointDeleter:
                     },
                 ),
                 "target_keypoints": (
-                    "STRING",
+                    TARGET_OPTIONS,
                     {
-                        "default": "",
-                        "multiline": False,
-                        "tooltip": "Comma-separated list of keypoint groups (Knees, Feet, Head, Hands) to monitor when selective delete is enabled.",
+                        "default": "BODY",
+                        "tooltip": "When selective delete is enabled, choose which pose region to monitor (same options as Pose Data Editor).",
                     },
                 ),
             }
@@ -8154,6 +8146,10 @@ class PoseDataEditorKeypointDeleter:
         if not selective_delete:
             return {"body": None, "lhand": None, "rhand": None, "face": None}
 
+        monitor_from_dropdown = self._build_monitor_from_dropdown(target_keypoints)
+        if monitor_from_dropdown is not None:
+            return monitor_from_dropdown
+
         tokens = []
         if isinstance(target_keypoints, str):
             parts = [part.strip().upper() for part in target_keypoints.replace("\n", ",").split(",")]
@@ -8165,7 +8161,7 @@ class PoseDataEditorKeypointDeleter:
         monitor = {"body": set(), "lhand": set(), "rhand": set(), "face": set()}
 
         for token in tokens:
-            spec = self.GROUP_SPECS.get(token)
+            spec = self._legacy_group_spec(token)
             if not spec:
                 continue
 
@@ -8184,6 +8180,52 @@ class PoseDataEditorKeypointDeleter:
                 monitor[key] = set()
 
         return monitor
+
+    def _build_monitor_from_dropdown(self, target_keypoints):
+        option = (target_keypoints or "").strip().upper() if isinstance(target_keypoints, str) else ""
+        if not option:
+            return None
+
+        valid_options = {opt.upper() for opt in TARGET_OPTIONS}
+        if option not in valid_options:
+            return None
+
+        monitor = {"body": set(), "lhand": set(), "rhand": set(), "face": set()}
+
+        if option == "ALL":
+            return {"body": None, "lhand": None, "rhand": None, "face": None}
+
+        if option == "BODY":
+            monitor["body"] = None
+            return monitor
+
+        if option in BODY_GROUPS:
+            monitor["body"].update(BODY_GROUPS[option])
+            return monitor
+
+        if option in HAND_GROUPS:
+            hand_target = HAND_GROUPS[option]
+            if hand_target in ("left", "both"):
+                monitor["lhand"] = None
+            if hand_target in ("right", "both"):
+                monitor["rhand"] = None
+            return monitor
+
+        if option in FACE_GROUP:
+            monitor["face"] = None
+            return monitor
+
+        return {"body": None, "lhand": None, "rhand": None, "face": None}
+
+    def _legacy_group_spec(self, token):
+        legacy_groups = {
+            "KNEES": {"body": {13, 14, 15, 16}},
+            "FEET": {"body": {15, 16, 17, 18, 19, 20, 21, 22, 23, 24}},
+            "HEAD": {"body": {0, 1, 2, 3, 4, 5}, "face": None},
+            "HANDS": {"body": {9, 10, 11}, "lhand": None, "rhand": None},
+        }
+
+        return legacy_groups.get(token)
 
     @staticmethod
     def _empty_deletion_record():
