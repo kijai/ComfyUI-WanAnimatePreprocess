@@ -1,6 +1,8 @@
 import os
 import copy
 import math
+from collections import defaultdict
+
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -8008,6 +8010,824 @@ class DrawViTPose:
 
         return (pose_images_tensor, )
 
+
+class PoseDataEditorKeypointDeleter:
+    BODY_KEYPOINT_NAMES = {
+        0: "nose",
+        1: "left_eye",
+        2: "right_eye",
+        3: "left_ear",
+        4: "right_ear",
+        5: "neck",
+        6: "left_shoulder",
+        7: "right_shoulder",
+        8: "left_elbow",
+        9: "right_elbow",
+        10: "left_wrist",
+        11: "right_wrist",
+        12: "left_hip",
+        13: "right_hip",
+        14: "left_knee",
+        15: "right_knee",
+        16: "left_ankle",
+        17: "right_ankle",
+        18: "left_big_toe",
+        19: "left_small_toe",
+        20: "left_heel",
+        21: "right_big_toe",
+        22: "right_small_toe",
+        23: "right_heel",
+        24: "hip",
+    }
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "duration": (
+                    "FLOAT",
+                    {
+                        "default": 0.5,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": "Seconds a keypoint may stay at the canvas border before deletion.",
+                    },
+                ),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 30,
+                        "min": 1,
+                        "max": 240,
+                        "step": 1,
+                        "tooltip": "Frame rate used to convert the duration to frame counts.",
+                    },
+                ),
+                "selective_delete": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "When enabled, only the selected keypoint groups are monitored.",
+                    },
+                ),
+                "target_keypoints": (
+                    TARGET_OPTIONS,
+                    {
+                        "default": "BODY",
+                        "tooltip": "When selective delete is enabled, choose which pose region to monitor (same options as Pose Data Editor).",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING")
+    RETURN_NAMES = ("pose_data", "log")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Removes keypoints that keep pressing against the canvas border for longer than the configured duration."
+
+    def process(self, pose_data, duration, fps, selective_delete, target_keypoints):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas") or []
+        pose_metas_original = pose_data_copy.get("pose_metas_original") or []
+
+        frame_count = max(len(pose_metas), len(pose_metas_original))
+        if frame_count == 0:
+            return (pose_data_copy, "No pose frames available.")
+
+        duration_value = max(0.0, float(duration))
+        fps_value = max(1, int(fps))
+        frames_required = max(1, int(math.ceil(duration_value * fps_value)))
+
+        monitor_spec = self._build_monitor_spec(selective_delete, target_keypoints)
+
+        counters = defaultdict(int)
+        frame_deletions = [self._empty_deletion_record() for _ in range(frame_count)]
+        deletion_log = []
+
+        if pose_metas:
+            self._evaluate_pose_metas(
+                pose_metas,
+                frames_required,
+                monitor_spec,
+                counters,
+                frame_deletions,
+                deletion_log,
+            )
+        else:
+            self._evaluate_original_metas(
+                pose_metas_original,
+                frames_required,
+                monitor_spec,
+                counters,
+                frame_deletions,
+                deletion_log,
+            )
+
+        if pose_metas:
+            for idx, meta in enumerate(pose_metas):
+                deletions = frame_deletions[idx]
+                self._apply_deletions_to_meta(meta, deletions)
+
+        if pose_metas_original:
+            for idx, entry in enumerate(pose_metas_original):
+                deletions = frame_deletions[idx]
+                self._apply_deletions_to_meta_dict(entry, deletions)
+
+        pose_data_copy["pose_metas"] = pose_metas
+        pose_data_copy["pose_metas_original"] = pose_metas_original
+
+        log_output = self._format_log(deletion_log, fps_value)
+        return (pose_data_copy, log_output)
+
+    def _build_monitor_spec(self, selective_delete, target_keypoints):
+        if not selective_delete:
+            return {"body": None, "lhand": None, "rhand": None, "face": None}
+
+        monitor_from_dropdown = self._build_monitor_from_dropdown(target_keypoints)
+        if monitor_from_dropdown is not None:
+            return monitor_from_dropdown
+
+        tokens = []
+        if isinstance(target_keypoints, str):
+            parts = [part.strip().upper() for part in target_keypoints.replace("\n", ",").split(",")]
+            tokens = [part for part in parts if part]
+
+        if not tokens:
+            return {"body": None, "lhand": None, "rhand": None, "face": None}
+
+        monitor = {"body": set(), "lhand": set(), "rhand": set(), "face": set()}
+
+        for token in tokens:
+            spec = self._legacy_group_spec(token)
+            if not spec:
+                continue
+
+            for key, indices in spec.items():
+                if indices is None:
+                    monitor[key] = None
+                    continue
+
+                if monitor[key] is None:
+                    continue
+
+                monitor[key].update(indices)
+
+        for key, value in monitor.items():
+            if isinstance(value, set) and not value:
+                monitor[key] = set()
+
+        return monitor
+
+    def _build_monitor_from_dropdown(self, target_keypoints):
+        option = (target_keypoints or "").strip().upper() if isinstance(target_keypoints, str) else ""
+        if not option:
+            return None
+
+        valid_options = {opt.upper() for opt in TARGET_OPTIONS}
+        if option not in valid_options:
+            return None
+
+        monitor = {"body": set(), "lhand": set(), "rhand": set(), "face": set()}
+
+        if option == "ALL":
+            return {"body": None, "lhand": None, "rhand": None, "face": None}
+
+        if option == "BODY":
+            monitor["body"] = None
+            return monitor
+
+        if option in BODY_GROUPS:
+            monitor["body"].update(BODY_GROUPS[option])
+            return monitor
+
+        if option in HAND_GROUPS:
+            hand_target = HAND_GROUPS[option]
+            if hand_target in ("left", "both"):
+                monitor["lhand"] = None
+            if hand_target in ("right", "both"):
+                monitor["rhand"] = None
+            return monitor
+
+        if option in FACE_GROUP:
+            monitor["face"] = None
+            return monitor
+
+        return {"body": None, "lhand": None, "rhand": None, "face": None}
+
+    def _legacy_group_spec(self, token):
+        legacy_groups = {
+            "KNEES": {"body": {13, 14, 15, 16}},
+            "FEET": {"body": {15, 16, 17, 18, 19, 20, 21, 22, 23, 24}},
+            "HEAD": {"body": {0, 1, 2, 3, 4, 5}, "face": None},
+            "HANDS": {"body": {9, 10, 11}, "lhand": None, "rhand": None},
+        }
+
+        return legacy_groups.get(token)
+
+    @staticmethod
+    def _empty_deletion_record():
+        return {"body": set(), "lhand": set(), "rhand": set(), "face": set()}
+
+    def _evaluate_pose_metas(
+        self,
+        pose_metas,
+        frames_required,
+        monitor_spec,
+        counters,
+        frame_deletions,
+        deletion_log,
+    ):
+        for frame_idx, meta in enumerate(pose_metas):
+            if not isinstance(meta, AAPoseMeta):
+                continue
+
+            width = self._to_float(getattr(meta, "width", None))
+            height = self._to_float(getattr(meta, "height", None))
+            if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or height <= 0:
+                self._reset_frame_counters(monitor_spec, counters)
+                continue
+
+            arrays = (
+                ("body", getattr(meta, "kps_body", None), getattr(meta, "kps_body_p", None)),
+                ("lhand", getattr(meta, "kps_lhand", None), getattr(meta, "kps_lhand_p", None)),
+                ("rhand", getattr(meta, "kps_rhand", None), getattr(meta, "kps_rhand_p", None)),
+                ("face", getattr(meta, "kps_face", None), getattr(meta, "kps_face_p", None)),
+            )
+
+            for key_type, coords, scores in arrays:
+                self._evaluate_frame_array(
+                    frame_idx,
+                    key_type,
+                    coords,
+                    scores,
+                    width,
+                    height,
+                    frames_required,
+                    monitor_spec,
+                    counters,
+                    frame_deletions,
+                    deletion_log,
+                )
+
+    def _evaluate_original_metas(
+        self,
+        meta_dicts,
+        frames_required,
+        monitor_spec,
+        counters,
+        frame_deletions,
+        deletion_log,
+    ):
+        for frame_idx, entry in enumerate(meta_dicts):
+            if not isinstance(entry, dict):
+                continue
+
+            width = self._to_float(entry.get("width"))
+            height = self._to_float(entry.get("height"))
+            if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or height <= 0:
+                self._reset_frame_counters(monitor_spec, counters)
+                continue
+
+            arrays = (
+                ("body", entry.get("keypoints_body")),
+                ("lhand", entry.get("keypoints_left_hand")),
+                ("rhand", entry.get("keypoints_right_hand")),
+                ("face", entry.get("keypoints_face")),
+            )
+
+            for key_type, points in arrays:
+                if points is None:
+                    self._reset_array_counters(key_type, monitor_spec, counters)
+                    continue
+
+                points_np = np.asarray(points, dtype=np.float32)
+                if points_np.ndim != 2 or points_np.shape[1] < 3:
+                    self._reset_array_counters(key_type, monitor_spec, counters)
+                    continue
+
+                coords = points_np[:, :2].copy()
+                coords[:, 0] *= width
+                coords[:, 1] *= height
+
+                scores = points_np[:, 2]
+
+                self._evaluate_frame_array(
+                    frame_idx,
+                    key_type,
+                    coords,
+                    scores,
+                    width,
+                    height,
+                    frames_required,
+                    monitor_spec,
+                    counters,
+                    frame_deletions,
+                    deletion_log,
+                )
+
+    def _evaluate_frame_array(
+        self,
+        frame_idx,
+        key_type,
+        coords,
+        scores,
+        width,
+        height,
+        frames_required,
+        monitor_spec,
+        counters,
+        frame_deletions,
+        deletion_log,
+    ):
+        indices = self._resolve_indices(key_type, coords, monitor_spec)
+        if not indices:
+            self._reset_array_counters(key_type, monitor_spec, counters)
+            return
+
+        coords_np = np.asarray(coords, dtype=np.float32)
+        scores_np = None if scores is None else np.asarray(scores, dtype=np.float32)
+
+        for idx in indices:
+            key = (key_type, idx)
+
+            if coords_np.ndim != 2 or idx >= coords_np.shape[0]:
+                counters[key] = 0
+                continue
+
+            point = coords_np[idx]
+            if point.shape[0] < 2 or not np.isfinite(point[:2]).all():
+                counters[key] = 0
+                continue
+
+            if scores_np is not None:
+                if idx >= scores_np.shape[0] or scores_np[idx] <= 0.0:
+                    counters[key] = 0
+                    continue
+
+            touching = self._is_touching_border(point[0], point[1], width, height)
+            if touching:
+                counters[key] += 1
+                if counters[key] >= frames_required:
+                    frame_deletions[frame_idx][key_type].add(idx)
+                    if counters[key] == frames_required:
+                        deletion_log.append((frame_idx, key_type, idx))
+                    counters[key] = min(counters[key], frames_required)
+            else:
+                counters[key] = 0
+
+    def _apply_deletions_to_meta(self, meta, deletions):
+        arrays = (
+            ("body", getattr(meta, "kps_body", None), getattr(meta, "kps_body_p", None)),
+            ("lhand", getattr(meta, "kps_lhand", None), getattr(meta, "kps_lhand_p", None)),
+            ("rhand", getattr(meta, "kps_rhand", None), getattr(meta, "kps_rhand_p", None)),
+            ("face", getattr(meta, "kps_face", None), getattr(meta, "kps_face_p", None)),
+        )
+
+        for key_type, coords, scores in arrays:
+            indices = deletions.get(key_type)
+            if not indices or coords is None or scores is None:
+                continue
+
+            for idx in indices:
+                if idx < len(scores):
+                    scores[idx] = 0.0
+                if idx < len(coords) and len(coords[idx]) >= 2:
+                    coords[idx][0] = 0.0
+                    coords[idx][1] = 0.0
+
+    def _apply_deletions_to_meta_dict(self, entry, deletions):
+        key_map = {
+            "body": "keypoints_body",
+            "lhand": "keypoints_left_hand",
+            "rhand": "keypoints_right_hand",
+            "face": "keypoints_face",
+        }
+
+        for key_type, key_name in key_map.items():
+            indices = deletions.get(key_type)
+            if not indices:
+                continue
+
+            points = entry.get(key_name)
+            if points is None:
+                continue
+
+            points_np = np.asarray(points, dtype=np.float32)
+            if points_np.ndim != 2 or points_np.shape[1] < 3:
+                continue
+
+            for idx in indices:
+                if idx < points_np.shape[0]:
+                    points_np[idx, 2] = 0.0
+            entry[key_name] = points_np.tolist()
+
+    @staticmethod
+    def _resolve_indices(key_type, coords, monitor_spec):
+        monitor = monitor_spec.get(key_type)
+        if coords is None:
+            return []
+
+        count = len(coords)
+        if monitor is None:
+            return list(range(count))
+
+        return [idx for idx in monitor if idx < count]
+
+    @staticmethod
+    def _reset_frame_counters(monitor_spec, counters):
+        for key_type in ("body", "lhand", "rhand", "face"):
+            monitor = monitor_spec.get(key_type)
+            if monitor is None:
+                keys = [k for k in counters.keys() if k[0] == key_type]
+                for key in keys:
+                    counters[key] = 0
+            else:
+                for idx in monitor:
+                    counters[(key_type, idx)] = 0
+
+    @staticmethod
+    def _reset_array_counters(key_type, monitor_spec, counters):
+        monitor = monitor_spec.get(key_type)
+        if monitor is None:
+            keys = [k for k in counters.keys() if k[0] == key_type]
+            for key in keys:
+                counters[key] = 0
+        else:
+            for idx in monitor:
+                counters[(key_type, idx)] = 0
+
+    @staticmethod
+    def _is_touching_border(x, y, width, height):
+        if not math.isfinite(x) or not math.isfinite(y):
+            return False
+
+        epsilon = 1e-6
+        if x <= 0.0 + epsilon or x >= width - epsilon:
+            return True
+        if y <= 0.0 + epsilon or y >= height - epsilon:
+            return True
+        return False
+
+    def _format_log(self, deletion_log, fps):
+        if not deletion_log:
+            return "No keypoints were removed."
+
+        lines = []
+        for frame_idx, key_type, idx in deletion_log:
+            timestamp = frame_idx / fps if fps > 0 else 0.0
+            name = self._describe_keypoint(key_type, idx)
+            lines.append(
+                f"Frame {frame_idx} ({timestamp:.3f}s): removed {name} ({key_type}[{idx}])."
+            )
+        return "\n".join(lines)
+
+    def _describe_keypoint(self, key_type, idx):
+        if key_type == "body":
+            return self.BODY_KEYPOINT_NAMES.get(idx, f"body #{idx}")
+        if key_type == "lhand":
+            return f"left hand #{idx}"
+        if key_type == "rhand":
+            return f"right hand #{idx}"
+        if key_type == "face":
+            return f"face #{idx}"
+        return f"{key_type} #{idx}"
+
+    @staticmethod
+    def _to_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+
+class PoseDataEditorKneeCutter:
+    KNEE_INDICES = (14, 15)
+    BODY_KEYPOINT_NAMES = {14: "left_knee", 15: "right_knee"}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 30,
+                        "min": 1,
+                        "max": 240,
+                        "step": 1,
+                        "tooltip": "Frame rate of the pose data sequence (reserved for future use).",
+                    },
+                ),
+                "normalize": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Set to true if knee coordinates are normalized (0-1).",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING")
+    RETURN_NAMES = ("pose_data", "log")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = (
+        "Removes knee keypoints immediately when they touch or cross the canvas bottom boundary."
+    )
+
+    def process(self, pose_data, fps, normalize):  # pylint: disable=unused-argument
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas") or []
+        pose_metas_original = pose_data_copy.get("pose_metas_original") or []
+
+        if not pose_metas and not pose_metas_original:
+            return (pose_data_copy, "No pose frames available.")
+
+        removal_log = []
+        removed_any = False
+
+        if pose_metas:
+            removed_any |= self._process_pose_metas(pose_metas, normalize, removal_log)
+
+        if pose_metas_original:
+            removed_any |= self._process_original_metas(
+                pose_metas_original, normalize, removal_log
+            )
+
+        if not removed_any:
+            removal_log.append("No knees touched the canvas bottom.")
+
+        return (pose_data_copy, "\n".join(removal_log))
+
+    def _process_pose_metas(self, pose_metas, normalize, removal_log):
+        removed_any = False
+        for frame_idx, meta in enumerate(pose_metas):
+            if not isinstance(meta, AAPoseMeta):
+                continue
+
+            height = self._to_float(getattr(meta, "height", None))
+            coords = getattr(meta, "kps_body", None)
+            scores = getattr(meta, "kps_body_p", None)
+            removed = self._prune_body_coords(
+                coords,
+                scores,
+                height,
+                normalize,
+                frame_idx,
+                removal_log,
+            )
+
+            if removed:
+                removed_any = True
+
+        return removed_any
+
+    def _process_original_metas(self, pose_metas_original, normalize, removal_log):
+        removed_any = False
+        for frame_idx, entry in enumerate(pose_metas_original):
+            if not isinstance(entry, dict):
+                continue
+
+            height = self._to_float(entry.get("height"))
+            keypoints_body = entry.get("keypoints_body")
+            if keypoints_body is None:
+                continue
+
+            points_np = np.asarray(keypoints_body, dtype=np.float32)
+            if points_np.ndim != 2 or points_np.shape[1] < 3:
+                continue
+
+            removed = False
+            for knee_index in self.KNEE_INDICES:
+                if knee_index >= points_np.shape[0]:
+                    continue
+
+                y_coord = self._to_float(points_np[knee_index, 1])
+                if not math.isfinite(y_coord):
+                    continue
+
+                if not normalize:
+                    if not math.isfinite(height) or height <= 0.0:
+                        continue
+                    threshold = height
+                else:
+                    threshold = 1.0
+
+                if y_coord >= threshold - 1e-6:
+                    points_np[knee_index, 2] = 0.0
+                    if points_np.shape[1] > 0:
+                        points_np[knee_index, 0] = 0.0
+                    if points_np.shape[1] > 1:
+                        points_np[knee_index, 1] = 0.0
+                    removal_log.append(
+                        self._format_log_entry(frame_idx, knee_index, normalize, y_coord)
+                    )
+                    removed = True
+
+            if removed:
+                entry["keypoints_body"] = points_np.tolist()
+                removed_any = True
+
+        return removed_any
+
+    def _prune_body_coords(self, coords, scores, height, normalize, frame_idx, removal_log):
+        if coords is None or scores is None:
+            return False
+
+        removed_any = False
+        for knee_index in self.KNEE_INDICES:
+            if knee_index >= len(coords) or knee_index >= len(scores):
+                continue
+
+            coord_pair = coords[knee_index]
+            if coord_pair is None or len(coord_pair) < 2:
+                continue
+
+            y_coord = self._to_float(coord_pair[1])
+            if not math.isfinite(y_coord):
+                continue
+
+            if not normalize:
+                if not math.isfinite(height) or height <= 0.0:
+                    continue
+                threshold = height
+            else:
+                threshold = 1.0
+
+            if y_coord >= threshold - 1e-6:
+                scores[knee_index] = 0.0
+                coord_pair[0] = 0.0
+                coord_pair[1] = 0.0
+                removal_log.append(
+                    self._format_log_entry(frame_idx, knee_index, normalize, y_coord)
+                )
+                removed_any = True
+
+        return removed_any
+
+    def _format_log_entry(self, frame_idx, knee_index, normalize, original_value):
+        name = self.BODY_KEYPOINT_NAMES.get(knee_index, f"index_{knee_index}")
+        value_type = "normalized" if normalize else "pixel"
+        return (
+            f"Frame {frame_idx}: removed {name} (y={original_value:.4f} {value_type}) for crossing the canvas bottom."
+        )
+
+    @staticmethod
+    def _to_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+
+class BlackStripeImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "blackstripe_left": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 4096.0,
+                        "step": 0.01,
+                        "tooltip": "Width of the left black stripe."
+                    },
+                ),
+                "blackstripe_right": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 4096.0,
+                        "step": 0.01,
+                        "tooltip": "Width of the right black stripe."
+                    },
+                ),
+                "blackstripe_top": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 4096.0,
+                        "step": 0.01,
+                        "tooltip": "Height of the top black stripe."
+                    },
+                ),
+                "blackstripe_bottom": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 4096.0,
+                        "step": 0.01,
+                        "tooltip": "Height of the bottom black stripe."
+                    },
+                ),
+                "normalize": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Interpret stripe sizes relative to the image dimensions."
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "apply"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Adds configurable black stripes around each image."
+
+    @staticmethod
+    def _resolve_length(value, normalize, reference):
+        value = float(value)
+        if value <= 0.0:
+            return 0
+        if normalize:
+            value *= float(reference)
+        return max(int(round(value)), 0)
+
+    def apply(
+        self,
+        images,
+        blackstripe_left,
+        blackstripe_right,
+        blackstripe_top,
+        blackstripe_bottom,
+        normalize,
+    ):
+        if all(
+            stripe == 0.0
+            for stripe in (
+                blackstripe_left,
+                blackstripe_right,
+                blackstripe_top,
+                blackstripe_bottom,
+            )
+        ):
+            return (images,)
+
+        if isinstance(images, torch.Tensor):
+            images_np = images.detach().cpu().numpy()
+            images_device = images.device
+            images_dtype = images.dtype
+        else:
+            images_np = np.asarray(images)
+            images_device = None
+            images_dtype = None
+
+        if images_np.size == 0:
+            return (images,)
+
+        single_image = False
+        if images_np.ndim == 3:
+            images_np = images_np[None, ...]
+            single_image = True
+
+        result_images = []
+        for image_np in images_np:
+            height, width = image_np.shape[:2]
+            left_px = self._resolve_length(blackstripe_left, normalize, width)
+            right_px = self._resolve_length(blackstripe_right, normalize, width)
+            top_px = self._resolve_length(blackstripe_top, normalize, height)
+            bottom_px = self._resolve_length(blackstripe_bottom, normalize, height)
+
+            if left_px == right_px == top_px == bottom_px == 0:
+                result_images.append(image_np.copy())
+                continue
+
+            new_height = height + top_px + bottom_px
+            new_width = width + left_px + right_px
+            padded = np.zeros((new_height, new_width, image_np.shape[2]), dtype=image_np.dtype)
+            padded[top_px : top_px + height, left_px : left_px + width] = image_np
+            result_images.append(padded)
+
+        result_np = np.stack(result_images, axis=0)
+        result_tensor = torch.from_numpy(result_np)
+
+        if images_dtype is not None:
+            result_tensor = result_tensor.to(dtype=images_dtype)
+        else:
+            result_tensor = result_tensor.to(dtype=torch.float32)
+
+        if images_device is not None:
+            result_tensor = result_tensor.to(device=images_device)
+
+        if single_image:
+            result_tensor = result_tensor[0]
+
+        return (result_tensor,)
+
+
 class PoseRetargetPromptHelper:
     @classmethod
     def INPUT_TYPES(s):
@@ -8073,12 +8893,15 @@ class PoseRetargetPromptHelper:
 
 NODE_CLASS_MAPPINGS = {
     "DrawViTPose": DrawViTPose,
+    "BlackStripeImage": BlackStripeImage,
     "OnnxDetectionModelLoader": OnnxDetectionModelLoader,
     "PoseAndFaceDetection": PoseAndFaceDetection,
     "PoseDataEditor": PoseDataEditor,
     "PoseDataEditorCutter": PoseDataEditorCutter,
     "PoseDataEditorWithMaskCutter": PoseDataEditorWithMaskCutter,
     "PoseDataEditorBlackout": PoseDataEditorBlackout,
+    "PoseDataEditorKeypointDeleter": PoseDataEditorKeypointDeleter,
+    "PoseDataEditorKneeCutter": PoseDataEditorKneeCutter,
     "PoseDataEditorAutomatic": PoseDataEditorAutomatic,
     "PoseDataEditorAutoPositioning": PoseDataEditorAutoPositioning,
     "PoseDataEditorAutomaticPositioningAndStretching": PoseDataEditorAutomaticPositioningAndStretching,
@@ -8099,12 +8922,15 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DrawViTPose": "Draw ViT Pose",
+    "BlackStripeImage": "Black Stripe Image",
     "OnnxDetectionModelLoader": "ONNX Detection Model Loader",
     "PoseAndFaceDetection": "Pose and Face Detection",
     "PoseDataEditor": "Pose Data Editor",
     "PoseDataEditorCutter": "Pose Data Editor Cutter v2",
     "PoseDataEditorWithMaskCutter": "Pose Data Editor With Mask Cutter",
     "PoseDataEditorBlackout": "Pose Data Editor Blackout",
+    "PoseDataEditorKeypointDeleter": "Pose Data Editor Keypoint Deleter",
+    "PoseDataEditorKneeCutter": "Pose Data Editor Knee Cutter",
     "PoseDataEditorAutomatic": "Pose Data Editor Automatic",
     "PoseDataEditorAutoPositioning": "Pose Data Editor Auto-Positioning",
     "PoseDataEditorAutomaticPositioningAndStretching": "Pose Data Editor Automatic Positioning and Stretching",
