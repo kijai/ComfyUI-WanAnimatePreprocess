@@ -9350,6 +9350,84 @@ class BlackStripeImage:
             result_tensor = result_tensor[0]
 
         return (result_tensor,)
+        class ImageBatchBlackout:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 30,
+                        "min": 1,
+                        "max": 240,
+                        "step": 1,
+                        "tooltip": "Frame rate of the image sequence.",
+                    },
+                ),
+                "duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": "Duration in seconds to black out.",
+                    },
+                ),
+                "reversed": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "label_on": "Reversed (End of Clip)",
+                        "label_off": "Normal (Start of Clip)",
+                        "tooltip": "If true, blacks out frames from the end. If false, blacks out from the start.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "blackout_frames"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Blacks out frames at the beginning or end of a batch for a specified duration."
+
+    def blackout_frames(self, images, fps, duration_seconds, reversed):
+        if duration_seconds <= 0:
+            # Nichts zu tun
+            return (images,)
+
+        # 1. Berechne die Anzahl der Frames, die schwarz sein sollen
+        num_frames_to_blackout = max(0, int(round(duration_seconds * float(fps))))
+
+        if num_frames_to_blackout == 0:
+            return (images,)
+
+        # 2. Hole die Gesamtanzahl der Frames
+        total_frames = images.shape[0]
+
+        # 3. Erstelle eine Kopie, um das Original nicht zu verändern
+        # Bilder sind Float-Tensoren (0-1), Schwarz ist 0.0
+        images_copy = images.clone()
+
+        # 4. Logik anwenden
+        if reversed:
+            # Mache die letzten N Frames schwarz
+            # Berechne den Start-Index für den Blackout
+            start_index = max(0, total_frames - num_frames_to_blackout)
+            
+            if start_index < total_frames:
+                images_copy[start_index:, :, :, :] = 0.0
+        else:
+            # Mache die ersten N Frames schwarz
+            # Berechne den End-Index für den Blackout
+            end_index = min(total_frames, num_frames_to_blackout)
+            
+            if end_index > 0:
+                images_copy[0:end_index, :, :, :] = 0.0
+
+        return (images_copy,)
 
 class PoseRetargetPromptHelper:
     @classmethod
@@ -9443,6 +9521,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorAdaptiveUpperBodyOffset": PoseDataEditorAdaptiveUpperBodyOffset,
     "PoseDataEditorAloneAutomaticChaty": PoseDataEditorAloneAutomaticChatyNode,
     "PoseDataPostProcessor": PoseDataPostProcessor,
+    "ImageBatchBlackout": ImageBatchBlackout,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -9474,5 +9553,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorAdaptiveUpperBodyOffset": "Pose Data Editor Adaptive Upper Body Offset",
     "PoseDataEditorAloneAutomaticChaty": "Pose Data Editor Alone Automatic Chaty",
     "PoseDataPostProcessor": "Pose Data Post-Processor",
+    "ImageBatchBlackout": "Image Batch Blackout",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
 }
