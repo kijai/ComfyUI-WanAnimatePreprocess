@@ -8503,9 +8503,16 @@ class PoseDataEditorKeypointDeleter:
             return float("nan")
 
 
+import copy
+import math
+from .pose_utils.pose2d_utils import AAPoseMeta # Stellt sicher, dass AAPoseMeta importiert wird
+
 class PoseDataEditorKneeCutter:
-    KNEE_INDICES = (14, 15)
-    BODY_KEYPOINT_NAMES = {14: "left_knee", 15: "right_knee"}
+    # Keypoint-Indizes basierend auf dem 20-Punkte-Skelett (retarget_pose.py, human_visualization.py)
+    # 9: RKnee (right_knee)
+    # 12: LKnee (left_knee)
+    KNEE_INDICES = (9, 12)
+    BODY_KEYPOINT_NAMES = {9: "right_knee", 12: "left_knee"}
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -8519,14 +8526,44 @@ class PoseDataEditorKneeCutter:
                         "min": 1,
                         "max": 240,
                         "step": 1,
-                        "tooltip": "Frame rate of the pose data sequence (reserved for future use).",
+                        "tooltip": "Frame rate of the pose data sequence.",
                     },
                 ),
                 "normalize": (
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "Set to true if knee coordinates are normalized (0-1).",
+                        "tooltip": "Set to true if keypoint coordinates are normalized (0-1).",
+                    },
+                ),
+                "padding_bottom": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Normalized padding from the bottom (0.0 = direkter Rand, 0.2 = untere 20%).",
+                    },
+                ),
+                "duration": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 60.0,
+                        "step": 0.01,
+                        "tooltip": "Duration in seconds the knee must be in the padding zone to be cut (0.0 = sofort).",
+                    },
+                ),
+                "activation_time_seconds": ( # <--- NEUER PARAMETER
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": "Time in seconds before the cutter starts monitoring (0.0 = sofort aktiv).",
                     },
                 ),
             }
@@ -8537,10 +8574,10 @@ class PoseDataEditorKneeCutter:
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
     DESCRIPTION = (
-        "Removes knee keypoints immediately when they touch or cross the canvas bottom boundary."
+        "Cuts knee keypoints if they stay in the bottom canvas padding zone for a specified duration."
     )
 
-    def process(self, pose_data, fps, normalize):  # pylint: disable=unused-argument
+    def process(self, pose_data, fps, normalize, padding_bottom, duration, activation_time_seconds): # <--- PARAMETER HINZUGEFÜGT
         pose_data_copy = copy.deepcopy(pose_data)
         pose_metas = pose_data_copy.get("pose_metas") or []
         pose_metas_original = pose_data_copy.get("pose_metas_original") or []
@@ -8548,48 +8585,57 @@ class PoseDataEditorKneeCutter:
         if not pose_metas and not pose_metas_original:
             return (pose_data_copy, "No pose frames available.")
 
+        frames_required = max(1, int(round(duration * float(fps))))
+        activation_frame = max(0, int(round(activation_time_seconds * float(fps)))) # <--- NEUE BERECHNUNG
+        
+        press_counters = {}
         removal_log = []
         removed_any = False
 
         if pose_metas:
-            removed_any |= self._process_pose_metas(pose_metas, normalize, removal_log)
-
-        if pose_metas_original:
-            removed_any |= self._process_original_metas(
-                pose_metas_original, normalize, removal_log
+            removed_any |= self._process_pose_metas(
+                pose_metas, normalize, padding_bottom, frames_required, activation_frame, press_counters, removal_log # <--- NEUES ARGUMENT
             )
 
-        if not removed_any:
-            removal_log.append("No knees touched the canvas bottom.")
+        press_counters = {}
+        if pose_metas_original:
+            removed_any |= self._process_original_metas(
+                pose_metas_original, normalize, padding_bottom, frames_required, activation_frame, press_counters, removal_log # <--- NEUES ARGUMENT
+            )
+
+        if not removed_any and activation_frame == 0:
+             removal_log.append(f"No knees entered the {padding_bottom*100}% bottom zone.")
+        elif activation_frame > 0 and not removed_any:
+            removal_log.append(f"Cutter activated after {activation_time_seconds}s. No knees were cut.")
 
         return (pose_data_copy, "\n".join(removal_log))
 
-    def _process_pose_metas(self, pose_metas, normalize, removal_log):
+    def _process_pose_metas(self, pose_metas, normalize, padding_bottom, frames_required, activation_frame, press_counters, removal_log): # <--- NEUES ARGUMENT
         removed_any = False
         for frame_idx, meta in enumerate(pose_metas):
+            if frame_idx < activation_frame: # <--- NEUE PRÜFUNG
+                continue # Überspringen, da die Aktivierungszeit noch nicht erreicht ist
+                
             if not isinstance(meta, AAPoseMeta):
                 continue
 
             height = self._to_float(getattr(meta, "height", None))
             coords = getattr(meta, "kps_body", None)
             scores = getattr(meta, "kps_body_p", None)
+            
             removed = self._prune_body_coords(
-                coords,
-                scores,
-                height,
-                normalize,
-                frame_idx,
-                removal_log,
+                frame_idx, coords, scores, height, normalize, padding_bottom, frames_required, press_counters, removal_log
             )
-
             if removed:
                 removed_any = True
-
         return removed_any
 
-    def _process_original_metas(self, pose_metas_original, normalize, removal_log):
+    def _process_original_metas(self, pose_metas_original, normalize, padding_bottom, frames_required, activation_frame, press_counters, removal_log): # <--- NEUES ARGUMENT
         removed_any = False
         for frame_idx, entry in enumerate(pose_metas_original):
+            if frame_idx < activation_frame: # <--- NEUE PRÜFUNG
+                continue # Überspringen, da die Aktivierungszeit noch nicht erreicht ist
+                
             if not isinstance(entry, dict):
                 continue
 
@@ -8606,36 +8652,51 @@ class PoseDataEditorKneeCutter:
             for knee_index in self.KNEE_INDICES:
                 if knee_index >= points_np.shape[0]:
                     continue
+                
+                key = (0, knee_index) # Annahme: Nur eine Person (person_id=0)
+                current_counter = press_counters.get(key, 0)
+                
+                y_coord_norm = self._to_float(points_np[knee_index, 1])
+                is_visible = points_np[knee_index, 2] > 0.0
 
-                y_coord = self._to_float(points_np[knee_index, 1])
-                if not math.isfinite(y_coord):
+                if normalize:
+                    threshold = 1.0 - padding_bottom
+                    y_coord_to_check = y_coord_norm
+                else:
+                    if not math.isfinite(height) or height <= 0.0:
+                        press_counters[key] = 0
+                        continue
+                    threshold = height - (padding_bottom * height)
+                    y_coord_to_check = y_coord_norm * height
+                
+                if not math.isfinite(y_coord_to_check):
+                    press_counters[key] = 0
                     continue
 
-                if not normalize:
-                    if not math.isfinite(height) or height <= 0.0:
-                        continue
-                    threshold = height
+                is_touching = (y_coord_to_check >= threshold - 1e-6)
+
+                if is_touching and is_visible:
+                    current_counter += 1
+                    press_counters[key] = current_counter
                 else:
-                    threshold = 1.0
+                    press_counters[key] = 0 # Reset, wenn nicht mehr berührt oder unsichtbar
 
-                if y_coord >= threshold - 1e-6:
+                if current_counter >= frames_required:
+                    if points_np[knee_index, 2] > 0: # Nur loggen, wenn es gerade entfernt wurde
+                        removal_log.append(
+                            self._format_log_entry(frame_idx, knee_index, normalize, y_coord_to_check, frames_required)
+                        )
+                        removed = True
                     points_np[knee_index, 2] = 0.0
-                    if points_np.shape[1] > 0:
-                        points_np[knee_index, 0] = 0.0
-                    if points_np.shape[1] > 1:
-                        points_np[knee_index, 1] = 0.0
-                    removal_log.append(
-                        self._format_log_entry(frame_idx, knee_index, normalize, y_coord)
-                    )
-                    removed = True
-
+                    points_np[knee_index, 0] = 0.0
+                    points_np[knee_index, 1] = 0.0
+            
             if removed:
                 entry["keypoints_body"] = points_np.tolist()
                 removed_any = True
-
         return removed_any
 
-    def _prune_body_coords(self, coords, scores, height, normalize, frame_idx, removal_log):
+    def _prune_body_coords(self, frame_idx, coords, scores, height, normalize, padding_bottom, frames_required, press_counters, removal_log):
         if coords is None or scores is None:
             return False
 
@@ -8643,38 +8704,60 @@ class PoseDataEditorKneeCutter:
         for knee_index in self.KNEE_INDICES:
             if knee_index >= len(coords) or knee_index >= len(scores):
                 continue
+            
+            key = (0, knee_index) # Annahme: Nur eine Person (person_id=0)
+            current_counter = press_counters.get(key, 0)
 
             coord_pair = coords[knee_index]
             if coord_pair is None or len(coord_pair) < 2:
+                press_counters[key] = 0
                 continue
 
-            y_coord = self._to_float(coord_pair[1])
-            if not math.isfinite(y_coord):
-                continue
-
-            if not normalize:
+            y_coord_pixel = self._to_float(coord_pair[1])
+            is_visible = scores[knee_index] > 0.0
+            
+            if normalize:
                 if not math.isfinite(height) or height <= 0.0:
+                    press_counters[key] = 0
                     continue
-                threshold = height
+                threshold = 1.0 - padding_bottom
+                y_coord_to_check = y_coord_pixel / height
             else:
-                threshold = 1.0
+                if not math.isfinite(height) or height <= 0.0:
+                    press_counters[key] = 0
+                    continue
+                threshold = height - (padding_bottom * height)
+                y_coord_to_check = y_coord_pixel
 
-            if y_coord >= threshold - 1e-6:
+            if not math.isfinite(y_coord_to_check):
+                press_counters[key] = 0
+                continue
+
+            is_touching = (y_coord_to_check >= threshold - 1e-6)
+
+            if is_touching and is_visible:
+                current_counter += 1
+                press_counters[key] = current_counter
+            else:
+                press_counters[key] = 0 # Reset
+
+            if current_counter >= frames_required:
+                if scores[knee_index] > 0.0: # Nur loggen, wenn es gerade entfernt wurde
+                    removal_log.append(
+                        self._format_log_entry(frame_idx, knee_index, normalize, y_coord_to_check, frames_required)
+                    )
+                    removed_any = True
                 scores[knee_index] = 0.0
                 coord_pair[0] = 0.0
                 coord_pair[1] = 0.0
-                removal_log.append(
-                    self._format_log_entry(frame_idx, knee_index, normalize, y_coord)
-                )
-                removed_any = True
 
         return removed_any
 
-    def _format_log_entry(self, frame_idx, knee_index, normalize, original_value):
+    def _format_log_entry(self, frame_idx, knee_index, normalize, y_value, frame_count):
         name = self.BODY_KEYPOINT_NAMES.get(knee_index, f"index_{knee_index}")
         value_type = "normalized" if normalize else "pixel"
         return (
-            f"Frame {frame_idx}: removed {name} (y={original_value:.4f} {value_type}) for crossing the canvas bottom."
+            f"Frame {frame_idx}: removed {name} (y={y_value:.4f} {value_type}) after {frame_count} frames."
         )
 
     @staticmethod
@@ -8683,8 +8766,430 @@ class PoseDataEditorKneeCutter:
             return float(value)
         except (TypeError, ValueError):
             return float("nan")
+class PoseDataEditorHeadDeleter:
+    # Keypoint-Indizes basierend auf dem 20-Punkte-Skelett (retarget_pose.py, human_visualization.py)
+    # 0: Nose, 14: REye, 15: LEye, 16: REar, 17: LEar
+    HEAD_INDICES = (0, 14, 15, 16, 17)
+    BODY_KEYPOINT_NAMES = {
+        0: "Nose",
+        14: "right_eye",
+        15: "left_eye",
+        16: "right_ear",
+        17: "left_ear",
+    }
 
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 30,
+                        "min": 1,
+                        "max": 240,
+                        "step": 1,
+                        "tooltip": "Frame rate of the pose data sequence.",
+                    },
+                ),
+                "normalize": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Set to true if keypoint coordinates are normalized (0-1).",
+                    },
+                ),
+                "padding_top": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Normalized padding from the top (0.0 = direkter Rand, 0.1 = obere 10%).",
+                    },
+                ),
+                "duration": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 60.0,
+                        "step": 0.01,
+                        "tooltip": "Duration in seconds the head must be in the padding zone to be cut (0.0 = sofort).",
+                    },
+                ),
+            }
+        }
 
+    RETURN_TYPES = ("POSEDATA", "STRING")
+    RETURN_NAMES = ("pose_data", "log")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = (
+        "Cuts head keypoints if they stay in the top canvas padding zone for a specified duration."
+    )
+
+    def process(self, pose_data, fps, normalize, padding_top, duration):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas") or []
+        pose_metas_original = pose_data_copy.get("pose_metas_original") or []
+
+        if not pose_metas and not pose_metas_original:
+            return (pose_data_copy, "No pose frames available.")
+
+        frames_required = max(1, int(round(duration * float(fps))))
+        press_counters = {}
+        removal_log = []
+        removed_any = False
+
+        if pose_metas:
+            removed_any |= self._process_pose_metas(
+                pose_metas, normalize, padding_top, frames_required, press_counters, removal_log
+            )
+
+        press_counters = {}
+        if pose_metas_original:
+            removed_any |= self._process_original_metas(
+                pose_metas_original, normalize, padding_top, frames_required, press_counters, removal_log
+            )
+
+        if not removed_any:
+            removal_log.append(f"No head points entered the {padding_top*100}% top zone.")
+
+        return (pose_data_copy, "\n".join(removal_log))
+
+    def _process_pose_metas(self, pose_metas, normalize, padding_top, frames_required, press_counters, removal_log):
+        removed_any = False
+        for frame_idx, meta in enumerate(pose_metas):
+            if not isinstance(meta, AAPoseMeta):
+                continue
+            height = self._to_float(getattr(meta, "height", None))
+            coords = getattr(meta, "kps_body", None)
+            scores = getattr(meta, "kps_body_p", None)
+            
+            removed = self._prune_body_coords(
+                frame_idx, coords, scores, height, normalize, padding_top, frames_required, press_counters, removal_log
+            )
+            if removed:
+                removed_any = True
+        return removed_any
+
+    def _process_original_metas(self, pose_metas_original, normalize, padding_top, frames_required, press_counters, removal_log):
+        removed_any = False
+        for frame_idx, entry in enumerate(pose_metas_original):
+            if not isinstance(entry, dict):
+                continue
+            height = self._to_float(entry.get("height"))
+            keypoints_body = entry.get("keypoints_body")
+            if keypoints_body is None:
+                continue
+            points_np = np.asarray(keypoints_body, dtype=np.float32)
+            if points_np.ndim != 2 or points_np.shape[1] < 3:
+                continue
+
+            removed = False
+            for head_index in self.HEAD_INDICES:
+                if head_index >= points_np.shape[0]:
+                    continue
+                
+                key = (0, head_index)
+                current_counter = press_counters.get(key, 0)
+                y_coord_norm = self._to_float(points_np[head_index, 1])
+                is_visible = points_np[head_index, 2] > 0.0
+
+                if normalize:
+                    threshold = padding_top
+                    y_coord_to_check = y_coord_norm
+                else:
+                    if not math.isfinite(height) or height <= 0.0:
+                        press_counters[key] = 0
+                        continue
+                    threshold = padding_top * height
+                    y_coord_to_check = y_coord_norm * height
+                
+                if not math.isfinite(y_coord_to_check):
+                    press_counters[key] = 0
+                    continue
+
+                is_touching = (y_coord_to_check <= threshold + 1e-6) # Logic inverted: <= threshold
+
+                if is_touching and is_visible:
+                    current_counter += 1
+                    press_counters[key] = current_counter
+                else:
+                    press_counters[key] = 0
+
+                if current_counter >= frames_required:
+                    if points_np[head_index, 2] > 0:
+                        removal_log.append(
+                            self._format_log_entry(frame_idx, head_index, normalize, y_coord_to_check, frames_required)
+                        )
+                        removed = True
+                    points_np[head_index, 2] = 0.0
+                    points_np[head_index, 0] = 0.0
+                    points_np[head_index, 1] = 0.0
+            
+            if removed:
+                entry["keypoints_body"] = points_np.tolist()
+                removed_any = True
+        return removed_any
+
+    def _prune_body_coords(self, frame_idx, coords, scores, height, normalize, padding_top, frames_required, press_counters, removal_log):
+        if coords is None or scores is None:
+            return False
+
+        removed_any = False
+        for head_index in self.HEAD_INDICES:
+            if head_index >= len(coords) or head_index >= len(scores):
+                continue
+            
+            key = (0, head_index)
+            current_counter = press_counters.get(key, 0)
+            coord_pair = coords[head_index]
+            if coord_pair is None or len(coord_pair) < 2:
+                press_counters[key] = 0
+                continue
+
+            y_coord_pixel = self._to_float(coord_pair[1])
+            is_visible = scores[head_index] > 0.0
+            
+            if normalize:
+                if not math.isfinite(height) or height <= 0.0:
+                    press_counters[key] = 0
+                    continue
+                threshold = padding_top
+                y_coord_to_check = y_coord_pixel / height
+            else:
+                if not math.isfinite(height) or height <= 0.0:
+                    press_counters[key] = 0
+                    continue
+                threshold = padding_top * height
+                y_coord_to_check = y_coord_pixel
+
+            if not math.isfinite(y_coord_to_check):
+                press_counters[key] = 0
+                continue
+
+            is_touching = (y_coord_to_check <= threshold + 1e-6) # Logic inverted: <= threshold
+
+            if is_touching and is_visible:
+                current_counter += 1
+                press_counters[key] = current_counter
+            else:
+                press_counters[key] = 0
+
+            if current_counter >= frames_required:
+                if scores[head_index] > 0.0:
+                    removal_log.append(
+                        self._format_log_entry(frame_idx, head_index, normalize, y_coord_to_check, frames_required)
+                    )
+                    removed_any = True
+                scores[head_index] = 0.0
+                coord_pair[0] = 0.0
+                coord_pair[1] = 0.0
+
+        return removed_any
+
+    def _format_log_entry(self, frame_idx, head_index, normalize, y_value, frame_count):
+        name = self.BODY_KEYPOINT_NAMES.get(head_index, f"index_{head_index}")
+        value_type = "normalized" if normalize else "pixel"
+        return (
+            f"Frame {frame_idx}: removed {name} (y={y_value:.4f} {value_type}) after {frame_count} frames (hit top)."
+        )
+
+    @staticmethod
+    def _to_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+            
+class PoseDataEditorJitterDeleter:
+    # Diese Node löscht Keypoints, die sich zwischen Frames unnatürlich schnell bewegen (Jitter/Glitch).
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "velocity_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 50.0,
+                        "min": 1.0,
+                        "max": 1024.0,
+                        "step": 1.0,
+                        "tooltip": "Maximale Distanz (in Pixel oder normalisiert), die sich ein Punkt pro Frame bewegen darf, bevor er als Jitter gelöscht wird.",
+                    },
+                ),
+                "normalize": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Behandelt den Schwellenwert normalisiert (0-1, relativ zur Höhe). Empfohlen: False (Pixel).",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING")
+    RETURN_NAMES = ("pose_data", "log")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = (
+        "Removes keypoints that 'jitter' or 'glitch' (move faster than a threshold) between frames."
+    )
+
+    def process(self, pose_data, velocity_threshold, normalize):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas") or []
+        pose_metas_original = pose_data_copy.get("pose_metas_original") or []
+
+        if not pose_metas and not pose_metas_original:
+            return (pose_data_copy, "No pose frames available.")
+
+        removal_log = []
+
+        if pose_metas:
+            self._process_meta_list(
+                pose_metas, velocity_threshold, normalize, removal_log
+            )
+        
+        if pose_metas_original:
+            self._process_original_list(
+                pose_metas_original, velocity_threshold, normalize, removal_log
+            )
+
+        if not removal_log:
+            removal_log.append("No jitter detected.")
+
+        return (pose_data_copy, "\n".join(removal_log))
+
+    def _get_threshold_px(self, meta, threshold, normalize):
+        if not normalize:
+            return threshold # Wert ist bereits in Pixeln
+        
+        height = self._to_float(getattr(meta, "height", None))
+        if not math.isfinite(height) or height <= 0.0:
+            return float('inf') # Kann nicht berechnen, also nichts löschen
+        return threshold * height
+
+    def _process_meta_list(self, metas, threshold, normalize, log):
+        # Beginne bei Frame 1, da wir Frame 0 als Referenz brauchen
+        for frame_idx in range(1, len(metas)):
+            meta_curr = metas[frame_idx]
+            meta_prev = metas[frame_idx - 1]
+
+            if not isinstance(meta_curr, AAPoseMeta) or not isinstance(meta_prev, AAPoseMeta):
+                continue
+            
+            threshold_px = self._get_threshold_px(meta_curr, threshold, normalize)
+
+            arrays_curr = [
+                ("body", getattr(meta_curr, "kps_body", None), getattr(meta_curr, "kps_body_p", None)),
+                ("lhand", getattr(meta_curr, "kps_lhand", None), getattr(meta_curr, "kps_lhand_p", None)),
+                ("rhand", getattr(meta_curr, "kps_rhand", None), getattr(meta_curr, "kps_rhand_p", None)),
+                ("face", getattr(meta_curr, "kps_face", None), getattr(meta_curr, "kps_face_p", None)),
+            ]
+            arrays_prev = {
+                "body": (getattr(meta_prev, "kps_body", None), getattr(meta_prev, "kps_body_p", None)),
+                "lhand": (getattr(meta_prev, "kps_lhand", None), getattr(meta_prev, "kps_lhand_p", None)),
+                "rhand": (getattr(meta_prev, "kps_rhand", None), getattr(meta_prev, "kps_rhand_p", None)),
+                "face": (getattr(meta_prev, "kps_face", None), getattr(meta_prev, "kps_face_p", None)),
+            }
+
+            for key_type, coords_curr, scores_curr in arrays_curr:
+                coords_prev, scores_prev = arrays_prev[key_type]
+                
+                if coords_curr is None or scores_curr is None or coords_prev is None or scores_prev is None:
+                    continue
+
+                for kp_idx in range(len(coords_curr)):
+                    if kp_idx >= len(coords_prev):
+                        continue
+                    
+                    score_curr = scores_curr[kp_idx]
+                    score_prev = scores_prev[kp_idx]
+                    
+                    # Nur vergleichen, wenn beide Punkte sichtbar waren/sind
+                    if score_curr > 0.0 and score_prev > 0.0:
+                        pos_curr = coords_curr[kp_idx][:2]
+                        pos_prev = coords_prev[kp_idx][:2]
+                        
+                        distance = np.linalg.norm(pos_curr - pos_prev)
+                        
+                        if distance > threshold_px:
+                            # Jitter/Glitch erkannt!
+                            scores_curr[kp_idx] = 0.0
+                            coords_curr[kp_idx] = [0.0, 0.0]
+                            log.append(f"Frame {frame_idx}: Jitter detected for {key_type}[{kp_idx}]. Dist: {distance:.1f}px. Point removed.")
+
+    def _process_original_list(self, meta_dicts, threshold, normalize, log):
+        key_names = ["keypoints_body", "keypoints_left_hand", "keypoints_right_hand", "keypoints_face"]
+        
+        for frame_idx in range(1, len(meta_dicts)):
+            entry_curr = meta_dicts[frame_idx]
+            entry_prev = meta_dicts[frame_idx - 1]
+            
+            if not isinstance(entry_curr, dict) or not isinstance(entry_prev, dict):
+                continue
+                
+            height = self._to_float(entry_curr.get("height"))
+            width = self._to_float(entry_curr.get("width"))
+            if not math.isfinite(height) or height <= 0 or not math.isfinite(width) or width <= 0:
+                continue
+
+            threshold_px = self._get_threshold_px(entry_curr, threshold, normalize)
+            
+            for key in key_names:
+                points_curr_list = entry_curr.get(key)
+                points_prev_list = entry_prev.get(key)
+
+                if points_curr_list is None or points_prev_list is None:
+                    continue
+                
+                points_curr = np.asarray(points_curr_list, dtype=np.float32)
+                points_prev = np.asarray(points_prev_list, dtype=np.float32)
+
+                if points_curr.ndim != 2 or points_curr.shape[1] < 3 or \
+                   points_prev.ndim != 2 or points_prev.shape[1] < 3:
+                    continue
+                    
+                for kp_idx in range(len(points_curr)):
+                    if kp_idx >= len(points_prev):
+                        continue
+                    
+                    score_curr = points_curr[kp_idx, 2]
+                    score_prev = points_prev[kp_idx, 2]
+                    
+                    if score_curr > 0.0 and score_prev > 0.0:
+                        pos_curr_norm = points_curr[kp_idx, :2]
+                        pos_prev_norm = points_prev[kp_idx, :2]
+                        
+                        # In Pixel umrechnen für den Distanzvergleich
+                        pos_curr_px = pos_curr_norm * np.array([width, height])
+                        pos_prev_px = pos_prev_norm * np.array([width, height])
+                        
+                        distance = np.linalg.norm(pos_curr_px - pos_prev_px)
+                        
+                        if distance > threshold_px:
+                            points_curr[kp_idx, 2] = 0.0 # Score auf 0 setzen
+                            points_curr[kp_idx, 0] = 0.0
+                            points_curr[kp_idx, 1] = 0.0
+                            log.append(f"Frame {frame_idx}: Jitter detected for {key}[{kp_idx}]. Dist: {distance:.1f}px. Point removed (Originals).")
+                
+                # Wichtig: Die Liste in der Diktionär-Struktur aktualisieren
+                entry_curr[key] = points_curr.tolist()
+
+    @staticmethod
+    def _to_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+            
 class BlackStripeImage:
     @classmethod
     def INPUT_TYPES(cls):
@@ -8745,7 +9250,7 @@ class BlackStripeImage:
     RETURN_NAMES = ("images",)
     FUNCTION = "apply"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "Adds configurable black stripes around each image."
+    DESCRIPTION = "Overlays configurable black stripes (blackout bars) on top of each image."
 
     @staticmethod
     def _resolve_length(value, normalize, reference):
@@ -8795,21 +9300,39 @@ class BlackStripeImage:
 
         result_images = []
         for image_np in images_np:
-            height, width = image_np.shape[:2]
+            # --- START KORREKTUR ---
+            # Erstelle eine Kopie des Originalbildes, um darauf zu zeichnen
+            overlaid_image = image_np.copy()
+            height, width = overlaid_image.shape[:2]
+
+            # Berechne die Pixel-Breiten der Streifen
             left_px = self._resolve_length(blackstripe_left, normalize, width)
             right_px = self._resolve_length(blackstripe_right, normalize, width)
             top_px = self._resolve_length(blackstripe_top, normalize, height)
             bottom_px = self._resolve_length(blackstripe_bottom, normalize, height)
 
-            if left_px == right_px == top_px == bottom_px == 0:
-                result_images.append(image_np.copy())
-                continue
+            # Zeichne die Streifen (Overlays)
+            # (Setze die Pixel auf 0.0, was bei 0-1 Float-Bildern schwarz ist)
+            if top_px > 0:
+                top_span = min(top_px, height) # Sicherstellen, dass der Balken nicht über das Bild hinausgeht
+                overlaid_image[0:top_span, :, :] = 0.0
 
-            new_height = height + top_px + bottom_px
-            new_width = width + left_px + right_px
-            padded = np.zeros((new_height, new_width, image_np.shape[2]), dtype=image_np.dtype)
-            padded[top_px : top_px + height, left_px : left_px + width] = image_np
-            result_images.append(padded)
+            if bottom_px > 0:
+                bottom_span = min(bottom_px, height - top_px) # Sicherstellen, dass er nicht den oberen Balken überlappt
+                if bottom_span > 0:
+                    overlaid_image[-bottom_span:, :, :] = 0.0
+
+            if left_px > 0:
+                left_span = min(left_px, width)
+                overlaid_image[:, 0:left_span, :] = 0.0
+
+            if right_px > 0:
+                right_span = min(right_px, width - left_px) # Sicherstellen, dass er nicht den linken Balken überlappt
+                if right_span > 0:
+                    overlaid_image[:, -right_span:, :] = 0.0
+
+            result_images.append(overlaid_image)
+            # --- ENDE KORREKTUR ---
 
         result_np = np.stack(result_images, axis=0)
         result_tensor = torch.from_numpy(result_np)
@@ -8817,6 +9340,7 @@ class BlackStripeImage:
         if images_dtype is not None:
             result_tensor = result_tensor.to(dtype=images_dtype)
         else:
+            # Fallback, falls die Eingabe kein Tensor war (z.B. reines Numpy-Array)
             result_tensor = result_tensor.to(dtype=torch.float32)
 
         if images_device is not None:
@@ -8826,7 +9350,6 @@ class BlackStripeImage:
             result_tensor = result_tensor[0]
 
         return (result_tensor,)
-
 
 class PoseRetargetPromptHelper:
     @classmethod
@@ -8902,6 +9425,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataEditorBlackout": PoseDataEditorBlackout,
     "PoseDataEditorKeypointDeleter": PoseDataEditorKeypointDeleter,
     "PoseDataEditorKneeCutter": PoseDataEditorKneeCutter,
+    "PoseDataEditorHeadDeleter": PoseDataEditorHeadDeleter,
+    "PoseDataEditorJitterDeleter": PoseDataEditorJitterDeleter,
     "PoseDataEditorAutomatic": PoseDataEditorAutomatic,
     "PoseDataEditorAutoPositioning": PoseDataEditorAutoPositioning,
     "PoseDataEditorAutomaticPositioningAndStretching": PoseDataEditorAutomaticPositioningAndStretching,
@@ -8931,6 +9456,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorBlackout": "Pose Data Editor Blackout",
     "PoseDataEditorKeypointDeleter": "Pose Data Editor Keypoint Deleter",
     "PoseDataEditorKneeCutter": "Pose Data Editor Knee Cutter",
+    "PoseDataEditorHeadDeleter": "Pose Data Head Deleter",
+    "PoseDataEditorJitterDeleter": "Pose Data Jitter Deleter",
     "PoseDataEditorAutomatic": "Pose Data Editor Automatic",
     "PoseDataEditorAutoPositioning": "Pose Data Editor Auto-Positioning",
     "PoseDataEditorAutomaticPositioningAndStretching": "Pose Data Editor Automatic Positioning and Stretching",
