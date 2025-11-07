@@ -9350,7 +9350,8 @@ class BlackStripeImage:
             result_tensor = result_tensor[0]
 
         return (result_tensor,)
-        class ImageBatchBlackout:
+   
+class ImageBatchBlackout:
     @classmethod
     def INPUT_TYPES(cls):
         return {
