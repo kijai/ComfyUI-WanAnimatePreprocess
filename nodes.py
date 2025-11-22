@@ -437,10 +437,9 @@ class PoseDataAutomaticOffsetNode:
     Der Oberkörper wird verschoben, die Beine werden zum Boden gestreckt.
     """
     
-    # Wir nutzen die gleichen Indizes wie im Editor für Head/Hips/Feet
-    HEAD_INDICES = [0, 1, 2, 3, 4, 5] # Nose, Eyes, Ears, Neck (COCO subset)
-    HIP_INDICES = [8, 11]             # R Hip, L Hip
-    FOOT_INDICES = [10, 13, 18, 19, 20, 21, 22, 23, 24] # Ankles + Toes
+    HEAD_INDICES = [0, 1, 2, 3, 4, 5] 
+    HIP_INDICES = [8, 11]             
+    FOOT_INDICES = [10, 13, 18, 19, 20, 21, 22, 23, 24] 
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -464,7 +463,7 @@ class PoseDataAutomaticOffsetNode:
                         "min": 0.1,
                         "max": 10.0,
                         "step": 0.01,
-                        "tooltip": "Die Höhe des Bildausschnitts (z.B. 2.20m). Bestimmt, wie viel 'Luft' über dem Kopf ist.",
+                        "tooltip": "Die Höhe des Bildausschnitts (z.B. 2.20m).",
                     },
                 ),
                 "analysis_duration": (
@@ -474,7 +473,7 @@ class PoseDataAutomaticOffsetNode:
                         "min": 0.0,
                         "max": 10.0,
                         "step": 0.1,
-                        "tooltip": "Wie lange (in Sekunden) am Anfang analysiert wird, um den Offset zu bestimmen. Danach ist er fix.",
+                        "tooltip": "Wie lange (in Sekunden) am Anfang analysiert wird.",
                     },
                 ),
                 "foot_padding": (
@@ -494,7 +493,7 @@ class PoseDataAutomaticOffsetNode:
                         "min": 1,
                         "max": 240,
                         "step": 1,
-                        "tooltip": "Framerate für die Zeitberechnung.",
+                        "tooltip": "Framerate.",
                     },
                 ),
             }
@@ -514,25 +513,13 @@ class PoseDataAutomaticOffsetNode:
             return (pose_data_copy,)
 
         # 1. Ziel-Position berechnen
-        # Ratio: Wie viel % des Bildes nimmt die Person ein? (z.B. 1.70 / 2.20 = 0.77)
-        # Der Kopf sollte also bei (1.0 - 0.77 - foot_padding) sein, wenn die Füße unten sind.
-        # Wir vereinfachen: Kopf Oben = (canvas_height - source_height) / canvas_height - foot_padding_adjustment?
-        # Besser: Wir definieren den 'Head Top' Zielwert (Y-Koordinate 0-1).
-        
-        # Verfügbarer Platz für die Person (ohne Foot Padding)
         available_height_ratio = source_height / canvas_height
-        
-        # Ziel Y-Position für den Kopf (Top)
-        # 1.0 (Unten) - foot_padding - available_height_ratio
-        # Beispiel: 1.0 - 0.02 - (1.70/2.20) = 0.98 - 0.77 = 0.21
         target_head_y = max(0.0, 1.0 - foot_padding - available_height_ratio)
 
-        # 2. Analyse Phase: Finde den aktuellen Kopf-Durchschnitt
+        # 2. Analyse Phase
         fps = max(1, int(fps))
         analysis_frames = max(1, int(analysis_duration * fps))
-        
         current_head_y_samples = []
-        
         limit_frames = min(len(pose_metas), analysis_frames)
         
         for i in range(limit_frames):
@@ -542,86 +529,58 @@ class PoseDataAutomaticOffsetNode:
                 current_head_y_samples.append(top_y)
         
         if not current_head_y_samples:
-            # Fallback: Nimm an, der Kopf ist aktuell bei 0.1 (oder skippe Offset)
             measured_current_head_y = 0.1
         else:
             measured_current_head_y = float(np.median(current_head_y_samples))
 
         # 3. Berechne den FIXEN Offset
-        # Offset = Ziel - Aktuell
-        # Beispiel: Ziel 0.21, Aktuell 0.10 -> Offset +0.11 (nach unten schieben)
-        # Beispiel: Ziel 0.21, Aktuell 0.50 -> Offset -0.29 (nach oben schieben)
         fixed_offset_y_norm = target_head_y - measured_current_head_y
 
-        # 4. Wende Offset an und strecke Beine
+        # 4. Wende Offset an
         for meta in pose_metas:
             height = getattr(meta, "height", 1.0) or 1.0
             width = getattr(meta, "width", 1.0) or 1.0
             
-            # Offset in Pixeln
             offset_px = fixed_offset_y_norm * height
-            
-            # Foot Target in Pixeln (Boden)
             target_foot_y_px = (1.0 - foot_padding) * height
 
-            # A. Verschiebe Oberkörper (Head, Torso, Arms, Hands)
-            # Wir sammeln die Hüftpositionen VOR dem Verschieben, um die Beine zu strecken
             hip_coords_before = self._get_hip_coords(meta)
             
-            # Verschiebung anwenden
             self._apply_offset_to_upper_body(meta, offset_px, width, height)
             
-            # B. Hüftpositionen NACH dem Verschieben (sind jetzt offset_px tiefer/höher)
-            # Wir berechnen sie einfach: Alt + Offset
-            
-            # C. Beine strecken (von neuer Hüfte bis zum festen Boden)
             if hip_coords_before:
-                self._stretch_legs(meta, hip_coords_before, offset_px, target_foot_y_px)
+                # KORREKTUR: width wird jetzt übergeben
+                self._stretch_legs(meta, hip_coords_before, offset_px, target_foot_y_px, width)
 
         return (pose_data_copy,)
 
     def _find_pose_top(self, meta):
-        """Findet den höchsten Punkt (kleinstes Y) des Kopfes."""
         body = getattr(meta, "kps_body", None)
-        if body is None:
-            return None
-        
+        if body is None: return None
         min_y = float('inf')
         found = False
-        
-        # Prüfe Body Head Points
         for idx in self.HEAD_INDICES:
             if idx < len(body):
                 pt = body[idx]
                 if self._is_valid(pt, meta):
-                    # pt ist [x, y] oder [x, y, score] in Pixeln
-                    # Wir normalisieren hier direkt für die Berechnung
                     y_norm = pt[1] / meta.height
                     if y_norm < min_y:
                         min_y = y_norm
                         found = True
-        
-        # Fallback auf Face Points falls vorhanden
         face = getattr(meta, "kps_face", None)
         if face is not None and len(face) > 0:
-             # Nimm einfach den min Y aller Facepoints
              ys = face[:, 1]
-             # Filtere 0er (ungültig oft 0,0)
              valid_ys = ys[ys > 0]
              if len(valid_ys) > 0:
                  y_norm_face = np.min(valid_ys) / meta.height
                  if y_norm_face < min_y:
                      min_y = y_norm_face
                      found = True
-
         return min_y if found else None
 
     def _get_hip_coords(self, meta):
-        """Holt Hüftkoordinaten (Pixel)."""
         body = getattr(meta, "kps_body", None)
-        if body is None:
-            return {}
-        
+        if body is None: return {}
         hips = {}
         for idx in self.HIP_INDICES:
             if idx < len(body) and self._is_valid(body[idx], meta):
@@ -629,147 +588,69 @@ class PoseDataAutomaticOffsetNode:
         return hips
 
     def _apply_offset_to_upper_body(self, meta, offset_px, width, height):
-        """Verschiebt alles außer die Beine (ab Knie abwärts)."""
-        # Wir definieren "Upper Body" hier als ALLES außer Knie und Füße.
-        # Knie (9, 12) und Füße (10, 13, 18-24) werden separat behandelt (gestreckt).
-        # Hüfte (8, 11) gehört zum Torso und wird verschoben.
-        
         excluded_indices = set([9, 12] + self.FOOT_INDICES)
-        
-        # 1. Body Points
         if meta.kps_body is not None:
             for i in range(len(meta.kps_body)):
                 if i not in excluded_indices:
                     self._offset_point(meta.kps_body, i, offset_px, width, height)
-        
-        # 2. Hands & Face (immer verschieben)
         for arr_name in ["kps_lhand", "kps_rhand", "kps_face"]:
             arr = getattr(meta, arr_name, None)
             if arr is not None:
                 for i in range(len(arr)):
                     self._offset_point(arr, i, offset_px, width, height)
 
-    def _stretch_legs(self, meta, hips_before, offset_px, target_foot_y_px):
-        """Verbindet die neuen Hüften mit den Füßen (die am Boden bleiben/landen sollen)."""
+    # KORREKTUR: width als Argument hinzugefügt
+    def _stretch_legs(self, meta, hips_before, offset_px, target_foot_y_px, width):
         body = meta.kps_body
-        if body is None:
-            return
+        if body is None: return
 
-        # Mapping: Hüfte -> (Knie, Fuß)
-        leg_map = {
-            8: (9, 10),   # Rechts
-            11: (12, 13)  # Links
-        }
+        leg_map = {8: (9, 10), 11: (12, 13)}
         
-        # Füße (Zehen etc) relativ zum Knöchel
-        foot_extensions = {
-            10: [19, 20, 21], # Rechte Zehen/Ferse an rechtem Knöchel (Indizes aus COCO/Halpe geschätzt, siehe Liste oben)
-            13: [22, 23, 24]  # Linke Zehen/Ferse
-            # Hinweis: Die genauen Indizes hängen vom Modell ab, wir nutzen die aus FOOT_INDICES
-        }
-
         for hip_idx, (knee_idx, ankle_idx) in leg_map.items():
-            if hip_idx not in hips_before:
-                continue
+            if hip_idx not in hips_before: continue
             
-            # Alte Positionen
             hip_old = hips_before[hip_idx]
-            
-            # Neue Hüftposition (wurde bereits verschoben)
             hip_new = hip_old.copy()
             hip_new[1] += offset_px
             
-            # Knie und Fuß holen (wenn vorhanden)
             knee_pt = body[knee_idx] if knee_idx < len(body) and self._is_valid(body[knee_idx], meta) else None
             ankle_pt = body[ankle_idx] if ankle_idx < len(body) and self._is_valid(body[ankle_idx], meta) else None
             
-            # Strategie:
-            # Wir wollen, dass der Fuß auf 'target_foot_y_px' landet (Y-Achse).
-            # Aber wir wollen nicht, dass er wild in X-Richtung springt.
-            # Wenn der Fuß erkannt wurde, behalten wir seine X-Pos bei und setzen Y auf Target (Floor).
-            # Wenn er nicht erkannt wurde, projizieren wir ihn unter die Hüfte.
-            
             if ankle_pt is not None:
                 ankle_old = np.array(ankle_pt[:2], dtype=np.float32)
-                # Wir setzen den Fuß auf den Boden (Target Y)
-                # Option: Wir behalten den "Style" des Fußes bei (wenn er z.B. gehoben war).
-                # Aber der User will "Target Height" -> also Bodenkontakt für die Skalierung.
-                
-                # Wir berechnen den Skalierungsfaktor für das Bein
-                # Vektor Alt: Hüfte -> Fuß
                 vec_old = ankle_old - hip_old
                 len_old = np.linalg.norm(vec_old)
                 
-                # Vektor Neu: Neue Hüfte -> Fuß am Boden (X bleibt gleich, Y = Target)
-                # Wenn wir X gleich lassen, sieht es am natürlichsten aus (Füße rutschen nicht).
                 ankle_new = ankle_old.copy()
-                ankle_new[1] = target_foot_y_px # Harter Bodenkontakt
-                
+                ankle_new[1] = target_foot_y_px 
                 vec_new = ankle_new - hip_new
                 
-                # Knie Interpolation
                 if knee_pt is not None:
                     knee_old = np.array(knee_pt[:2], dtype=np.float32)
-                    # Projektion: Wo war das Knie auf der Strecke Hüfte-Fuß? (0.0 bis 1.0)
-                    # Wir nutzen eine einfache relative Verschiebung
                     if len_old > 1e-6:
-                        # Ratio entlang des Beins
-                        knee_vec = knee_old - hip_old
-                        # Projektion auf Beinachse oder einfache proportionale Streckung
-                        # Einfach: Relativer Vektor wird mitgestreckt
-                        # Wir berechnen eine Transformationsmatrix für dieses Bein wäre zu komplex.
-                        # Simple approach: Knie bleibt relativ zur Strecke Hüfte-Fuß gleich.
-                        
-                        # Ratio berechnen
-                        # Wir nehmen an, das Bein ist eine Linie.
-                        # Knie ist bei hip + t * (foot - hip) + deviation
-                        # Wir skalieren t und deviation.
-                        
-                        # Vektor Skalierung
-                        scale_y = (ankle_new[1] - hip_new[1]) / (ankle_old[1] - hip_old[1]) if abs(ankle_old[1] - hip_old[1]) > 1e-6 else 1.0
-                        scale_x = 1.0 # X nicht skalieren, Beine werden ja nicht breiter, nur länger? 
-                        # Oder sollen sie sich verjüngen? User: "nur die Beine skaliert werden".
-                        # Wir interpolieren das Knie linear zwischen neuer Hüfte und neuem Fuß
-                        
-                        # Projektion Knie auf Vektor Hüfte-Fuß (alt)
                         t = np.dot(knee_old - hip_old, vec_old) / (len_old * len_old)
-                        ortho = (knee_old - hip_old) - t * vec_old # Abweichung von der Geraden
-                        
-                        # Neues Knie
-                        knee_new = hip_new + t * vec_new + ortho # Ortho bleibt gleich (Kniebeugung)
-                        
+                        ortho = (knee_old - hip_old) - t * vec_old 
+                        knee_new = hip_new + t * vec_new + ortho 
                         self._set_point(body, knee_idx, knee_new[0], knee_new[1])
 
-                # Fuß setzen
                 self._set_point(body, ankle_idx, ankle_new[0], ankle_new[1])
                 
-                # Zehen mitziehen (Offset vom Knöchel)
-                # Wir schauen, ob Zehen Indizes existieren
-                # Einfachheitshalber: Verschiebe Zehen um das gleiche Delta wie den Knöchel
                 delta_ankle = ankle_new - ankle_old
-                
-                # Suche zugehörige Fußpunkte
-                # (Hier vereinfacht über eine generische Liste oder die oben definierte)
-                # Wir nehmen alle FOOT_INDICES die NICHT Ankles sind
                 current_foot_extras = [idx for idx in self.FOOT_INDICES if idx not in [10, 13]]
                 
-                # Wir müssen wissen, welcher Punkt zu welchem Fuß gehört.
-                # Einfache Heuristik: Distanz zum Knöchel.
                 for f_idx in current_foot_extras:
                     if f_idx < len(body) and self._is_valid(body[f_idx], meta):
                         pt_old = np.array(body[f_idx][:2])
-                        if np.linalg.norm(pt_old - ankle_old) < width * 0.2: # Gehört zu diesem Fuß
+                        # HIER WAR DER FEHLER: width wird jetzt erkannt
+                        if np.linalg.norm(pt_old - ankle_old) < width * 0.2: 
                             pt_new = pt_old + delta_ankle
                             self._set_point(body, f_idx, pt_new[0], pt_new[1])
 
     def _offset_point(self, arr, idx, offset_y, w, h):
         if idx < len(arr):
             pt = arr[idx]
-            # Prüfen ob Liste oder Numpy
             if isinstance(pt, np.ndarray):
                 pt[1] += offset_y
-                # Clamp (optional, user wollte "auf einem Punkt", also lassen wir es ggf. rauslaufen wenn nötig, aber hier clippen wir sicherheitshalber leicht)
-                # pt[1] = np.clip(pt[1], -h, h*2) 
             elif isinstance(pt, list):
                 pt[1] += offset_y
 
@@ -785,7 +666,6 @@ class PoseDataAutomaticOffsetNode:
 
     def _is_valid(self, pt, meta):
         if pt is None: return False
-        # Score check
         score = pt[2] if len(pt) > 2 else 1.0
         if score < 0.05: return False
         return True 
@@ -10808,5 +10688,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutomaticOffsetNodeV3": "Automatic Offset Node V3",
     
 }
+
 
 
