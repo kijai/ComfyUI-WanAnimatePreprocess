@@ -278,6 +278,148 @@ class PoseAndFaceDetection:
 
         return (pose_data, face_images_tensor, json.dumps(points_dict_list), [bbox_ints], face_bboxes)
 
+
+import copy
+import math
+import torch
+import numpy as np
+from .pose_utils.pose2d_utils import AAPoseMeta
+
+import copy
+import math
+import torch
+import numpy as np
+from .pose_utils.pose2d_utils import AAPoseMeta
+
+class PoseDataAutoBlackoutOnJitter:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "pose_data": ("POSEDATA",),
+                "jitter_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 50.0,
+                        "min": 1.0,
+                        "max": 500.0,
+                        "step": 1.0,
+                        "tooltip": "Wie stark darf sich die Figur bewegen? Wenn die Figur am Ende 'spinnt', ist der Wert extrem hoch.",
+                    },
+                ),
+                "consecutive_frames": (
+                    "INT",
+                    {
+                        "default": 2,
+                        "min": 1,
+                        "max": 10,
+                        "step": 1,
+                        "tooltip": "Wie viele Frames muss es zittern, bevor der Blackout startet?",
+                    },
+                ),
+                "remove_pose_data": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Soll auch das Skelett für diese Frames gelöscht werden?",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "POSEDATA", "INT")
+    RETURN_NAMES = ("images", "pose_data", "blackout_start_frame")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Analysiert die Pose und macht das Bild automatisch schwarz, sobald die Figur am Ende anfängt zu 'spinnen' (Jitter)."
+
+    def process(self, images, pose_data, jitter_threshold, consecutive_frames, remove_pose_data):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        
+        # Bilder kopieren (Tensor)
+        new_images = images.clone()
+        batch_size = new_images.shape[0]
+        
+        if not pose_metas:
+            return (new_images, pose_data_copy, -1)
+
+        # Wir suchen den Frame, ab dem das Chaos beginnt
+        blackout_start_index = -1
+        bad_frame_counter = 0
+
+        # Wir starten bei Frame 1 (wir brauchen Frame 0 zum Vergleich)
+        for i in range(1, len(pose_metas)):
+            curr_meta = pose_metas[i]
+            prev_meta = pose_metas[i-1]
+            
+            if not isinstance(curr_meta, AAPoseMeta) or not isinstance(prev_meta, AAPoseMeta):
+                continue
+
+            # Wir berechnen die durchschnittliche Bewegung aller Körperteile
+            total_dist = 0.0
+            valid_points = 0
+            
+            # Body Keypoints prüfen
+            kp_curr = getattr(curr_meta, "kps_body", None)
+            score_curr = getattr(curr_meta, "kps_body_p", None)
+            kp_prev = getattr(prev_meta, "kps_body", None)
+            score_prev = getattr(prev_meta, "kps_body_p", None)
+
+            if kp_curr is not None and kp_prev is not None:
+                # Nur sichtbare Punkte vergleichen
+                for idx in range(min(len(kp_curr), len(kp_prev))):
+                    # HIER IST DER SICHERHEITSCHECK:
+                    # Wenn der JitterDeleter den Punkt gelöscht hat (Score 0), wird er hier ignoriert.
+                    if score_curr[idx] > 0.05 and score_prev[idx] > 0.05:
+                        # Euklidische Distanz
+                        dist = math.sqrt(
+                            (kp_curr[idx][0] - kp_prev[idx][0])**2 + 
+                            (kp_curr[idx][1] - kp_prev[idx][1])**2
+                        )
+                        total_dist += dist
+                        valid_points += 1
+            
+            # Durchschnittliche Bewegung ("Jitter Score")
+            avg_jitter = total_dist / valid_points if valid_points > 0 else 0.0
+            
+            # Wenn die Bewegung extrem hoch ist (das "Spinnen" am Rand), zählen wir hoch
+            if avg_jitter > jitter_threshold:
+                bad_frame_counter += 1
+            else:
+                bad_frame_counter = 0 # Reset, war nur ein kurzer Ruckler
+            
+            # Wenn es oft genug hintereinander passiert ist -> Blackout auslösen!
+            if bad_frame_counter >= consecutive_frames:
+                # Wir gehen zurück zum ersten Frame des Fehlers
+                blackout_start_index = i - (consecutive_frames - 1)
+                break # Abbruch, wir haben den Punkt gefunden
+
+        # Blackout anwenden
+        if blackout_start_index != -1:
+            print(f"AutoBlackout: Jitter detected starting at frame {blackout_start_index}. Blacking out remaining {batch_size - blackout_start_index} frames.")
+            
+            # 1. Bilder schwärzen
+            if blackout_start_index < batch_size:
+                new_images[blackout_start_index:, :, :, :] = 0.0
+            
+            # 2. Pose Daten löschen (optional)
+            if remove_pose_data:
+                for d_idx in range(blackout_start_index, len(pose_metas)):
+                    # Wir setzen einfach leere Daten
+                    meta = pose_metas[d_idx]
+                    if hasattr(meta, "kps_body_p"):
+                        meta.kps_body_p[:] = 0.0 # Alles unsichtbar machen
+                    if hasattr(meta, "kps_lhand_p"):
+                        meta.kps_lhand_p[:] = 0.0
+                    if hasattr(meta, "kps_rhand_p"):
+                        meta.kps_rhand_p[:] = 0.0
+                    if hasattr(meta, "kps_face_p"):
+                        meta.kps_face_p[:] = 0.0
+
+        return (new_images, pose_data_copy, blackout_start_index)
+        
 class PoseDataAdaptiveUpperBodyOffsetHelper:
     @classmethod
     def INPUT_TYPES(cls):
@@ -10648,6 +10790,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataAutomaticOffsetNode": PoseDataAutomaticOffsetNode,
     "PoseDataAutomaticOffsetNodeV2": PoseDataAutomaticOffsetNodeV2,
     "PoseDataAutomaticOffsetNodeV3": PoseDataAutomaticOffsetNodeV3,
+    "PoseDataAutoBlackoutOnJitter": PoseDataAutoBlackoutOnJitter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DrawViTPose": "Draw ViT Pose",
@@ -10686,8 +10829,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutomaticOffsetNode": "Automatic Offset Note",
     "PoseDataAutomaticOffsetNodeV2": "Automatic Offset Node V2",
     "PoseDataAutomaticOffsetNodeV3": "Automatic Offset Node V3",
+    "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
