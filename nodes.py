@@ -9524,6 +9524,10 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataPostProcessor": PoseDataPostProcessor,
     "ImageBatchBlackout": ImageBatchBlackout,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
+    "ImageBlackoutOnNoBBox": ImageBlackoutOnNoBBox,
+    "PoseAndFaceDetectionV2": PoseAndFaceDetectionV2,
+    "PoseDataAdaptiveUpperBodyOffsetHelper": PoseDataAdaptiveUpperBodyOffsetHelper,
+    "PoseDataAutomaticOffsetNode": PoseDataAutomaticOffsetNode,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DrawViTPose": "Draw ViT Pose",
@@ -9556,4 +9560,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataPostProcessor": "Pose Data Post-Processor",
     "ImageBatchBlackout": "Image Batch Blackout",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
+    "ImageBlackoutOnNoBBox": "Image Blackout on No BBox",
+    "PoseAndFaceDetectionV2": "Pose and Face Detection V2",
+    "PoseDataAdaptiveUpperBodyOffsetHelper": "Pose Data Adaptive Upper Body Offset Helper",
+    "PoseDataAutomaticOffsetNode": "Automatic Offset Note",
+    
 }
+
