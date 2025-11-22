@@ -278,6 +278,762 @@ class PoseAndFaceDetection:
 
         return (pose_data, face_images_tensor, json.dumps(points_dict_list), [bbox_ints], face_bboxes)
 
+class PoseDataAdaptiveUpperBodyOffsetHelper:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "start_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 3600.0,
+                        "step": 0.01,
+                        "tooltip": "Startzeitpunkt für die Analyse der Fußposition.",
+                    },
+                ),
+                "duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.1,
+                        "max": 60.0,
+                        "step": 0.01,
+                        "tooltip": "Dauer der Analyse. Dieser Wert wird auch als output durchgereicht.",
+                    },
+                ),
+                "person_height_m": (
+                    "FLOAT",
+                    {
+                        "default": 1.70,
+                        "min": 0.1,
+                        "max": 3.0,
+                        "step": 0.01,
+                        "tooltip": "Die tatsächliche Größe der Person in Metern (z.B. 1.70).",
+                    },
+                ),
+                "canvas_height_m": (
+                    "FLOAT",
+                    {
+                        "default": 2.20,
+                        "min": 0.1,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "Die vertikale Höhe des sichtbaren Bildausschnitts in Metern an der Position der Person. Bleibt dieser Wert gleich, bleibt die Person gleich groß, auch wenn sie im Bild wandert.",
+                    },
+                ),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 30,
+                        "min": 1,
+                        "max": 960,
+                        "step": 1,
+                        "tooltip": "Framerate zur Berechnung der Frames.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("FLOAT", "FLOAT", "STRING")
+    RETURN_NAMES = ("head_padding", "duration_seconds", "info")
+    FUNCTION = "calculate"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = (
+        "Berechnet das Head-Padding relativ zur AKTUELLEN Fußposition. "
+        "Die Füße bleiben dort, wo sie sind. Der Kopf wird so platziert, dass die Proportionen stimmen."
+    )
+
+    def calculate(
+        self,
+        pose_data,
+        start_seconds,
+        duration_seconds,
+        person_height_m,
+        canvas_height_m,
+        fps,
+    ):
+        pose_metas = pose_data.get("pose_metas", [])
+        if not pose_metas:
+            return (0.0, duration_seconds, "No pose data found.")
+
+        fps = max(1, int(fps))
+        start_frame = int(start_seconds * fps)
+        end_frame = start_frame + int(duration_seconds * fps)
+        
+        total_frames = len(pose_metas)
+        start_frame = min(start_frame, total_frames - 1)
+        end_frame = min(end_frame, total_frames)
+
+        # 1. Analyse der Fußposition
+        # Wir suchen den tiefsten Punkt der Füße (Y-Koordinate) im Analyse-Zeitraum.
+        foot_y_values = []
+        
+        # Indizes für Füße (Ankles, Toes, Heels)
+        foot_indices = [10, 13, 18, 19, 20, 21, 22, 23, 24]
+
+        for i in range(start_frame, end_frame):
+            meta = pose_metas[i]
+            if not hasattr(meta, "kps_body") or meta.kps_body is None:
+                continue
+            
+            height = getattr(meta, "height", 1.0) or 1.0
+            
+            max_y = -1.0
+            found = False
+            
+            for idx in foot_indices:
+                if idx < len(meta.kps_body):
+                    pt = meta.kps_body[idx]
+                    if pt is not None:
+                        # Handle numpy array or list/tuple
+                        y = pt[1] if isinstance(pt, (list, tuple, np.ndarray)) else None
+                        score = pt[2] if isinstance(pt, (list, tuple, np.ndarray)) and len(pt) > 2 else 1.0
+                        
+                        if y is not None and score > 0.05:
+                            # Normalisieren
+                            y_norm = y / height
+                            if y_norm > max_y:
+                                max_y = y_norm
+                                found = True
+            
+            if found:
+                foot_y_values.append(max_y)
+
+        # Wenn keine Füße erkannt wurden, nehmen wir einen Fallback (z.B. 0.95)
+        avg_foot_y = np.median(foot_y_values) if foot_y_values else 0.95
+        
+        # 2. Berechnung der Ziel-Größe im Bild (Ratio)
+        # Beispiel: 1.70m Person in 2.20m hohem Bild = 0.77 (77% der Bildhöhe)
+        visual_height_ratio = person_height_m / canvas_height_m
+        
+        # 3. Berechnung des Head Paddings
+        # Wo muss der Kopf sein, wenn die Füße bei 'avg_foot_y' bleiben?
+        # Head Y = Fuß Y - Körpergröße
+        target_head_y = avg_foot_y - visual_height_ratio
+        
+        # Padding ist der Abstand von oben (0.0) zum Kopf
+        # Wir clippen nicht zu hart, erlauben aber keine negativen Werte (außer du willst Overflow erlauben)
+        # Hier clippen wir auf 0.0, damit der Kopf nicht aus dem Bild fliegt, 
+        # es sei denn, die 'Head Padding Allow Overflow' Option in der Editor Node ist an.
+        # Da diese Node nur den Wert liefert, geben wir den echten Wert aus, aber >= 0 ist meist sicherer.
+        calculated_head_padding = max(0.0, target_head_y)
+
+        info = (
+            f"Analysis Frame: {start_frame}-{end_frame}\n"
+            f"Avg Foot Y (Anchor): {avg_foot_y:.4f}\n"
+            f"Visual Ratio: {visual_height_ratio:.4f} ({person_height_m}m / {canvas_height_m}m)\n"
+            f"Result Head Padding: {calculated_head_padding:.4f}"
+        )
+
+        return (calculated_head_padding, duration_seconds, info)
+
+class PoseDataAutomaticOffsetNode:
+    """
+    Positioniert eine Person basierend auf ihrer Körpergröße in einem virtuellen Canvas (Kameraausschnitt).
+    Analysiert kurz die Position, berechnet den Offset und 'lockt' diesen dann, um Wackeln zu verhindern.
+    Der Oberkörper wird verschoben, die Beine werden zum Boden gestreckt.
+    """
+    
+    # Wir nutzen die gleichen Indizes wie im Editor für Head/Hips/Feet
+    HEAD_INDICES = [0, 1, 2, 3, 4, 5] # Nose, Eyes, Ears, Neck (COCO subset)
+    HIP_INDICES = [8, 11]             # R Hip, L Hip
+    FOOT_INDICES = [10, 13, 18, 19, 20, 21, 22, 23, 24] # Ankles + Toes
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "source_height": (
+                    "FLOAT",
+                    {
+                        "default": 1.70,
+                        "min": 0.1,
+                        "max": 3.0,
+                        "step": 0.01,
+                        "tooltip": "Deine tatsächliche Größe (z.B. 1.70m).",
+                    },
+                ),
+                "canvas_height": (
+                    "FLOAT",
+                    {
+                        "default": 2.20,
+                        "min": 0.1,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "Die Höhe des Bildausschnitts (z.B. 2.20m). Bestimmt, wie viel 'Luft' über dem Kopf ist.",
+                    },
+                ),
+                "analysis_duration": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.1,
+                        "tooltip": "Wie lange (in Sekunden) am Anfang analysiert wird, um den Offset zu bestimmen. Danach ist er fix.",
+                    },
+                ),
+                "foot_padding": (
+                    "FLOAT",
+                    {
+                        "default": 0.02,
+                        "min": 0.0,
+                        "max": 0.5,
+                        "step": 0.001,
+                        "tooltip": "Abstand der Füße vom unteren Bildrand (normalisiert 0-1).",
+                    },
+                ),
+                "fps": (
+                    "INT",
+                    {
+                        "default": 30,
+                        "min": 1,
+                        "max": 240,
+                        "step": 1,
+                        "tooltip": "Framerate für die Zeitberechnung.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Smart offset for scaling specific body heights into a defined canvas height with stabilization."
+
+    def process(self, pose_data, source_height, canvas_height, analysis_duration, foot_padding, fps):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        # 1. Ziel-Position berechnen
+        # Ratio: Wie viel % des Bildes nimmt die Person ein? (z.B. 1.70 / 2.20 = 0.77)
+        # Der Kopf sollte also bei (1.0 - 0.77 - foot_padding) sein, wenn die Füße unten sind.
+        # Wir vereinfachen: Kopf Oben = (canvas_height - source_height) / canvas_height - foot_padding_adjustment?
+        # Besser: Wir definieren den 'Head Top' Zielwert (Y-Koordinate 0-1).
+        
+        # Verfügbarer Platz für die Person (ohne Foot Padding)
+        available_height_ratio = source_height / canvas_height
+        
+        # Ziel Y-Position für den Kopf (Top)
+        # 1.0 (Unten) - foot_padding - available_height_ratio
+        # Beispiel: 1.0 - 0.02 - (1.70/2.20) = 0.98 - 0.77 = 0.21
+        target_head_y = max(0.0, 1.0 - foot_padding - available_height_ratio)
+
+        # 2. Analyse Phase: Finde den aktuellen Kopf-Durchschnitt
+        fps = max(1, int(fps))
+        analysis_frames = max(1, int(analysis_duration * fps))
+        
+        current_head_y_samples = []
+        
+        limit_frames = min(len(pose_metas), analysis_frames)
+        
+        for i in range(limit_frames):
+            meta = pose_metas[i]
+            top_y = self._find_pose_top(meta)
+            if top_y is not None:
+                current_head_y_samples.append(top_y)
+        
+        if not current_head_y_samples:
+            # Fallback: Nimm an, der Kopf ist aktuell bei 0.1 (oder skippe Offset)
+            measured_current_head_y = 0.1
+        else:
+            measured_current_head_y = float(np.median(current_head_y_samples))
+
+        # 3. Berechne den FIXEN Offset
+        # Offset = Ziel - Aktuell
+        # Beispiel: Ziel 0.21, Aktuell 0.10 -> Offset +0.11 (nach unten schieben)
+        # Beispiel: Ziel 0.21, Aktuell 0.50 -> Offset -0.29 (nach oben schieben)
+        fixed_offset_y_norm = target_head_y - measured_current_head_y
+
+        # 4. Wende Offset an und strecke Beine
+        for meta in pose_metas:
+            height = getattr(meta, "height", 1.0) or 1.0
+            width = getattr(meta, "width", 1.0) or 1.0
+            
+            # Offset in Pixeln
+            offset_px = fixed_offset_y_norm * height
+            
+            # Foot Target in Pixeln (Boden)
+            target_foot_y_px = (1.0 - foot_padding) * height
+
+            # A. Verschiebe Oberkörper (Head, Torso, Arms, Hands)
+            # Wir sammeln die Hüftpositionen VOR dem Verschieben, um die Beine zu strecken
+            hip_coords_before = self._get_hip_coords(meta)
+            
+            # Verschiebung anwenden
+            self._apply_offset_to_upper_body(meta, offset_px, width, height)
+            
+            # B. Hüftpositionen NACH dem Verschieben (sind jetzt offset_px tiefer/höher)
+            # Wir berechnen sie einfach: Alt + Offset
+            
+            # C. Beine strecken (von neuer Hüfte bis zum festen Boden)
+            if hip_coords_before:
+                self._stretch_legs(meta, hip_coords_before, offset_px, target_foot_y_px)
+
+        return (pose_data_copy,)
+
+    def _find_pose_top(self, meta):
+        """Findet den höchsten Punkt (kleinstes Y) des Kopfes."""
+        body = getattr(meta, "kps_body", None)
+        if body is None:
+            return None
+        
+        min_y = float('inf')
+        found = False
+        
+        # Prüfe Body Head Points
+        for idx in self.HEAD_INDICES:
+            if idx < len(body):
+                pt = body[idx]
+                if self._is_valid(pt, meta):
+                    # pt ist [x, y] oder [x, y, score] in Pixeln
+                    # Wir normalisieren hier direkt für die Berechnung
+                    y_norm = pt[1] / meta.height
+                    if y_norm < min_y:
+                        min_y = y_norm
+                        found = True
+        
+        # Fallback auf Face Points falls vorhanden
+        face = getattr(meta, "kps_face", None)
+        if face is not None and len(face) > 0:
+             # Nimm einfach den min Y aller Facepoints
+             ys = face[:, 1]
+             # Filtere 0er (ungültig oft 0,0)
+             valid_ys = ys[ys > 0]
+             if len(valid_ys) > 0:
+                 y_norm_face = np.min(valid_ys) / meta.height
+                 if y_norm_face < min_y:
+                     min_y = y_norm_face
+                     found = True
+
+        return min_y if found else None
+
+    def _get_hip_coords(self, meta):
+        """Holt Hüftkoordinaten (Pixel)."""
+        body = getattr(meta, "kps_body", None)
+        if body is None:
+            return {}
+        
+        hips = {}
+        for idx in self.HIP_INDICES:
+            if idx < len(body) and self._is_valid(body[idx], meta):
+                hips[idx] = np.array(body[idx][:2], dtype=np.float32)
+        return hips
+
+    def _apply_offset_to_upper_body(self, meta, offset_px, width, height):
+        """Verschiebt alles außer die Beine (ab Knie abwärts)."""
+        # Wir definieren "Upper Body" hier als ALLES außer Knie und Füße.
+        # Knie (9, 12) und Füße (10, 13, 18-24) werden separat behandelt (gestreckt).
+        # Hüfte (8, 11) gehört zum Torso und wird verschoben.
+        
+        excluded_indices = set([9, 12] + self.FOOT_INDICES)
+        
+        # 1. Body Points
+        if meta.kps_body is not None:
+            for i in range(len(meta.kps_body)):
+                if i not in excluded_indices:
+                    self._offset_point(meta.kps_body, i, offset_px, width, height)
+        
+        # 2. Hands & Face (immer verschieben)
+        for arr_name in ["kps_lhand", "kps_rhand", "kps_face"]:
+            arr = getattr(meta, arr_name, None)
+            if arr is not None:
+                for i in range(len(arr)):
+                    self._offset_point(arr, i, offset_px, width, height)
+
+    def _stretch_legs(self, meta, hips_before, offset_px, target_foot_y_px):
+        """Verbindet die neuen Hüften mit den Füßen (die am Boden bleiben/landen sollen)."""
+        body = meta.kps_body
+        if body is None:
+            return
+
+        # Mapping: Hüfte -> (Knie, Fuß)
+        leg_map = {
+            8: (9, 10),   # Rechts
+            11: (12, 13)  # Links
+        }
+        
+        # Füße (Zehen etc) relativ zum Knöchel
+        foot_extensions = {
+            10: [19, 20, 21], # Rechte Zehen/Ferse an rechtem Knöchel (Indizes aus COCO/Halpe geschätzt, siehe Liste oben)
+            13: [22, 23, 24]  # Linke Zehen/Ferse
+            # Hinweis: Die genauen Indizes hängen vom Modell ab, wir nutzen die aus FOOT_INDICES
+        }
+
+        for hip_idx, (knee_idx, ankle_idx) in leg_map.items():
+            if hip_idx not in hips_before:
+                continue
+            
+            # Alte Positionen
+            hip_old = hips_before[hip_idx]
+            
+            # Neue Hüftposition (wurde bereits verschoben)
+            hip_new = hip_old.copy()
+            hip_new[1] += offset_px
+            
+            # Knie und Fuß holen (wenn vorhanden)
+            knee_pt = body[knee_idx] if knee_idx < len(body) and self._is_valid(body[knee_idx], meta) else None
+            ankle_pt = body[ankle_idx] if ankle_idx < len(body) and self._is_valid(body[ankle_idx], meta) else None
+            
+            # Strategie:
+            # Wir wollen, dass der Fuß auf 'target_foot_y_px' landet (Y-Achse).
+            # Aber wir wollen nicht, dass er wild in X-Richtung springt.
+            # Wenn der Fuß erkannt wurde, behalten wir seine X-Pos bei und setzen Y auf Target (Floor).
+            # Wenn er nicht erkannt wurde, projizieren wir ihn unter die Hüfte.
+            
+            if ankle_pt is not None:
+                ankle_old = np.array(ankle_pt[:2], dtype=np.float32)
+                # Wir setzen den Fuß auf den Boden (Target Y)
+                # Option: Wir behalten den "Style" des Fußes bei (wenn er z.B. gehoben war).
+                # Aber der User will "Target Height" -> also Bodenkontakt für die Skalierung.
+                
+                # Wir berechnen den Skalierungsfaktor für das Bein
+                # Vektor Alt: Hüfte -> Fuß
+                vec_old = ankle_old - hip_old
+                len_old = np.linalg.norm(vec_old)
+                
+                # Vektor Neu: Neue Hüfte -> Fuß am Boden (X bleibt gleich, Y = Target)
+                # Wenn wir X gleich lassen, sieht es am natürlichsten aus (Füße rutschen nicht).
+                ankle_new = ankle_old.copy()
+                ankle_new[1] = target_foot_y_px # Harter Bodenkontakt
+                
+                vec_new = ankle_new - hip_new
+                
+                # Knie Interpolation
+                if knee_pt is not None:
+                    knee_old = np.array(knee_pt[:2], dtype=np.float32)
+                    # Projektion: Wo war das Knie auf der Strecke Hüfte-Fuß? (0.0 bis 1.0)
+                    # Wir nutzen eine einfache relative Verschiebung
+                    if len_old > 1e-6:
+                        # Ratio entlang des Beins
+                        knee_vec = knee_old - hip_old
+                        # Projektion auf Beinachse oder einfache proportionale Streckung
+                        # Einfach: Relativer Vektor wird mitgestreckt
+                        # Wir berechnen eine Transformationsmatrix für dieses Bein wäre zu komplex.
+                        # Simple approach: Knie bleibt relativ zur Strecke Hüfte-Fuß gleich.
+                        
+                        # Ratio berechnen
+                        # Wir nehmen an, das Bein ist eine Linie.
+                        # Knie ist bei hip + t * (foot - hip) + deviation
+                        # Wir skalieren t und deviation.
+                        
+                        # Vektor Skalierung
+                        scale_y = (ankle_new[1] - hip_new[1]) / (ankle_old[1] - hip_old[1]) if abs(ankle_old[1] - hip_old[1]) > 1e-6 else 1.0
+                        scale_x = 1.0 # X nicht skalieren, Beine werden ja nicht breiter, nur länger? 
+                        # Oder sollen sie sich verjüngen? User: "nur die Beine skaliert werden".
+                        # Wir interpolieren das Knie linear zwischen neuer Hüfte und neuem Fuß
+                        
+                        # Projektion Knie auf Vektor Hüfte-Fuß (alt)
+                        t = np.dot(knee_old - hip_old, vec_old) / (len_old * len_old)
+                        ortho = (knee_old - hip_old) - t * vec_old # Abweichung von der Geraden
+                        
+                        # Neues Knie
+                        knee_new = hip_new + t * vec_new + ortho # Ortho bleibt gleich (Kniebeugung)
+                        
+                        self._set_point(body, knee_idx, knee_new[0], knee_new[1])
+
+                # Fuß setzen
+                self._set_point(body, ankle_idx, ankle_new[0], ankle_new[1])
+                
+                # Zehen mitziehen (Offset vom Knöchel)
+                # Wir schauen, ob Zehen Indizes existieren
+                # Einfachheitshalber: Verschiebe Zehen um das gleiche Delta wie den Knöchel
+                delta_ankle = ankle_new - ankle_old
+                
+                # Suche zugehörige Fußpunkte
+                # (Hier vereinfacht über eine generische Liste oder die oben definierte)
+                # Wir nehmen alle FOOT_INDICES die NICHT Ankles sind
+                current_foot_extras = [idx for idx in self.FOOT_INDICES if idx not in [10, 13]]
+                
+                # Wir müssen wissen, welcher Punkt zu welchem Fuß gehört.
+                # Einfache Heuristik: Distanz zum Knöchel.
+                for f_idx in current_foot_extras:
+                    if f_idx < len(body) and self._is_valid(body[f_idx], meta):
+                        pt_old = np.array(body[f_idx][:2])
+                        if np.linalg.norm(pt_old - ankle_old) < width * 0.2: # Gehört zu diesem Fuß
+                            pt_new = pt_old + delta_ankle
+                            self._set_point(body, f_idx, pt_new[0], pt_new[1])
+
+    def _offset_point(self, arr, idx, offset_y, w, h):
+        if idx < len(arr):
+            pt = arr[idx]
+            # Prüfen ob Liste oder Numpy
+            if isinstance(pt, np.ndarray):
+                pt[1] += offset_y
+                # Clamp (optional, user wollte "auf einem Punkt", also lassen wir es ggf. rauslaufen wenn nötig, aber hier clippen wir sicherheitshalber leicht)
+                # pt[1] = np.clip(pt[1], -h, h*2) 
+            elif isinstance(pt, list):
+                pt[1] += offset_y
+
+    def _set_point(self, arr, idx, x, y):
+        if idx < len(arr):
+            pt = arr[idx]
+            if isinstance(pt, np.ndarray):
+                pt[0] = x
+                pt[1] = y
+            elif isinstance(pt, list):
+                pt[0] = x
+                pt[1] = y
+
+    def _is_valid(self, pt, meta):
+        if pt is None: return False
+        # Score check
+        score = pt[2] if len(pt) > 2 else 1.0
+        if score < 0.05: return False
+        return True 
+
+class PoseAndFaceDetectionV2:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("POSEMODEL",),
+                "images": ("IMAGE",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Width of the generation"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Height of the generation"}),
+            },
+            "optional": {
+                "retarget_image": ("IMAGE", {"default": None, "tooltip": "Optional reference image for pose retargeting"}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX")
+    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Detects human poses and face images. V2: Returns a list of BBOXes for ALL frames."
+
+    def process(self, model, images, width, height, retarget_image=None):
+        detector = model["yolo"]
+        pose_model = model["vitpose"]
+        B, H, W, C = images.shape
+
+        shape = np.array([H, W])[None]
+        images_np = images.numpy()
+
+        IMG_NORM_MEAN = np.array([0.485, 0.456, 0.406])
+        IMG_NORM_STD = np.array([0.229, 0.224, 0.225])
+        input_resolution=(256, 192)
+        rescale = 1.25
+
+        detector.reinit()
+        pose_model.reinit()
+        
+        refer_pose_meta = None
+        refer_img = None
+        
+        if retarget_image is not None:
+            refer_img = resize_by_area(retarget_image[0].numpy() * 255, width * height, divisor=16) / 255.0
+            ref_bbox = (detector(
+                cv2.resize(refer_img.astype(np.float32), (640, 640)).transpose(2, 0, 1)[None],
+                shape
+                )[0][0]["bbox"])
+
+            if ref_bbox is None or ref_bbox[-1] <= 0 or (ref_bbox[2] - ref_bbox[0]) < 10 or (ref_bbox[3] - ref_bbox[1]) < 10:
+                ref_bbox = np.array([0, 0, refer_img.shape[1], refer_img.shape[0]])
+
+            center, scale = bbox_from_detector(ref_bbox, input_resolution, rescale=rescale)
+            refer_img_crop = crop(refer_img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+
+            img_norm = (refer_img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+
+            ref_keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            refer_pose_meta = load_pose_metas_from_kp2ds_seq(ref_keypoints, width=retarget_image.shape[2], height=retarget_image.shape[1])[0]
+
+        comfy_pbar = ProgressBar(B*2)
+        progress = 0
+        bboxes = []
+        
+        # 1. Detection Pass
+        for img in tqdm(images_np, total=len(images_np), desc="Detecting bboxes"):
+            det_result = detector(
+                cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None],
+                shape
+            )
+            # YOLO liefert eine Liste von Listen. Wir nehmen hier bbox[0][0] (erste Person im Batch, erste Detektion)
+            # Falls nichts erkannt wurde, kommt oft eine Default-Box zurück, das prüft der Detektor meist intern.
+            bbox_res = det_result[0][0]["bbox"]
+            bboxes.append(bbox_res)
+            
+            progress += 1
+            if progress % 10 == 0:
+                comfy_pbar.update_absolute(progress)
+
+        detector.cleanup()
+
+        # 2. Pose Estimation Pass
+        kp2ds = []
+        for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="Extracting keypoints"):
+            if bbox is None or bbox[-1] <= 0 or (bbox[2] - bbox[0]) < 10 or (bbox[3] - bbox[1]) < 10:
+                bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+
+            bbox_xywh = bbox
+            center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
+            img_crop = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+
+            img_norm = (img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+
+            keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            kp2ds.append(keypoints)
+            
+            progress += 1
+            if progress % 10 == 0:
+                comfy_pbar.update_absolute(progress)
+
+        pose_model.cleanup()
+
+        kp2ds = np.concatenate(kp2ds, 0)
+        pose_metas = load_pose_metas_from_kp2ds_seq(kp2ds, width=W, height=H)
+
+        face_images = []
+        face_bboxes = []
+        for idx, meta in enumerate(pose_metas):
+            face_bbox_for_image = get_face_bboxes(meta['keypoints_face'][:, :2], scale=1.3, image_shape=(H, W))
+            x1, x2, y1, y2 = face_bbox_for_image
+            face_bboxes.append((x1, y1, x2, y2))
+            face_image = images_np[idx][y1:y2, x1:x2]
+            
+            if face_image.size == 0 or face_image.shape[0] == 0 or face_image.shape[1] == 0:
+                # Fallback wenn Gesichtscrop leer
+                fallback_size = int(min(H, W) * 0.3)
+                fallback_x1 = (W - fallback_size) // 2
+                fallback_x2 = fallback_x1 + fallback_size
+                fallback_y1 = int(H * 0.1)
+                fallback_y2 = fallback_y1 + fallback_size
+                face_image = images_np[idx][fallback_y1:fallback_y2, fallback_x1:fallback_x2]
+                
+                if face_image.size == 0:
+                    face_image = np.zeros((fallback_size, fallback_size, C), dtype=images_np.dtype)
+            
+            face_image = cv2.resize(face_image, (512, 512))
+            face_images.append(face_image)
+
+        face_images_np = np.stack(face_images, 0)
+        face_images_tensor = torch.from_numpy(face_images_np)
+
+        if retarget_image is not None and refer_pose_meta is not None:
+            retarget_pose_metas = get_retarget_pose(pose_metas[0], refer_pose_meta, pose_metas, None, None)
+        else:
+            retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+
+        # --- ÄNDERUNG FÜR V2: Alle BBoxen sammeln ---
+        final_bboxes_list = []
+        for bb in bboxes:
+            # Sicherstellen, dass es ein flaches Array ist
+            bb_flat = np.array(bb).flatten()
+            # Mindestens 4 Werte (x, y, w, h, ...)
+            if bb_flat.shape[0] >= 4:
+                # Konvertierung zu int-Tupel (x, y, w, h)
+                bbox_ints = tuple(int(v) for v in bb_flat[:4])
+            else:
+                bbox_ints = (0, 0, 0, 0)
+            final_bboxes_list.append(bbox_ints)
+        # --------------------------------------------
+
+        # Keypoints Logik für JSON output (unverändert)
+        key_frame_num = 4 if B >= 4 else 1
+        key_frame_step = len(pose_metas) // key_frame_num
+        key_frame_index_list = list(range(0, len(pose_metas), key_frame_step))
+        key_points_index = [0, 1, 2, 5, 8, 11, 10, 13]
+        
+        points_dict_list = [] 
+        # Hinweis: Im Original-Code wird points_dict_list in der Loop überschrieben und nur der letzte Stand genommen,
+        # oder es war unvollständig im Snippet. Ich behalte die Logik bei, dass es am Ende json dumped.
+        # Da im Original-Code `points_dict_list` referenziert wird, initialisieren wir es hier sauber.
+        
+        # Wir nehmen einfach die Points vom ersten Keyframe für den Output, 
+        # oder sammeln alle (im Original war die Logik etwas spärlich).
+        # Hier der Original-Block rekonstruiert:
+        for key_frame_index in key_frame_index_list:
+            keypoints_body_list = []
+            if key_frame_index < len(pose_metas):
+                body_key_points = pose_metas[key_frame_index]['keypoints_body']
+                for each_index in key_points_index:
+                    each_keypoint = body_key_points[each_index]
+                    if None is each_keypoint:
+                        continue
+                    keypoints_body_list.append(each_keypoint)
+
+                keypoints_body = np.array(keypoints_body_list)[:, :2]
+                wh = np.array([[pose_metas[0]['width'], pose_metas[0]['height']]])
+                points = (keypoints_body * wh).astype(np.int32)
+                # Reset list for each keyframe to match original logic behavior (last one wins usually unless accumulated)
+                # Aber für JSON dump nehmen wir an, wir wollen eine Liste von Punkten.
+                # Der Originalcode hat `points_dict_list` in der Loop neu befüllt.
+                points_dict_list = [] 
+                for point in points:
+                    points_dict_list.append({"x": int(point[0]), "y": int(point[1])})
+
+        pose_data = {
+            "retarget_image": refer_img if retarget_image is not None else None,
+            "pose_metas": retarget_pose_metas,
+            "refer_pose_meta": refer_pose_meta if retarget_image is not None else None,
+            "pose_metas_original": pose_metas,
+        }
+
+        return (pose_data, face_images_tensor, json.dumps(points_dict_list), final_bboxes_list, face_bboxes)
+
+
+
+class ImageBlackoutOnNoBBox:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "bboxes": ("BBOX",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Blacks out the image frame if no valid BBOX is detected."
+
+    def process(self, images, bboxes):
+        # Wir erstellen eine Kopie der Bilder, um das Original nicht zu verändern
+        new_images = images.clone()
+        batch_size = images.shape[0]
+
+        # Sicherstellen, dass bboxes als Liste vorliegt
+        if not isinstance(bboxes, list):
+            bboxes = [bboxes]
+
+        for i in range(batch_size):
+            is_bbox_valid = False
+
+            # Wir prüfen, ob für den aktuellen Frame 'i' ein Eintrag in der BBox-Liste existiert.
+            # Hinweis: Wenn die Detection Node weniger BBoxen liefert als Bilder da sind,
+            # werden die überschüssigen Bilder schwarz.
+            if i < len(bboxes):
+                bbox = bboxes[i]
+                
+                # Prüfen ob bbox existiert und das Standardformat [x, y, w, h] hat
+                if bbox is not None and len(bbox) >= 4:
+                    w = bbox[2]
+                    h = bbox[3]
+                    
+                    # Ein Bild gilt nur als "erkannt", wenn die Box eine Fläche hat
+                    if w > 0 and h > 0:
+                        is_bbox_valid = True
+
+            # Wenn ungültig (keine Detection), wird der Frame schwarz (Wert 0.0)
+            if not is_bbox_valid:
+                new_images[i] = 0.0
+
+        return (new_images,)
+
 
 class PoseDataEditor:
     @classmethod
