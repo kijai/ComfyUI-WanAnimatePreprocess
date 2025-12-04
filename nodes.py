@@ -84,39 +84,264 @@ FULL_BODY_LENGTH_PAIRS = TORSO_LENGTH_PAIRS + [
     (11, 12),  # left hip to left knee
     (12, 13),  # left knee to left ankle
 ]
+# --------------------------------------------------------------------------------
+# NEW NODES: Face Extractor & Stitcher (Custom Implementation)
+# --------------------------------------------------------------------------------
 
-class OnnxDetectionModelLoader:
+# --------------------------------------------------------------------------------
+# NEW NODES: Wan Face Extractor & Stitcher (Hybrid: Batch Padded or List)
+# --------------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------
+# NEW NODES: Wan Face Extractor & Stitcher (Hybrid: Batch Padded or List)
+# --------------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------
+# NEW NODES: Wan Face Extractor & Stitcher (Hybrid: Batch Padded or List)
+# --------------------------------------------------------------------------------
+
+class WanFaceExtractor:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "vitpose_model": (folder_paths.get_filename_list("detection"), {"tooltip": "These models are loaded from the 'ComfyUI/models/detection' -folder",}),
-                "yolo_model": (folder_paths.get_filename_list("detection"), {"tooltip": "These models are loaded from the 'ComfyUI/models/detection' -folder",}),
-                "onnx_device": (["CUDAExecutionProvider", "CPUExecutionProvider"], {"default": "CUDAExecutionProvider", "tooltip": "Device to run the ONNX models on"}),
+                "model": ("POSEMODEL",),
+                "images": ("IMAGE",),
+                "min_face_scale": ("FLOAT", {"default": 1.3, "min": 1.0, "max": 2.5, "step": 0.05, "tooltip": "Wie viel Kontext um das Gesicht herum ausgeschnitten werden soll."}),
+                "output_mode": (["Batch (Padded)", "Original (List)"], {"default": "Batch (Padded)", "tooltip": "Batch: Alle Bilder gleich groß mit schwarzen Rändern (Tensor). List: Originalgröße (Liste)."}),
+                "batch_size": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64, "tooltip": "Pixelgröße für den Batch-Modus (Quadratisch, z.B. 512x512)."}),
             },
         }
 
-    RETURN_TYPES = ("POSEMODEL",)
-    RETURN_NAMES = ("model", )
-    FUNCTION = "loadmodel"
+    RETURN_TYPES = ("IMAGE", "FACE_INFO")
+    RETURN_NAMES = ("face_images", "face_info")
+    FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "Loads ONNX models for pose and face detection. ViTPose for pose estimation and YOLO for object detection."
+    DESCRIPTION = "Detects faces. Can return either a padded Tensor batch (same size) or a raw list of crops (variable size)."
 
-    def loadmodel(self, vitpose_model, yolo_model, onnx_device):
+    def process(self, model, images, min_face_scale, output_mode, batch_size):
+        detector = model["yolo"]
+        pose_model = model["vitpose"]
+        
+        B, H, W, C = images.shape
+        shape = np.array([H, W])[None]
+        images_np = images.numpy()
 
-        vitpose_model_path = folder_paths.get_full_path_or_raise("detection", vitpose_model)
-        yolo_model_path = folder_paths.get_full_path_or_raise("detection", yolo_model)
+        IMG_NORM_MEAN = np.array([0.485, 0.456, 0.406])
+        IMG_NORM_STD = np.array([0.229, 0.224, 0.225])
+        input_resolution = (256, 192)
+        rescale = 1.25
 
-        vitpose = ViTPose(vitpose_model_path, onnx_device)
-        yolo = Yolo(yolo_model_path, onnx_device)
+        detector.reinit()
+        pose_model.reinit()
 
-        model = {
-            "vitpose": vitpose,
-            "yolo": yolo,
+        # 1. Detection
+        bboxes = []
+        for img in tqdm(images_np, total=len(images_np), desc="Extr: Detecting"):
+            det_result = detector(
+                cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None],
+                shape
+            )
+            bbox_res = det_result[0][0]["bbox"]
+            bboxes.append(bbox_res)
+        detector.cleanup()
+
+        # 2. Pose & Crop
+        face_crops_processed = [] 
+        face_info_list = [] 
+
+        use_padding = (output_mode == "Batch (Padded)")
+
+        for i, (img, bbox) in enumerate(zip(tqdm(images_np, desc="Extr: Cropping"), bboxes)):
+            # Fallback
+            if bbox is None or bbox[-1] <= 0 or (bbox[2] - bbox[0]) < 10:
+                bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+
+            bbox_xywh = bbox
+            center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
+            img_crop_pose = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+            
+            img_norm = (img_crop_pose - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+
+            keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            kp2ds = keypoints[0]
+            meta = load_pose_metas_from_kp2ds_seq(kp2ds[None], width=W, height=H)[0]
+
+            face_bbox = get_face_bboxes(meta['keypoints_face'][:, :2], scale=min_face_scale, image_shape=(H, W))
+            x1, x2, y1, y2 = face_bbox
+            
+            face_crop = images_np[i][y1:y2, x1:x2]
+            
+            valid_crop = True
+            if face_crop.size == 0 or face_crop.shape[0] == 0 or face_crop.shape[1] == 0:
+                valid_crop = False
+                face_crop = np.zeros((64, 64, C), dtype=images_np.dtype)
+
+            crop_h, crop_w = face_crop.shape[:2]
+            
+            # Basis-Info
+            info = {
+                "frame_index": i,
+                "orig_image_w": W,
+                "orig_image_h": H,
+                "x": int(x1),
+                "y": int(y1),
+                "w": int(x2 - x1),
+                "h": int(y2 - y1),
+                "is_valid": valid_crop,
+                "padded": False, 
+                "valid_roi": (0.0, 0.0, 1.0, 1.0) # Format: y1, x1, y2, x2 (RELATIV 0-1)
+            }
+
+            if use_padding:
+                # Modus: Batch (Padded) -> Alles auf 'batch_size' skalieren + schwarze Ränder
+                target_s = batch_size
+                
+                # Skalierung berechnen (Aspect Ratio erhalten)
+                scale_factor = min(target_s / crop_h, target_s / crop_w)
+                new_h = int(crop_h * scale_factor)
+                new_w = int(crop_w * scale_factor)
+                
+                resized_img = cv2.resize(face_crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                
+                # Canvas erstellen (Schwarz)
+                padded_img = np.zeros((target_s, target_s, C), dtype=face_crop.dtype)
+                
+                # Zentrieren
+                pad_top = (target_s - new_h) // 2
+                pad_left = (target_s - new_w) // 2
+                
+                padded_img[pad_top:pad_top+new_h, pad_left:pad_left+new_w] = resized_img
+                
+                face_crops_processed.append(padded_img)
+                
+                info["padded"] = True
+                # HIER: Wir speichern relative Werte (Prozent), damit es bei jeder Auflösung klappt!
+                info["valid_roi"] = (
+                    pad_top / target_s,           # Start Y (z.B. 0.12)
+                    pad_left / target_s,          # Start X
+                    (pad_top + new_h) / target_s, # Ende Y
+                    (pad_left + new_w) / target_s # Ende X
+                )
+                
+            else:
+                # Modus: Original (List) -> Keine Änderung
+                t_crop = torch.from_numpy(face_crop)[None, ...]
+                face_crops_processed.append(t_crop)
+
+            face_info_list.append(info)
+
+        pose_model.cleanup()
+
+        if use_padding:
+            final_output = torch.from_numpy(np.stack(face_crops_processed, 0))
+        else:
+            final_output = face_crops_processed
+
+        return (final_output, face_info_list)
+
+
+class WanFaceStitcher:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "destination_images": ("IMAGE",),
+                "upscaled_face_images": ("IMAGE",),
+                "face_info": ("FACE_INFO",),
+                "resize_faces_to_fit": ("BOOLEAN", {"default": True, "tooltip": "Passt das (zugeschnittene) Gesicht exakt in die Zielbox ein."}),
+            },
         }
 
-        return (model, )
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("stitched_images",)
+    FUNCTION = "stitch"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Stitches faces back. Automatically crops padding from upscaled batch images correctly."
 
+    def stitch(self, destination_images, upscaled_face_images, face_info, resize_faces_to_fit):
+        dest_np = destination_images.detach().clone().cpu().numpy()
+        target_h, target_w = dest_np.shape[1:3]
+
+        # Inputs normalisieren (Liste oder Tensor Batch)
+        faces_list = []
+        if isinstance(upscaled_face_images, list):
+            for t in upscaled_face_images:
+                img = t.detach().cpu().numpy()
+                if img.ndim == 4: img = img[0]
+                faces_list.append(img)
+        else:
+            batch_np = upscaled_face_images.detach().cpu().numpy()
+            for i in range(batch_np.shape[0]):
+                faces_list.append(batch_np[i])
+
+        cnt = 0
+        for info in face_info:
+            if cnt >= len(faces_list):
+                break
+                
+            frame_idx = info["frame_index"]
+            if frame_idx >= len(dest_np):
+                continue
+            if not info["is_valid"]:
+                cnt += 1
+                continue
+
+            face_img = faces_list[cnt]
+            
+            # --- PADDING ENTFERNEN (Dynamisch Skaliert) ---
+            if info.get("padded", False):
+                # Wir holen uns die AKTUELLE Größe des (evtl. upgescalten) Bildes
+                h_curr, w_curr = face_img.shape[:2]
+                
+                # Wir holen uns die RELATIVEN Koordinaten (Prozentwerte)
+                ry1, rx1, ry2, rx2 = info["valid_roi"]
+                
+                # Wir berechnen die Pixel-Koordinaten für DIESE Auflösung neu
+                # Wenn das Bild 2x größer ist, ist h_curr 2x größer -> Crop Koordinaten verdoppeln sich automatisch
+                py1 = int(ry1 * h_curr)
+                px1 = int(rx1 * w_curr)
+                py2 = int(ry2 * h_curr)
+                px2 = int(rx2 * w_curr)
+                
+                # Zuschneiden: Schwarze Ränder fallen weg, nur Gesicht bleibt
+                face_img = face_img[py1:py2, px1:px2]
+
+            # --- POSITIONS BERECHNUNG ---
+            # Skalierung relativ zum Zielbild
+            scale_x = target_w / info["orig_image_w"]
+            scale_y = target_h / info["orig_image_h"]
+            
+            new_x = int(info["x"] * scale_x)
+            new_y = int(info["y"] * scale_y)
+            new_w = int(info["w"] * scale_x)
+            new_h = int(info["h"] * scale_y)
+            
+            # Clipping
+            new_x = max(0, new_x)
+            new_y = max(0, new_y)
+            new_w = min(new_w, target_w - new_x)
+            new_h = min(new_h, target_h - new_y)
+            
+            if new_w > 0 and new_h > 0:
+                if resize_faces_to_fit:
+                    # Skaliere das (bereits von Rändern befreite) Gesicht in die Zielbox
+                    face_img_resized = cv2.resize(face_img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                    dest_np[frame_idx, new_y:new_y+new_h, new_x:new_x+new_w, :] = face_img_resized
+                else:
+                    # Fallback ohne Resize
+                    fh, fw = face_img.shape[:2]
+                    if fh != new_h or fw != new_w:
+                         face_img_resized = cv2.resize(face_img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                         dest_np[frame_idx, new_y:new_y+new_h, new_x:new_x+new_w, :] = face_img_resized
+                    else:
+                        dest_np[frame_idx, new_y:new_y+new_h, new_x:new_x+new_w, :] = face_img
+            
+            cnt += 1
+
+        return (torch.from_numpy(dest_np),)
+        
 class PoseAndFaceDetection:
     @classmethod
     def INPUT_TYPES(s):
@@ -10754,6 +10979,8 @@ class PoseRetargetPromptHelper:
         return (tpl_prompt, refer_prompt, )
 
 NODE_CLASS_MAPPINGS = {
+    "WanFaceExtractor": WanFaceExtractor,
+    "WanFaceStitcher": WanFaceStitcher,
     "DrawViTPose": DrawViTPose,
     "BlackStripeImage": BlackStripeImage,
     "OnnxDetectionModelLoader": OnnxDetectionModelLoader,
@@ -10793,6 +11020,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": PoseDataAutoBlackoutOnJitter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "WanFaceExtractor": "Wan Face Extractor (Coords)",
+    "WanFaceStitcher": "Wan Face Stitcher (Coords)",
     "DrawViTPose": "Draw ViT Pose",
     "BlackStripeImage": "Black Stripe Image",
     "OnnxDetectionModelLoader": "ONNX Detection Model Loader",
@@ -10832,6 +11061,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
