@@ -470,12 +470,95 @@ class PoseDetectionOneToAllAnimation:
 
         return (pose_tensor, ref_pose_image_tensor, image_input_tensor, image_mask_tensor)
 
+class PoseAlignAuggVideoSteadyDancer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "filenames": ("VHS_FILENAMES",),
+                # "detect_resolution":("INT", {"default": 512}),
+                # "image_resolution":("INT", {"default": 700}),
+                "detect_resolution":("INT", {"default": 1024}),
+                "image_resolution":("INT", {"default": 720}),
+                "max_frame":("INT", {"default": 300}),
+                "align_frame":("INT", {"default": 0}),
+            }
+        }
+ 
+    CATEGORY = "musepose_list"
+ 
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("posCond_pose", "negCond_pose")
+    FUNCTION = "posealign_func"
+ 
+    def posealign_func(self, image, filenames, detect_resolution, image_resolution, max_frame, align_frame):
+        from PIL import Image
+        from collections import namedtuple
+        PROJECT_DIR = os.path.dirname(__file__)
+        # import sys
+        # sys.path.insert(0,PROJECT_DIR)
+        from .steadydancer.pose_align import run_alignAugg_video_with_filterPose_translate_smooth
+        ref_image = 255.0 * image[0].cpu().numpy()
+        ref_image = Image.fromarray(np.clip(ref_image, 0, 255).astype(np.uint8))
+        # image_path = os.path.join(PROJECT_DIR, "data/ref_image.jpg")
+        # os.makedirs(os.path.dirname(image_path), exist_ok=True)
+        # ref_image.save(image_path)
+
+        video = filenames[1][-1]
+        # print(filenames, video)
+        
+        # Param = namedtuple('Param', [
+        #                    'yolox_config',
+        #                    'dwpose_config', 
+        #                    'yolox_ckpt', 
+        #                    'dwpose_ckpt',
+        #                 #    'outfn_align_pose_video',
+        #                 #    'outfn',
+        #                    'detect_resolution',
+        #                    'image_resolution',
+        #                    'align_frame',
+        #                    'max_frame', 
+        #                    'imgfn_refer', 
+        #                    'vidfn'])
+        
+        # args = Param(
+        #              os.path.join(PROJECT_DIR,"steadydancer/pose/config/yolox_l_8xb8-300e_coco.py"),
+        #              os.path.join(PROJECT_DIR,"steadydancer/pose/config/dwpose-l_384x288.py"),
+        #              os.path.join(PROJECT_DIR,"steadydancer/pretrained_weights/dwpose/yolox_l_8x8_300e_coco.pth"),
+        #              os.path.join(PROJECT_DIR,"steadydancer/pretrained_weights/dwpose/dw-ll_ucoco_384.pth"), 
+        #             #  None, 
+        #             #  None,
+        #              detect_resolution,
+        #              image_resolution,
+        #              align_frame,
+        #              max_frame, 
+        #              image_path, 
+        #              video)
+        # print(args)
+
+        return run_alignAugg_video_with_filterPose_translate_smooth(
+            yolox_config=os.path.join(PROJECT_DIR,"steadydancer/pose/config/yolox_l_8xb8-300e_coco.py"),
+            dwpose_config=os.path.join(PROJECT_DIR,"steadydancer/pose/config/dwpose-l_384x288.py"),
+            yolox_ckpt=os.path.join(PROJECT_DIR,"steadydancer/pretrained_weights/dwpose/yolox_l_8x8_300e_coco.pth"),
+            dwpose_ckpt=os.path.join(PROJECT_DIR,"steadydancer/pretrained_weights/dwpose/dw-ll_ucoco_384.pth"),
+            # outfn_align_pose_video=None,
+            # outfn=None,
+            detect_resolution=detect_resolution,
+            image_resolution=image_resolution,
+            align_frame=align_frame,
+            max_frame=max_frame,
+            imgfn_refer=ref_image,
+            vidfn=video
+        )
+
 NODE_CLASS_MAPPINGS = {
     "OnnxDetectionModelLoader": OnnxDetectionModelLoader,
     "PoseAndFaceDetection": PoseAndFaceDetection,
     "DrawViTPose": DrawViTPose,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
     "PoseDetectionOneToAllAnimation": PoseDetectionOneToAllAnimation,
+    "PoseAlignAuggVideoSteadyDancer": PoseAlignAuggVideoSteadyDancer,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OnnxDetectionModelLoader": "ONNX Detection Model Loader",
@@ -483,4 +566,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DrawViTPose": "Draw ViT Pose",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
     "PoseDetectionOneToAllAnimation": "Pose Detection OneToAll Animation",
+    "PoseAlignAuggVideoSteadyDancer": "Pose Align Augg Video Steady Dancer",
 }
