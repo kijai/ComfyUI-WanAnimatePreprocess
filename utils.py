@@ -48,6 +48,19 @@ def get_face_bboxes(kp2ds, scale, image_shape, ratio_aug):
     min_x, min_y = np.min(kp2ds_face, axis=0)
     max_x, max_y = np.max(kp2ds_face, axis=0)
 
+    # Check for NaN values in face keypoints (happens when face is not visible)
+    if np.isnan(min_x) or np.isnan(max_x) or np.isnan(min_y) or np.isnan(max_y):
+        # Return a fallback bbox centered on the image, approximately 30% of image size
+        fallback_width = int(w * 0.3)
+        fallback_height = int(h * 0.3)
+        center_x = w // 2
+        center_y = h // 2
+        return [
+            max(center_x - fallback_width // 2, 0),
+            min(center_x + fallback_width // 2, w),
+            max(center_y - fallback_height // 2, 0),
+            min(center_y + fallback_height // 2, h)
+        ]
 
     initial_width = max_x - min_x
     initial_height = max_y - min_y
@@ -291,10 +304,47 @@ def get_frame_indices(frame_num, video_fps, clip_length, train_fps):
 
 def get_face_bboxes(kp2ds, scale, image_shape):
     h, w = image_shape
-    kp2ds_face = kp2ds.copy()[1:] * (w, h)
+    
+    # Check for NaN BEFORE any operation
+    kp2ds_raw = kp2ds.copy()[1:]
+    
+    # Multiple checks for NaN detection
+    has_nan = False
+    try:
+        has_nan = np.any(np.isnan(kp2ds_raw))
+    except:
+        has_nan = True
+    
+    if has_nan or kp2ds_raw.size == 0:
+        # Return a fallback bbox centered on the image, approximately 30% of image size
+        fallback_width = int(w * 0.3)
+        fallback_height = int(h * 0.3)
+        center_x = w // 2
+        center_y = h // 2
+        return [
+            max(center_x - fallback_width // 2, 0),
+            min(center_x + fallback_width // 2, w),
+            max(center_y - fallback_height // 2, 0),
+            min(center_y + fallback_height // 2, h)
+        ]
+    
+    kp2ds_face = kp2ds_raw * (w, h)
 
     min_x, min_y = np.min(kp2ds_face, axis=0)
     max_x, max_y = np.max(kp2ds_face, axis=0)
+    
+    # Additional check after min/max computation
+    if np.isnan(min_x) or np.isnan(max_x) or np.isnan(min_y) or np.isnan(max_y):
+        fallback_width = int(w * 0.3)
+        fallback_height = int(h * 0.3)
+        center_x = w // 2
+        center_y = h // 2
+        return [
+            max(center_x - fallback_width // 2, 0),
+            min(center_x + fallback_width // 2, w),
+            max(center_y - fallback_height // 2, 0),
+            min(center_y + fallback_height // 2, h)
+        ]
 
     initial_width = max_x - min_x
     initial_height = max_y - min_y
@@ -313,5 +363,18 @@ def get_face_bboxes(kp2ds, scale, image_shape):
     expanded_max_x = min(max_x + delta_width, w)
     expanded_min_y = max(min_y - 3 * delta_height, 0)
     expanded_max_y = min(max_y + delta_height, h)
+    
+    # Final safety check before converting to int
+    if np.isnan(expanded_min_x) or np.isnan(expanded_max_x) or np.isnan(expanded_min_y) or np.isnan(expanded_max_y):
+        fallback_width = int(w * 0.3)
+        fallback_height = int(h * 0.3)
+        center_x = w // 2
+        center_y = h // 2
+        return [
+            max(center_x - fallback_width // 2, 0),
+            min(center_x + fallback_width // 2, w),
+            max(center_y - fallback_height // 2, 0),
+            min(center_y + fallback_height // 2, h)
+        ]
 
     return [int(expanded_min_x), int(expanded_max_x), int(expanded_min_y), int(expanded_max_y)]
