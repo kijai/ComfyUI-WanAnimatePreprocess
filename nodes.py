@@ -12744,10 +12744,10 @@ class PoseDataToMask:
                 "stick_width": ("INT", {
                     "default": 10, 
                     "min": 1, 
-                    "max": 300,        # Technisches Limit für manuelle Eingabe
+                    "max": 300, 
                     "step": 1,
-                    "display": "slider", 
-                    "slider_max": 200    # Der Schieberegler stoppt hier
+                    "display": "slider",
+                    "slider_max": 200 
                 }),
             },
         }
@@ -12755,37 +12755,92 @@ class PoseDataToMask:
     RETURN_TYPES = ("MASK",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "Konvertiert PoseData-Skelette in eine binäre Maske (Weiß auf Schwarz)."
+    DESCRIPTION = "Erstellt eine solide Maske mit gefülltem Torso und Kopfbereich."
 
     def process(self, pose_data, width, height, stick_width):
         pose_metas = pose_data["pose_metas"]
         mask_list = []
 
         for meta in pose_metas:
-            # 1. Schwarzer Hintergrund
+            # 1. Leeren Canvas erstellen
             canvas = np.zeros((height, width, 3), dtype=np.uint8)
             
-            # 2. Skelett zeichnen (nutzt deine existierende Funktion)
+            # --- KÖRPERTEILE FÜLLEN ---
+            # Wir holen die Punkte direkt aus den Metadaten
+            kps = meta.kps_body
+            scores = meta.kps_body_p
+            
+            # Hilfsfunktion: Gibt Punkt zurück, wenn Score gut ist, sonst None
+            def get_pt(idx):
+                if idx < len(scores) and scores[idx] > 0.3: # 0.3 Threshold
+                    return (int(kps[idx][0]), int(kps[idx][1]))
+                return None
+
+            # Keypoint Indices (COCO Format):
+            # 0:Nose, 2:RShoulder, 5:LShoulder, 8:RHip, 11:LHip, 14:REye, 15:LEye, 16:REar, 17:LEar
+
+            # A. TORSO FÜLLEN (Trapez zwischen Schultern und Hüften)
+            # Reihenfolge: L-Schulter -> R-Schulter -> R-Hüfte -> L-Hüfte
+            p_lsh, p_rsh = get_pt(5), get_pt(2)
+            p_lhip, p_rhip = get_pt(11), get_pt(8)
+            
+            if p_lsh and p_rsh and p_rhip and p_lhip:
+                pts_torso = np.array([p_lsh, p_rsh, p_rhip, p_lhip], np.int32)
+                cv2.fillPoly(canvas, [pts_torso], (255, 255, 255))
+
+            # B. KOPF & HALS FÜLLEN
+            # Wir bauen ein Polygon von der Nase über die Ohren zu den Schultern
+            head_pts = []
+            
+            # 1. Nase (Mitte oben)
+            p_nose = get_pt(0)
+            if p_nose: head_pts.append(p_nose)
+            
+            # 2. Linkes Ohr (oder Auge als Fallback)
+            p_lear = get_pt(17)
+            if not p_lear: p_lear = get_pt(15) # Fallback LEye
+            if p_lear: head_pts.append(p_lear)
+            
+            # 3. Linke Schulter
+            if p_lsh: head_pts.append(p_lsh)
+            
+            # 4. Rechte Schulter
+            if p_rsh: head_pts.append(p_rsh)
+            
+            # 5. Rechtes Ohr (oder Auge als Fallback)
+            p_rear = get_pt(16)
+            if not p_rear: p_rear = get_pt(14) # Fallback REye
+            if p_rear: head_pts.append(p_rear)
+            
+            # Zeichnen, wenn wir genug Punkte für eine Fläche haben (mind. 3)
+            if len(head_pts) >= 3:
+                pts_head = np.array(head_pts, np.int32)
+                cv2.fillPoly(canvas, [pts_head], (255, 255, 255))
+
+            # --- SKELETT (ARME & BEINE) ---
+            # Das Skelett wird zusätzlich gezeichnet, um Arme, Beine und Details sicherzustellen
+            skeleton_canvas = np.zeros_like(canvas)
             skeleton_img = draw_aapose_by_meta_new(
-                canvas, 
+                skeleton_canvas, 
                 meta, 
                 draw_hand=True, 
                 draw_head=True,
                 body_stick_width=stick_width,
-                hand_stick_width=max(1, stick_width // 2) 
+                hand_stick_width=max(1, stick_width // 2)
             )
             
-            # 3. In Graustufen umwandeln
-            gray = cv2.cvtColor(skeleton_img, cv2.COLOR_RGB2GRAY)
+            # --- KOMBINIEREN ---
+            # Konvertiere beide zu Graustufen-Masken
+            filled_mask = cv2.cvtColor(canvas, cv2.COLOR_RGB2GRAY)
+            skeleton_mask = cv2.cvtColor(skeleton_img, cv2.COLOR_RGB2GRAY)
             
-            # 4. WICHTIG: Thresholding, damit alles, was nicht schwarz ist, komplett Weiß wird (1.0)
-            # Das verhindert graue Linien durch die Skelett-Farben.
-            mask = (gray > 0).astype(np.float32) 
+            # Kombiniere Füllung und Skelett (Logisches ODER)
+            final_mask = cv2.bitwise_or(filled_mask, skeleton_mask)
             
-            mask_tensor = torch.from_numpy(mask)
+            # Normalisieren (0.0 bis 1.0) und alles > 0 auf 1.0 setzen
+            mask_tensor = torch.from_numpy((final_mask > 0).astype(np.float32))
             mask_list.append(mask_tensor)
 
-        # Stapeln (B, H, W)
         return (torch.stack(mask_list, dim=0),)
 
 
@@ -12896,6 +12951,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataToMask": "PoseData to Mask",
     
 }
+
 
 
 
