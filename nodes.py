@@ -12744,10 +12744,10 @@ class PoseDataToMask:
                 "stick_width": ("INT", {
                     "default": 10, 
                     "min": 1, 
-                    "max": 300, # Erlaubt manuelle Eingabe bis 300
+                    "max": 300,        # Technisches Limit für manuelle Eingabe
                     "step": 1,
-                    "display": "slider", # Slider-Interface
-                    "slider_max": 200    # Der Regler selbst geht nur bis 200
+                    "display": "slider", 
+                    "slider_max": 200    # Der Schieberegler stoppt hier
                 }),
             },
         }
@@ -12755,39 +12755,38 @@ class PoseDataToMask:
     RETURN_TYPES = ("MASK",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "Konvertiert PoseData-Skelette in eine binäre Maske mit einstellbarer Linienbreite."
+    DESCRIPTION = "Konvertiert PoseData-Skelette in eine binäre Maske (Weiß auf Schwarz)."
 
     def process(self, pose_data, width, height, stick_width):
         pose_metas = pose_data["pose_metas"]
         mask_list = []
 
         for meta in pose_metas:
-            # Erzeuge schwarzen Hintergrund (Canvas)
+            # 1. Schwarzer Hintergrund
             canvas = np.zeros((height, width, 3), dtype=np.uint8)
             
-            # Zeichne das Skelett mit der neuen Hilfsfunktion
-            # Wir erzwingen Weiß (255, 255, 255) für die Maske
+            # 2. Skelett zeichnen (nutzt deine existierende Funktion)
             skeleton_img = draw_aapose_by_meta_new(
                 canvas, 
                 meta, 
                 draw_hand=True, 
                 draw_head=True,
                 body_stick_width=stick_width,
-                hand_stick_width=max(1, stick_width // 2) # Hände proportional dünner
+                hand_stick_width=max(1, stick_width // 2) 
             )
             
-            # Konvertierung in Graustufen-Maske (nur ein Kanal)
-            mask = cv2.cvtColor(skeleton_img, cv2.COLOR_RGB2GRAY)
+            # 3. In Graustufen umwandeln
+            gray = cv2.cvtColor(skeleton_img, cv2.COLOR_RGB2GRAY)
             
-            # Normalisierung auf 0.0 - 1.0 für ComfyUI Mask-Format
-            mask_tensor = torch.from_numpy(mask.astype(np.float32) / 255.0)
+            # 4. WICHTIG: Thresholding, damit alles, was nicht schwarz ist, komplett Weiß wird (1.0)
+            # Das verhindert graue Linien durch die Skelett-Farben.
+            mask = (gray > 0).astype(np.float32) 
+            
+            mask_tensor = torch.from_numpy(mask)
             mask_list.append(mask_tensor)
 
-        # Stapeln zu einem Batch-Tensor (B, H, W)
+        # Stapeln (B, H, W)
         return (torch.stack(mask_list, dim=0),)
-
-# Vergiss nicht, die Node in den NODE_CLASS_MAPPINGS zu registrieren:
-# "PoseDataToMask": PoseDataToMask
 
 
 
@@ -12897,6 +12896,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataToMask": "PoseData to Mask",
     
 }
+
 
 
 
