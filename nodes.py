@@ -12732,6 +12732,68 @@ class PoseRetargetPromptHelper:
 
         return (tpl_prompt, refer_prompt, )
 
+
+class PoseDataToMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1}),
+                "stick_width": ("INT", {
+                    "default": 10, 
+                    "min": 1, 
+                    "max": 300, # Erlaubt manuelle Eingabe bis 300
+                    "step": 1,
+                    "display": "slider", # Slider-Interface
+                    "slider_max": 200    # Der Regler selbst geht nur bis 200
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Konvertiert PoseData-Skelette in eine binäre Maske mit einstellbarer Linienbreite."
+
+    def process(self, pose_data, width, height, stick_width):
+        pose_metas = pose_data["pose_metas"]
+        mask_list = []
+
+        for meta in pose_metas:
+            # Erzeuge schwarzen Hintergrund (Canvas)
+            canvas = np.zeros((height, width, 3), dtype=np.uint8)
+            
+            # Zeichne das Skelett mit der neuen Hilfsfunktion
+            # Wir erzwingen Weiß (255, 255, 255) für die Maske
+            skeleton_img = draw_aapose_by_meta_new(
+                canvas, 
+                meta, 
+                draw_hand=True, 
+                draw_head=True,
+                body_stick_width=stick_width,
+                hand_stick_width=max(1, stick_width // 2) # Hände proportional dünner
+            )
+            
+            # Konvertierung in Graustufen-Maske (nur ein Kanal)
+            mask = cv2.cvtColor(skeleton_img, cv2.COLOR_RGB2GRAY)
+            
+            # Normalisierung auf 0.0 - 1.0 für ComfyUI Mask-Format
+            mask_tensor = torch.from_numpy(mask.astype(np.float32) / 255.0)
+            mask_list.append(mask_tensor)
+
+        # Stapeln zu einem Batch-Tensor (B, H, W)
+        return (torch.stack(mask_list, dim=0),)
+
+# Vergiss nicht, die Node in den NODE_CLASS_MAPPINGS zu registrieren:
+# "PoseDataToMask": PoseDataToMask
+
+
+
+
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -12781,6 +12843,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataAutomaticOffsetNodeV2": PoseDataAutomaticOffsetNodeV2,
     "PoseDataAutomaticOffsetNodeV3": PoseDataAutomaticOffsetNodeV3,
     "PoseDataAutoBlackoutOnJitter": PoseDataAutoBlackoutOnJitter,
+    "PoseDataToMask": PoseDataToMask,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": "Pose and Face Detection V7 (No Warp)",
@@ -12831,8 +12894,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutomaticOffsetNodeV2": "Automatic Offset Node V2",
     "PoseDataAutomaticOffsetNodeV3": "Automatic Offset Node V3",
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
+    "PoseDataToMask": "PoseData to Mask",
     
 }
+
 
 
 
