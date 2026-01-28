@@ -12755,88 +12755,94 @@ class PoseDataToMask:
     RETURN_TYPES = ("MASK",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "Erstellt eine Maske. Füllt den Körper aus; zieht bei fehlenden Hüften Linien bis zum Boden."
+    DESCRIPTION = "Erstellt Maske. Füllt Körper. Fallback auf vorherigen Frame, wenn Schultern fehlen."
 
     def process(self, pose_data, width, height, stick_width):
         pose_metas = pose_data["pose_metas"]
         mask_list = []
 
+        # Initialisierung: Leere Maske für den Start (falls Frame 0 schon leer ist)
+        last_valid_mask = np.zeros((height, width), dtype=np.float32)
+
         for meta in pose_metas:
-            canvas = np.zeros((height, width, 3), dtype=np.uint8)
-            
+            # Hilfsfunktion für Keypoints
             kps = meta.kps_body
             scores = meta.kps_body_p
             
-            # Hilfsfunktion: Punkt holen, wenn Score > 0.3
             def get_pt(idx):
                 if idx < len(scores) and scores[idx] > 0.3:
                     return (int(kps[idx][0]), int(kps[idx][1]))
                 return None
 
-            # Indices: 0:Nose, 2:RShoulder, 5:LShoulder, 8:RHip, 11:LHip, ...
+            # Prüfen, ob Schultern da sind (Links: 5, Rechts: 2)
+            p_lsh, p_rsh = get_pt(5), get_pt(2)
 
-            # --- A. KÖRPER / TORSO FÜLLEN ---
-            p_lsh, p_rsh = get_pt(5), get_pt(2)   # Schultern
-            p_lhip, p_rhip = get_pt(11), get_pt(8) # Hüften
-            
-            # Wir brauchen zumindest beide Schultern, um den Körper zu zeichnen
+            # --- ENTSCHEIDUNGSLOGIK ---
             if p_lsh and p_rsh:
+                # === FALL A: SCHULTERN SIND DA -> NEU ZEICHNEN ===
+                
+                canvas = np.zeros((height, width, 3), dtype=np.uint8)
+                p_lhip, p_rhip = get_pt(11), get_pt(8)
+
+                # 1. TORSO FÜLLEN
                 if p_lhip and p_rhip:
-                    # FALL 1: Hüften sind da -> Zeichne Trapez (Schultern zu Hüften)
+                    # Hüften da: Trapez zeichnen
                     pts_torso = np.array([p_lsh, p_rsh, p_rhip, p_lhip], np.int32)
                     cv2.fillPoly(canvas, [pts_torso], (255, 255, 255))
                 else:
-                    # FALL 2: Hüften fehlen -> Zeichne Rechteck bis ganz nach unten (height)
-                    # Wir nehmen die X-Koordinate der Schulter und Y = Bildhöhe
+                    # Hüften weg: Rechteck bis zum Boden
                     p_r_bottom = (p_rsh[0], height)
                     p_l_bottom = (p_lsh[0], height)
-                    
                     pts_torso = np.array([p_lsh, p_rsh, p_r_bottom, p_l_bottom], np.int32)
                     cv2.fillPoly(canvas, [pts_torso], (255, 255, 255))
 
-            # --- B. KOPF & HALS FÜLLEN ---
-            # Polygon: Nase -> Ohren -> Schultern
-            head_pts = []
-            p_nose = get_pt(0)
-            if p_nose: head_pts.append(p_nose)
-            
-            p_lear = get_pt(17) or get_pt(15) # Ohr oder Auge
-            if p_lear: head_pts.append(p_lear)
-            
-            if p_lsh: head_pts.append(p_lsh)
-            if p_rsh: head_pts.append(p_rsh)
-            
-            p_rear = get_pt(16) or get_pt(14) # Ohr oder Auge
-            if p_rear: head_pts.append(p_rear)
-            
-            if len(head_pts) >= 3:
-                pts_head = np.array(head_pts, np.int32)
-                cv2.fillPoly(canvas, [pts_head], (255, 255, 255))
+                # 2. KOPF & HALS FÜLLEN
+                head_pts = []
+                p_nose = get_pt(0)
+                if p_nose: head_pts.append(p_nose)
+                p_lear = get_pt(17) or get_pt(15)
+                if p_lear: head_pts.append(p_lear)
+                head_pts.append(p_lsh)
+                head_pts.append(p_rsh)
+                p_rear = get_pt(16) or get_pt(14)
+                if p_rear: head_pts.append(p_rear)
+                
+                if len(head_pts) >= 3:
+                    pts_head = np.array(head_pts, np.int32)
+                    cv2.fillPoly(canvas, [pts_head], (255, 255, 255))
 
-            # --- C. SKELETT DRAUFZEICHNEN ---
-            skeleton_canvas = np.zeros_like(canvas)
-            skeleton_img = draw_aapose_by_meta_new(
-                skeleton_canvas, 
-                meta, 
-                draw_hand=True, 
-                draw_head=True,
-                body_stick_width=stick_width,
-                hand_stick_width=max(1, stick_width // 2)
-            )
-            
-            # --- D. KOMBINIEREN ---
-            filled_mask = cv2.cvtColor(canvas, cv2.COLOR_RGB2GRAY)
-            skeleton_mask = cv2.cvtColor(skeleton_img, cv2.COLOR_RGB2GRAY)
-            final_mask = cv2.bitwise_or(filled_mask, skeleton_mask)
-            
-            mask_tensor = torch.from_numpy((final_mask > 0).astype(np.float32))
+                # 3. SKELETT DRAUFZEICHNEN
+                skeleton_canvas = np.zeros_like(canvas)
+                skeleton_img = draw_aapose_by_meta_new(
+                    skeleton_canvas, 
+                    meta, 
+                    draw_hand=True, 
+                    draw_head=True,
+                    body_stick_width=stick_width,
+                    hand_stick_width=max(1, stick_width // 2)
+                )
+
+                # 4. ZUSAMMENFÜHREN & SPEICHERN
+                filled_mask = cv2.cvtColor(canvas, cv2.COLOR_RGB2GRAY)
+                skeleton_mask = cv2.cvtColor(skeleton_img, cv2.COLOR_RGB2GRAY)
+                final_mask_combined = cv2.bitwise_or(filled_mask, skeleton_mask)
+                
+                # Als aktuellen "gültigen" Stand speichern (0.0 - 1.0 Format)
+                last_valid_mask = (final_mask_combined > 0).astype(np.float32)
+
+            else:
+                # === FALL B: SCHULTERN WEG (oder gar nichts da) ===
+                # Wir machen nichts Neues, sondern behalten einfach 'last_valid_mask'
+                # (Das ist effektiv das "Kopieren" der alten Maske)
+                pass 
+
+            # Maske zur Liste hinzufügen
+            # Wir nehmen hier immer 'last_valid_mask'.
+            # Wenn Fall A eintrat, ist es die neue. Wenn Fall B eintrat, ist es die alte.
+            mask_tensor = torch.from_numpy(last_valid_mask)
             mask_list.append(mask_tensor)
 
         return (torch.stack(mask_list, dim=0),)
-
-
-
-
 
 
 NODE_CLASS_MAPPINGS = {
@@ -12942,6 +12948,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataToMask": "PoseData to Mask",
     
 }
+
 
 
 
