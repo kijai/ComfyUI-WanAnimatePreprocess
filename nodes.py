@@ -13123,6 +13123,166 @@ class PoseDataToMask:
         return (torch.stack(mask_list, dim=0),)
 
 
+class PoseDataToOvalMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1}),
+                # Optional: Ein Faktor, um die Box etwas breiter/schmaler zu machen
+                "width_scale": ("FLOAT", {"default": 1.2, "min": 0.8, "max": 2.0, "step": 0.05}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Erstellt eine Body-Box (Rechteck), die am Kopf hängt und sich die Breite merkt, wenn der Körper aus dem Bild geht."
+
+    def process(self, pose_data, width, height, width_scale):
+        pose_metas = pose_data["pose_metas"]
+        mask_list = []
+
+        # Wir merken uns die letzte "gute" halbe Breite (Abstand von Mitte nach Außen)
+        last_half_width = None
+        
+        # Indizes für die Breite (Wir ignorieren Arme 3,4,6,7):
+        # 2: RShoulder, 5: LShoulder, 8: RHip, 11: LHip, 0: Nose, 14-17: Eyes/Ears
+        width_indices = [2, 5, 8, 11, 0, 14, 15, 16, 17]
+        
+        # Indizes für unten (Knie, Füße):
+        bottom_indices = [9, 10, 12, 13, 19, 20] # Knie, Knöchel, Zehen
+
+        for meta in pose_metas:
+            canvas = np.zeros((height, width), dtype=np.float32) # Float Canvas 0.0-1.0
+            
+            kps = meta.kps_body
+            scores = meta.kps_body_p
+
+            # Helper
+            def get_pt(idx):
+                if idx < len(scores) and scores[idx] > 0.3:
+                    return np.array(kps[idx][:2])
+                return None
+
+            # 1. KOPF / ZENTRUM FINDEN
+            # Wir brauchen ein Zentrum, an dem die Box hängt. Am besten Durchschnitt aus Schultern oder Ohren.
+            p_lsh, p_rsh = get_pt(5), get_pt(2)
+            p_lear, p_rear = (get_pt(17) or get_pt(15)), (get_pt(16) or get_pt(14))
+            
+            center_x = None
+            
+            # Versuch 1: Mitte der Schultern
+            if p_lsh is not None and p_rsh is not None:
+                center_x = (p_lsh[0] + p_rsh[0]) / 2
+            # Versuch 2: Mitte der Ohren/Augen
+            elif p_lear is not None and p_rear is not None:
+                center_x = (p_lear[0] + p_rear[0]) / 2
+            # Versuch 3: Nase
+            elif get_pt(0) is not None:
+                center_x = get_pt(0)[0]
+
+            if center_x is not None:
+                # === A. STIRN-LOGIK (TOP Y) ===
+                top_y = 0
+                if p_lear is not None and p_rear is not None and p_lsh is not None and p_rsh is not None:
+                    eye_y = (p_lear[1] + p_rear[1]) / 2
+                    sh_y = (p_lsh[1] + p_rsh[1]) / 2
+                    dist = abs(sh_y - eye_y)
+                    forehead_add = dist * 0.7  # Faktor für Stirnhöhe
+                    top_y = max(0, int(eye_y - forehead_add))
+                elif get_pt(0) is not None:
+                    # Fallback nur Nase -> Pauschal etwas drüber
+                    top_y = max(0, int(get_pt(0)[1] - (height * 0.1)))
+
+                # === B. BREITE BESTIMMEN ===
+                # Suche den breitesten Punkt im aktuellen Frame (ohne Arme)
+                current_min_x = width
+                current_max_x = 0
+                found_body_parts = False
+
+                for idx in width_indices:
+                    pt = get_pt(idx)
+                    if pt is not None:
+                        if pt[0] < current_min_x: current_min_x = pt[0]
+                        if pt[0] > current_max_x: current_max_x = pt[0]
+                        found_body_parts = True
+                
+                # Berechnung der halben Breite (vom Zentrum aus)
+                current_half_width = 0
+                if found_body_parts:
+                    w = (current_max_x - current_min_x)
+                    # Sicherstellen, dass wir eine Mindestbreite haben (z.B. Kopfbreite)
+                    if w < 10: w = 50 
+                    current_half_width = (w / 2) * width_scale
+
+                # LOGIK: Sind Hüften da?
+                p_lhip, p_rhip = get_pt(11), get_pt(8)
+                hips_present = (p_lhip is not None or p_rhip is not None)
+
+                if hips_present:
+                    # Wenn Hüften da sind, vertrauen wir der aktuellen Breite und speichern sie
+                    draw_half_width = current_half_width
+                    last_half_width = current_half_width
+                else:
+                    # Keine Hüften (zu nah dran)? 
+                    # Nimm die gespeicherte Breite. Wenn keine gespeichert, nimm die aktuelle (Schultern).
+                    if last_half_width is not None:
+                        draw_half_width = last_half_width
+                    else:
+                        draw_half_width = current_half_width
+
+                # === C. UNTEN BESTIMMEN (BOTTOM Y) ===
+                # Suche den tiefsten Punkt
+                max_y = 0
+                found_legs = False
+                for idx in bottom_indices:
+                    pt = get_pt(idx)
+                    if pt is not None:
+                        if pt[1] > max_y: max_y = pt[1]
+                        found_legs = True
+                
+                if found_legs:
+                    # Beine da -> Box geht bis zu den Füßen (+ etwas Puffer)
+                    bottom_y = min(height, int(max_y + 20))
+                else:
+                    # Keine Beine -> Box geht bis ganz nach unten (und darüber hinaus)
+                    bottom_y = height 
+
+                # === D. ZEICHNEN ===
+                # Wir zeichnen ein Rechteck
+                x1 = int(center_x - draw_half_width)
+                x2 = int(center_x + draw_half_width)
+                y1 = int(top_y)
+                y2 = int(bottom_y)
+
+                # Zeichnen (1.0 für Weiß)
+                # cv2.rectangle erwartet Integer Koordinaten. 
+                # Wir füllen einfach diesen Bereich im Array.
+                
+                # Clipping für Array-Zugriff, damit es nicht crasht
+                x1 = max(0, x1)
+                x2 = min(width, x2)
+                y1 = max(0, y1)
+                y2 = min(height, y2)
+
+                if x2 > x1 and y2 > y1:
+                    canvas[y1:y2, x1:x2] = 1.0
+
+            else:
+                # Kein Kopf gefunden? 
+                # Option A: Schwarzes Bild
+                # Option B: Letzte Maske wiederholen (könnte man hier einbauen)
+                pass
+
+            mask_tensor = torch.from_numpy(canvas)
+            mask_list.append(mask_tensor)
+
+        return (torch.stack(mask_list, dim=0),)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -13174,6 +13334,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataAutomaticOffsetNodeV4": PoseDataAutomaticOffsetNodeV4,
     "PoseDataAutoBlackoutOnJitter": PoseDataAutoBlackoutOnJitter,
     "PoseDataToMask": PoseDataToMask,
+    "PoseDataToOvalMask": PoseDataToOvalMask,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": "Pose and Face Detection V7 (No Warp)",
@@ -13226,8 +13387,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutomaticOffsetNodeV4": "Automatic Offset Node V4",
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     "PoseDataToMask": "PoseData to Mask",
+    "PoseDataToOvalMask": "PoseData to Oval Mask",
     
 }
+
 
 
 
