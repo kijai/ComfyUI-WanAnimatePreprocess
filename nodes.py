@@ -3719,7 +3719,7 @@ class PoseDataAutomaticOffsetNodeV4:
                 arr[idx][1] = y
             elif isinstance(arr[idx], list):
                 arr[idx][0] = x
-                arr[idx][1] =
+                arr[idx][1] = y
 
 
 class ImageBlackoutOnNoBBox:
@@ -13204,6 +13204,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataToMask": "PoseData to Mask",
     
 }
+
 
 
 
