@@ -13968,7 +13968,82 @@ class PoseDataEditorV2:
             return selections
         return selections
 
+class SavePoseDataNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "filename_prefix": ("STRING", {"default": "debug_pose_data"}),
+            }
+        }
 
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "save_json"
+    CATEGORY = "WanAnimatePreprocess/Debug"
+    DESCRIPTION = "Speichert die Pose-Daten in einer JSON-Datei, um sie für das Debugging bereitzustellen."
+
+    def save_json(self, pose_data, filename_prefix):
+        import json
+        import os
+        import numpy as np
+        
+        output_dir = folder_paths.get_output_directory()
+        
+        # Filename generieren (hochzählend)
+        counter = 0
+        while True:
+            filename = f"{filename_prefix}_{counter:05d}.json"
+            full_path = os.path.join(output_dir, filename)
+            if not os.path.exists(full_path):
+                break
+            counter += 1
+
+        def convert_to_serializable(obj):
+            if isinstance(obj, np.ndarray):
+                # Große Arrays (z.B. Bilder) nicht speichern, nur Metadaten
+                if obj.ndim >= 3 and obj.size > 10000: 
+                    return f"<Image/Array shape={obj.shape} dtype={str(obj.dtype)}>"
+                return obj.tolist()
+            elif isinstance(obj, AAPoseMeta):
+                # AAPoseMeta Objekt explizit in Dict umwandeln
+                return {
+                    "image_id": getattr(obj, "image_id", ""),
+                    "height": getattr(obj, "height", 0),
+                    "width": getattr(obj, "width", 0),
+                    "kps_body": convert_to_serializable(getattr(obj, "kps_body", None)),
+                    "kps_body_p": convert_to_serializable(getattr(obj, "kps_body_p", None)),
+                    "kps_lhand": convert_to_serializable(getattr(obj, "kps_lhand", None)),
+                    "kps_lhand_p": convert_to_serializable(getattr(obj, "kps_lhand_p", None)),
+                    "kps_rhand": convert_to_serializable(getattr(obj, "kps_rhand", None)),
+                    "kps_rhand_p": convert_to_serializable(getattr(obj, "kps_rhand_p", None)),
+                    "kps_face": convert_to_serializable(getattr(obj, "kps_face", None)),
+                    "kps_face_p": convert_to_serializable(getattr(obj, "kps_face_p", None)),
+                }
+            elif isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_serializable(x) for x in obj]
+            elif isinstance(obj, (np.float32, np.float64)):
+                return float(obj)
+            elif isinstance(obj, (np.int32, np.int64)):
+                return int(obj)
+            else:
+                return obj
+
+        try:
+            serializable_data = convert_to_serializable(pose_data)
+            
+            with open(full_path, 'w', encoding='utf-8') as f:
+                json.dump(serializable_data, f, indent=4, ensure_ascii=False)
+                
+            print(f"✅ PoseData erfolgreich gespeichert: {full_path}")
+        except Exception as e:
+            print(f"❌ Fehler beim Speichern der PoseData: {e}")
+
+        return (pose_data,)
+        
 
 class PoseDataHipHandDebug:
     @classmethod
@@ -14154,6 +14229,7 @@ class PoseDataHipHandDebug:
 
 
 
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -14208,6 +14284,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataToOvalMask": PoseDataToOvalMask,
     "PoseDataEditorV2": PoseDataEditorV2,
     "PoseDataHipHandDebug": PoseDataHipHandDebug,
+    "SavePoseDataNode": SavePoseDataNode,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": "Pose and Face Detection V7 (No Warp)",
@@ -14263,8 +14340,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataToOvalMask": "PoseData to Oval Mask",
     "PoseDataEditorV2": "Pose Data Editor V2",
     "PoseDataHipHandDebug": "Pose Data Hip & Hand Debug",
+    "SavePoseDataNode": "Save Pose Data (Debug)",
     
 }
+
 
 
 
