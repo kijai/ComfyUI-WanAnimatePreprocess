@@ -13283,6 +13283,17 @@ class PoseDataToOvalMask:
         return (torch.stack(mask_list, dim=0),)
 
 
+import copy
+import math
+import numpy as np
+import torch
+
+# Stelle sicher, dass diese Konstanten im Scope verfügbar sind 
+# (normalerweise sind sie oben in der nodes.py definiert).
+# Falls nicht, hier zur Sicherheit nochmal (auskommentieren, falls schon vorhanden):
+# BODY_GROUPS = { ... } 
+# TARGET_OPTIONS = ...
+
 class PoseDataEditorV2:
     @classmethod
     def INPUT_TYPES(cls):
@@ -13318,7 +13329,7 @@ class PoseDataEditorV2:
                         "tooltip": "Minimum distance (in pixels) to keep between head keypoints and the top canvas edge when enforcing bounds.",
                     },
                 ),
-                # --- NEUE PARAMETER ---
+                # --- NEUE PARAMETER START ---
                 "auto_hand_adjust": (
                     "BOOLEAN",
                     {
@@ -13333,10 +13344,27 @@ class PoseDataEditorV2:
                         "min": -500.0,
                         "max": 500.0,
                         "step": 1.0,
-                        "tooltip": "Zusätzlicher Abstand für die Hände (Links nach links, Rechts nach rechts) bei HipWidth-Anpassung.",
+                        "tooltip": "Zusätzlicher manueller Abstand für die Hände.",
                     },
                 ),
-                # ----------------------
+                "smooth_hand_entry": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Aktiviert den graduellen Übergang basierend auf der Handhöhe relativ zur Hüfte.",
+                    },
+                ),
+                "smooth_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.15,
+                        "min": 0.01,
+                        "max": 0.5,
+                        "step": 0.01,
+                        "tooltip": "Bereich über der Hüfte (0.0-1.0 der Bildhöhe), in dem der Effekt langsam beginnt.",
+                    },
+                ),
+                # --- NEUE PARAMETER ENDE ---
                 "only_adjust_when_legs_long": (
                     "BOOLEAN",
                     {
@@ -13370,7 +13398,7 @@ class PoseDataEditorV2:
     RETURN_NAMES = ("pose_data",)
     FUNCTION = "edit"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "Pose Data Editor V2: With automatic hand adjustment for hip scaling."
+    DESCRIPTION = "Pose Data Editor V2: With smoothed automatic hand adjustment for hip scaling."
 
     def edit(
         self,
@@ -13391,6 +13419,8 @@ class PoseDataEditorV2:
         head_top_padding,
         auto_hand_adjust,
         hand_offset,
+        smooth_hand_entry,
+        smooth_threshold,
         only_adjust_when_legs_long,
         min_leg_length_ratio,
         strict_leg_guard,
@@ -13438,6 +13468,8 @@ class PoseDataEditorV2:
                 head_top_padding,
                 auto_hand_adjust,
                 hand_offset,
+                smooth_hand_entry,
+                smooth_threshold,
                 only_adjust_when_legs_long,
                 min_leg_length_ratio,
                 strict_leg_guard,
@@ -13463,6 +13495,8 @@ class PoseDataEditorV2:
         head_top_padding,
         auto_hand_adjust,
         hand_offset,
+        smooth_hand_entry,
+        smooth_threshold,
         only_adjust_when_legs_long,
         min_leg_length_ratio,
         strict_leg_guard,
@@ -13490,7 +13524,8 @@ class PoseDataEditorV2:
         refs = []
 
         # --- HIP LOGIC PRE-CALCULATION ---
-        hip_indices_map = {} 
+        # Speichere alte Positionen für Vergleich
+        hip_indices_map_x = {}
         is_hip_edit = (target_upper == "HIP_WIDTH")
         
         if is_hip_edit and auto_hand_adjust:
@@ -13500,12 +13535,12 @@ class PoseDataEditorV2:
                     if hip_idx < len(body_arr):
                          coords = self._extract_coords(body_arr[hip_idx])
                          if coords is not None:
-                             hip_indices_map[hip_idx] = coords[0]
+                             hip_indices_map_x[hip_idx] = coords[0]
 
+        # --- SELECTION LOOP ---
         for arr_name, indices in selections:
             arr = getattr(meta, arr_name, None)
-            if arr is None:
-                continue
+            if arr is None: continue
 
             if isinstance(indices, str) and indices == "ALL":
                 iterable = range(len(arr))
@@ -13513,33 +13548,20 @@ class PoseDataEditorV2:
                 iterable = indices
 
             for idx in iterable:
-                if idx >= len(arr):
-                    continue
-
+                if idx >= len(arr): continue
                 point = arr[idx]
-                if point is None:
-                    continue
+                if point is None: continue
 
-                if isinstance(point, np.ndarray):
-                    if np.isnan(point).any():
-                        continue
-                    x, y = point.tolist()
-                elif isinstance(point, (list, tuple)):
-                    if len(point) < 2 or point[0] is None or point[1] is None:
-                        continue
-                    x, y = point[:2]
-                else:
-                    continue
+                coords = self._extract_coords(point)
+                if coords is None: continue
+                x, y = coords
 
                 if arr_name == "kps_body" and getattr(meta, "kps_body_p", None) is not None:
-                    if meta.kps_body_p[idx] <= 0:
-                        continue
+                    if meta.kps_body_p[idx] <= 0: continue
                 if arr_name == "kps_lhand" and getattr(meta, "kps_lhand_p", None) is not None:
-                    if meta.kps_lhand_p[idx] <= 0:
-                        continue
+                    if meta.kps_lhand_p[idx] <= 0: continue
                 if arr_name == "kps_rhand" and getattr(meta, "kps_rhand_p", None) is not None:
-                    if meta.kps_rhand_p[idx] <= 0:
-                        continue
+                    if meta.kps_rhand_p[idx] <= 0: continue
 
                 points.append([float(x), float(y)])
                 refs.append((arr_name, idx))
@@ -13564,19 +13586,15 @@ class PoseDataEditorV2:
         )
 
         scales = np.array([scale_x, scale_y], dtype=np.float32)
-        if only_scale_up:
-            scales = np.maximum(scales, np.ones_like(scales))
-        if only_scale_down:
-            scales = np.minimum(scales, np.ones_like(scales))
+        if only_scale_up: scales = np.maximum(scales, np.ones_like(scales))
+        if only_scale_down: scales = np.minimum(scales, np.ones_like(scales))
 
         if affects_legs and only_adjust_when_legs_long and height not in (None, 0):
             leg_span = float(np.ptp(original_points[:, 1]))
             leg_span_ratio = leg_span / float(height) if height else 0.0
             if leg_span_ratio < max(0.0, float(min_leg_length_ratio)):
-                if scales[0] > 1.0:
-                    scales[0] = 1.0
-                if scales[1] > 1.0:
-                    scales[1] = 1.0
+                if scales[0] > 1.0: scales[0] = 1.0
+                if scales[1] > 1.0: scales[1] = 1.0
 
         offset = np.array([x_offset, y_offset], dtype=np.float32)
         if normalized_offset:
@@ -13601,60 +13619,105 @@ class PoseDataEditorV2:
             transformed[:, 0] = np.clip(transformed[:, 0], 0.0, float(width))
             transformed[:, 1] = np.clip(transformed[:, 1], 0.0, float(height))
 
+        # --- APPLY TRANSFORMATIONS ---
         for (arr_name, idx), new_point in zip(refs, transformed.tolist()):
-            if arr_name == "kps_body":
-                meta.kps_body[idx] = new_point
-            elif arr_name == "kps_lhand":
-                meta.kps_lhand[idx] = new_point
-            elif arr_name == "kps_rhand":
-                meta.kps_rhand[idx] = new_point
-            elif arr_name == "kps_face":
-                meta.kps_face[idx] = new_point
+            if arr_name == "kps_body": meta.kps_body[idx] = new_point
+            elif arr_name == "kps_lhand": meta.kps_lhand[idx] = new_point
+            elif arr_name == "kps_rhand": meta.kps_rhand[idx] = new_point
+            elif arr_name == "kps_face": meta.kps_face[idx] = new_point
 
-        # --- HIP WIDTH HAND ADJUSTMENT LOGIC ---
+        # =========================================================
+        # --- HIP WIDTH HAND ADJUSTMENT (With Smoothing Logic) ---
+        # =========================================================
         if is_hip_edit and auto_hand_adjust:
             body_arr = getattr(meta, "kps_body", None)
             if body_arr is not None:
-                # Delta Rechts (Hip 8) - typischerweise negativ wenn breiter (nach links)
+                # 1. Deltas berechnen
                 delta_right = 0.0
-                if 8 in hip_indices_map and 8 < len(body_arr):
+                current_hip_y_r = 0.0
+                if 8 in hip_indices_map_x and 8 < len(body_arr):
                     new_coords = self._extract_coords(body_arr[8])
                     if new_coords is not None:
-                        delta_right = new_coords[0] - hip_indices_map[8]
+                        delta_right = new_coords[0] - hip_indices_map_x[8]
+                        current_hip_y_r = new_coords[1]
                 
-                # Delta Links (Hip 11) - typischerweise positiv wenn breiter (nach rechts)
                 delta_left = 0.0
-                if 11 in hip_indices_map and 11 < len(body_arr):
+                current_hip_y_l = 0.0
+                if 11 in hip_indices_map_x and 11 < len(body_arr):
                     new_coords = self._extract_coords(body_arr[11])
                     if new_coords is not None:
-                        delta_left = new_coords[0] - hip_indices_map[11]
+                        delta_left = new_coords[0] - hip_indices_map_x[11]
+                        current_hip_y_l = new_coords[1]
+
+                # Basis-Verschiebung inkl. Hand Offset
+                base_shift_right = delta_right - float(hand_offset)
+                base_shift_left = delta_left + float(hand_offset)
+
+                # 2. Smoothing: Bestimme Faktor basierend auf Handhöhe
                 
-                # Hand Offset anwenden (Positiv = Breiter)
-                # Rechts (Seite 8): delta ist negativ. Minus offset macht es noch negativer (weiter links).
-                final_delta_right = delta_right - float(hand_offset)
-                # Links (Seite 11): delta ist positiv. Plus offset macht es noch positiver (weiter rechts).
-                final_delta_left = delta_left + float(hand_offset)
-                
-                # Arme/Hände verschieben
+                # --- RECHTE SEITE (Wrist Index 4) ---
+                factor_right = 1.0
+                if smooth_hand_entry and 4 < len(body_arr):
+                    wrist_coords = self._extract_coords(body_arr[4])
+                    if wrist_coords is not None and current_hip_y_r > 0:
+                        wrist_y = wrist_coords[1]
+                        safe_zone_px = float(height) * float(smooth_threshold)
+                        start_transition_y = current_hip_y_r - safe_zone_px
+                        
+                        if wrist_y < start_transition_y:
+                            factor_right = 0.0 # Zu weit oben
+                        elif wrist_y >= current_hip_y_r:
+                            factor_right = 1.0 # Unterhalb Hüfte -> Voller Effekt
+                        else:
+                            # Interpolation
+                            if safe_zone_px > 0:
+                                progress = (wrist_y - start_transition_y) / safe_zone_px
+                                factor_right = max(0.0, min(1.0, progress))
+                            else:
+                                factor_right = 1.0
+
+                # --- LINKE SEITE (Wrist Index 7) ---
+                factor_left = 1.0
+                if smooth_hand_entry and 7 < len(body_arr):
+                    wrist_coords = self._extract_coords(body_arr[7])
+                    if wrist_coords is not None and current_hip_y_l > 0:
+                        wrist_y = wrist_coords[1]
+                        safe_zone_px = float(height) * float(smooth_threshold)
+                        start_transition_y = current_hip_y_l - safe_zone_px
+                        
+                        if wrist_y < start_transition_y:
+                            factor_left = 0.0
+                        elif wrist_y >= current_hip_y_l:
+                            factor_left = 1.0
+                        else:
+                            if safe_zone_px > 0:
+                                progress = (wrist_y - start_transition_y) / safe_zone_px
+                                factor_left = max(0.0, min(1.0, progress))
+                            else:
+                                factor_left = 1.0
+
+                final_shift_right = base_shift_right * factor_right
+                final_shift_left = base_shift_left * factor_left
+
+                # 3. Apply Shifts
                 # Rechts (Seite 8): Elbow(3), Wrist(4)
                 right_arm_indices = [3, 4]
+                for arm_idx in right_arm_indices:
+                    self._shift_point_x(body_arr, arm_idx, final_shift_right, width, limit_scale_to_canvas)
+                
                 # Links (Seite 11): Elbow(6), Wrist(7)
                 left_arm_indices = [6, 7]
-                
-                # 1. Body Points verschieben
-                for arm_idx in right_arm_indices:
-                    self._shift_point_x(body_arr, arm_idx, final_delta_right, width, limit_scale_to_canvas)
                 for arm_idx in left_arm_indices:
-                    self._shift_point_x(body_arr, arm_idx, final_delta_left, width, limit_scale_to_canvas)
+                    self._shift_point_x(body_arr, arm_idx, final_shift_left, width, limit_scale_to_canvas)
                     
-                # 2. Hand Arrays verschieben
+                # Hände
                 if hasattr(meta, "kps_rhand") and meta.kps_rhand is not None:
                     for i in range(len(meta.kps_rhand)):
-                        self._shift_point_x(meta.kps_rhand, i, final_delta_right, width, limit_scale_to_canvas)
+                        self._shift_point_x(meta.kps_rhand, i, final_shift_right, width, limit_scale_to_canvas)
                         
                 if hasattr(meta, "kps_lhand") and meta.kps_lhand is not None:
                     for i in range(len(meta.kps_lhand)):
-                        self._shift_point_x(meta.kps_lhand, i, final_delta_left, width, limit_scale_to_canvas)
+                        self._shift_point_x(meta.kps_lhand, i, final_shift_left, width, limit_scale_to_canvas)
 
         if vertical_offset_for_rest > 0.0:
             self._offset_unselected_points(
@@ -13675,16 +13738,19 @@ class PoseDataEditorV2:
             float(head_top_padding),
         )
 
+    # =========================================================
+    # --- HELPER METHODS (Standalone) ---
+    # =========================================================
+
     def _shift_point_x(self, arr, idx, dx, max_width, limit):
         if idx >= len(arr): return
         coords = self._extract_coords(arr[idx])
         if coords is None: return
+        if abs(dx) < 1e-9: return # Performance / Precision check
         new_x = coords[0] + dx
         if limit:
             new_x = float(np.clip(new_x, 0.0, float(max_width)))
         self._assign_point(arr, idx, new_x, coords[1])
-
-    # --- Helper Methods from Original PoseDataEditor ---
 
     def _required_refs_for_visibility(self, meta, target_upper):
         if target_upper in ("ALL", "BODY"):
@@ -13825,9 +13891,7 @@ class PoseDataEditorV2:
                 y = float(point[1])
             except (TypeError, ValueError): return None
         else: return None
-        try:
-            if not (math.isfinite(x) and math.isfinite(y)): return None
-        except (TypeError, ValueError): return None
+        if not (math.isfinite(x) and math.isfinite(y)): return None
         return x, y
 
     def _assign_point(self, arr, idx, x, y):
@@ -13838,6 +13902,7 @@ class PoseDataEditorV2:
                 arr[idx, 0] = x_val
                 arr[idx, 1] = y_val
             else:
+                # Fallback für seltsame Strukturen
                 current = arr[idx]
                 if isinstance(current, np.ndarray) and current.shape[-1] >= 2:
                     current[0] = x_val
@@ -13846,6 +13911,7 @@ class PoseDataEditorV2:
                 else:
                     arr[idx] = np.array([x_val, y_val], dtype=np.float32)
             return
+        # Fallback für Listen
         current = arr[idx]
         if current is None:
             current = [0.0, 0.0]
@@ -14012,6 +14078,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataEditorV2": "Pose Data Editor V2",
     
 }
+
 
 
 
