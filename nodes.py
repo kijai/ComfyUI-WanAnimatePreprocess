@@ -13283,6 +13283,626 @@ class PoseDataToOvalMask:
         return (torch.stack(mask_list, dim=0),)
 
 
+class PoseDataEditorV2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "target_region": (TARGET_OPTIONS, {"default": "BODY", "tooltip": "Select which set of keypoints to manipulate."}),
+                "x_offset": ("FLOAT", {"default": 0.0, "min": -2048.0, "max": 2048.0, "step": 0.01, "tooltip": "Horizontal offset applied to the selected points."}),
+                "y_offset": ("FLOAT", {"default": 0.0, "min": -2048.0, "max": 2048.0, "step": 0.01, "tooltip": "Vertical offset applied to the selected points."}),
+                "normalized_offset": ("BOOLEAN", {"default": False, "tooltip": "Interpret offsets in normalised 0-1 space instead of pixels."}),
+                "rotation_deg": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.1, "tooltip": "Rotation angle applied around the centroid of the selected points."}),
+                "scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "Uniform scale applied when link scale axes is enabled."}),
+                "link_scale_axes": ("BOOLEAN", {"default": False, "tooltip": "When enabled, the uniform scale value drives both X and Y axes."}),
+                "scale_x": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "Scale factor along the X axis (bi-directional)."}),
+                "scale_y": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "Scale factor along the Y axis (bi-directional)."}),
+                "limit_scale_to_canvas": ("BOOLEAN", {"default": True, "tooltip": "Clamp transformed points so they stay within the canvas."}),
+                "only_scale_up": ("BOOLEAN", {"default": False, "tooltip": "Prevent scale factors below 1.0 to avoid shrinking the selection."}),
+                "only_scale_down": ("BOOLEAN", {"default": False, "tooltip": "Prevent scale factors above 1.0 to avoid enlarging the selection."}),
+                "shift_pose_to_canvas": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Translate the entire pose after edits so every keypoint stays on the canvas before any clamping is applied.",
+                    },
+                ),
+                "head_top_padding": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1024.0,
+                        "step": 0.1,
+                        "tooltip": "Minimum distance (in pixels) to keep between head keypoints and the top canvas edge when enforcing bounds.",
+                    },
+                ),
+                # --- NEUE PARAMETER ---
+                "auto_hand_adjust": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Wenn aktiviert: Bewegt Hände/Ellbogen automatisch mit, wenn HipWidth skaliert wird.",
+                    },
+                ),
+                "hand_offset": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": -500.0,
+                        "max": 500.0,
+                        "step": 1.0,
+                        "tooltip": "Zusätzlicher Abstand für die Hände (Links nach links, Rechts nach rechts) bei HipWidth-Anpassung.",
+                    },
+                ),
+                # ----------------------
+                "only_adjust_when_legs_long": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "When editing legs or feet, only apply scaling when their normalised height span exceeds the configured threshold.",
+                    },
+                ),
+                "min_leg_length_ratio": (
+                    "FLOAT",
+                    {
+                        "default": 0.35,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.01,
+                        "tooltip": "Minimum normalised leg length (relative to canvas height) required before leg scaling is applied.",
+                    },
+                ),
+                "strict_leg_guard": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "When enabled, leg edits are skipped unless both legs have visible lower joints so torso points stay unchanged when detections are missing.",
+                    },
+                ),
+                "require_visible_part": ("BOOLEAN", {"default": True, "tooltip": "Skip edits when any required keypoints for the selected region are not visible."}),
+                "person_index": ("INT", {"default": -1, "min": -1, "max": 9999, "step": 1, "tooltip": "When >= 0, only edit the matching pose entry. Use -1 to edit every pose."}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "edit"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Pose Data Editor V2: With automatic hand adjustment for hip scaling."
+
+    def edit(
+        self,
+        pose_data,
+        target_region,
+        x_offset,
+        y_offset,
+        normalized_offset,
+        rotation_deg,
+        scale,
+        link_scale_axes,
+        scale_x,
+        scale_y,
+        limit_scale_to_canvas,
+        only_scale_up,
+        only_scale_down,
+        shift_pose_to_canvas,
+        head_top_padding,
+        auto_hand_adjust,
+        hand_offset,
+        only_adjust_when_legs_long,
+        min_leg_length_ratio,
+        strict_leg_guard,
+        require_visible_part,
+        person_index,
+    ):
+        if only_scale_up and only_scale_down:
+            raise ValueError(
+                "Only one of 'only_scale_up' or 'only_scale_down' can be enabled at a time."
+            )
+
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        if link_scale_axes:
+            scale_x = scale
+            scale_y = scale
+
+        indices = (
+            [person_index]
+            if isinstance(person_index, int) and person_index >= 0 and person_index < len(pose_metas)
+            else list(range(len(pose_metas)))
+        )
+
+        for idx in indices:
+            meta = pose_metas[idx]
+            if meta is None:
+                continue
+            self._apply_edit(
+                meta,
+                target_region,
+                x_offset,
+                y_offset,
+                normalized_offset,
+                rotation_deg,
+                scale_x,
+                scale_y,
+                limit_scale_to_canvas,
+                only_scale_up,
+                only_scale_down,
+                shift_pose_to_canvas,
+                head_top_padding,
+                auto_hand_adjust,
+                hand_offset,
+                only_adjust_when_legs_long,
+                min_leg_length_ratio,
+                strict_leg_guard,
+                require_visible_part,
+            )
+
+        return (pose_data_copy,)
+
+    def _apply_edit(
+        self,
+        meta,
+        target_region,
+        x_offset,
+        y_offset,
+        normalized_offset,
+        rotation_deg,
+        scale_x,
+        scale_y,
+        limit_scale_to_canvas,
+        only_scale_up,
+        only_scale_down,
+        shift_pose_to_canvas,
+        head_top_padding,
+        auto_hand_adjust,
+        hand_offset,
+        only_adjust_when_legs_long,
+        min_leg_length_ratio,
+        strict_leg_guard,
+        require_visible_part,
+    ):
+        width = getattr(meta, "width", None)
+        height = getattr(meta, "height", None)
+
+        if width in (None, 0) or height in (None, 0):
+            return
+
+        selections = self._resolve_selection(meta, target_region)
+        if not selections:
+            return
+
+        target_upper = target_region.upper()
+        if require_visible_part:
+            required_refs = self._required_refs_for_visibility(meta, target_upper)
+            if required_refs and not all(
+                self._is_point_visible(meta, arr_name, idx) for arr_name, idx in required_refs
+            ):
+                return
+
+        points = []
+        refs = []
+
+        # --- HIP LOGIC PRE-CALCULATION ---
+        hip_indices_map = {} 
+        is_hip_edit = (target_upper == "HIP_WIDTH")
+        
+        if is_hip_edit and auto_hand_adjust:
+            body_arr = getattr(meta, "kps_body", None)
+            if body_arr is not None:
+                for hip_idx in [8, 11]:
+                    if hip_idx < len(body_arr):
+                         coords = self._extract_coords(body_arr[hip_idx])
+                         if coords is not None:
+                             hip_indices_map[hip_idx] = coords[0]
+
+        for arr_name, indices in selections:
+            arr = getattr(meta, arr_name, None)
+            if arr is None:
+                continue
+
+            if isinstance(indices, str) and indices == "ALL":
+                iterable = range(len(arr))
+            else:
+                iterable = indices
+
+            for idx in iterable:
+                if idx >= len(arr):
+                    continue
+
+                point = arr[idx]
+                if point is None:
+                    continue
+
+                if isinstance(point, np.ndarray):
+                    if np.isnan(point).any():
+                        continue
+                    x, y = point.tolist()
+                elif isinstance(point, (list, tuple)):
+                    if len(point) < 2 or point[0] is None or point[1] is None:
+                        continue
+                    x, y = point[:2]
+                else:
+                    continue
+
+                if arr_name == "kps_body" and getattr(meta, "kps_body_p", None) is not None:
+                    if meta.kps_body_p[idx] <= 0:
+                        continue
+                if arr_name == "kps_lhand" and getattr(meta, "kps_lhand_p", None) is not None:
+                    if meta.kps_lhand_p[idx] <= 0:
+                        continue
+                if arr_name == "kps_rhand" and getattr(meta, "kps_rhand_p", None) is not None:
+                    if meta.kps_rhand_p[idx] <= 0:
+                        continue
+
+                points.append([float(x), float(y)])
+                refs.append((arr_name, idx))
+
+        if not points:
+            return
+
+        if (
+            strict_leg_guard
+            and target_upper == "LEGS"
+            and not self._has_lower_leg_points(refs)
+        ):
+            return
+
+        points_np = np.array(points, dtype=np.float32)
+        center = points_np.mean(axis=0, keepdims=True)
+        original_points = points_np.copy()
+
+        leg_indices = set(BODY_GROUPS.get("LEGS", [])) | set(BODY_GROUPS.get("FEET", []))
+        affects_legs = bool(refs) and all(
+            arr_name == "kps_body" and idx in leg_indices for arr_name, idx in refs
+        )
+
+        scales = np.array([scale_x, scale_y], dtype=np.float32)
+        if only_scale_up:
+            scales = np.maximum(scales, np.ones_like(scales))
+        if only_scale_down:
+            scales = np.minimum(scales, np.ones_like(scales))
+
+        if affects_legs and only_adjust_when_legs_long and height not in (None, 0):
+            leg_span = float(np.ptp(original_points[:, 1]))
+            leg_span_ratio = leg_span / float(height) if height else 0.0
+            if leg_span_ratio < max(0.0, float(min_leg_length_ratio)):
+                if scales[0] > 1.0:
+                    scales[0] = 1.0
+                if scales[1] > 1.0:
+                    scales[1] = 1.0
+
+        offset = np.array([x_offset, y_offset], dtype=np.float32)
+        if normalized_offset:
+            offset *= np.array([width, height], dtype=np.float32)
+
+        theta = math.radians(rotation_deg)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        rotation_matrix = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float32)
+
+        transformed = (points_np - center) * scales
+        transformed = transformed @ rotation_matrix.T
+        transformed = transformed + center
+
+        vertical_offset_for_rest = 0.0
+        if affects_legs and only_scale_up and (scales[0] > 1.0 or scales[1] > 1.0):
+            vertical_offset_for_rest = max(0.0, float(np.min(original_points[:, 1]) - np.min(transformed[:, 1])))
+
+        transformed = transformed + offset
+
+        if limit_scale_to_canvas and not shift_pose_to_canvas:
+            transformed[:, 0] = np.clip(transformed[:, 0], 0.0, float(width))
+            transformed[:, 1] = np.clip(transformed[:, 1], 0.0, float(height))
+
+        for (arr_name, idx), new_point in zip(refs, transformed.tolist()):
+            if arr_name == "kps_body":
+                meta.kps_body[idx] = new_point
+            elif arr_name == "kps_lhand":
+                meta.kps_lhand[idx] = new_point
+            elif arr_name == "kps_rhand":
+                meta.kps_rhand[idx] = new_point
+            elif arr_name == "kps_face":
+                meta.kps_face[idx] = new_point
+
+        # --- HIP WIDTH HAND ADJUSTMENT LOGIC ---
+        if is_hip_edit and auto_hand_adjust:
+            body_arr = getattr(meta, "kps_body", None)
+            if body_arr is not None:
+                # Delta Rechts (Hip 8) - typischerweise negativ wenn breiter (nach links)
+                delta_right = 0.0
+                if 8 in hip_indices_map and 8 < len(body_arr):
+                    new_coords = self._extract_coords(body_arr[8])
+                    if new_coords is not None:
+                        delta_right = new_coords[0] - hip_indices_map[8]
+                
+                # Delta Links (Hip 11) - typischerweise positiv wenn breiter (nach rechts)
+                delta_left = 0.0
+                if 11 in hip_indices_map and 11 < len(body_arr):
+                    new_coords = self._extract_coords(body_arr[11])
+                    if new_coords is not None:
+                        delta_left = new_coords[0] - hip_indices_map[11]
+                
+                # Hand Offset anwenden (Positiv = Breiter)
+                # Rechts (Seite 8): delta ist negativ. Minus offset macht es noch negativer (weiter links).
+                final_delta_right = delta_right - float(hand_offset)
+                # Links (Seite 11): delta ist positiv. Plus offset macht es noch positiver (weiter rechts).
+                final_delta_left = delta_left + float(hand_offset)
+                
+                # Arme/Hände verschieben
+                # Rechts (Seite 8): Elbow(3), Wrist(4)
+                right_arm_indices = [3, 4]
+                # Links (Seite 11): Elbow(6), Wrist(7)
+                left_arm_indices = [6, 7]
+                
+                # 1. Body Points verschieben
+                for arm_idx in right_arm_indices:
+                    self._shift_point_x(body_arr, arm_idx, final_delta_right, width, limit_scale_to_canvas)
+                for arm_idx in left_arm_indices:
+                    self._shift_point_x(body_arr, arm_idx, final_delta_left, width, limit_scale_to_canvas)
+                    
+                # 2. Hand Arrays verschieben
+                if hasattr(meta, "kps_rhand") and meta.kps_rhand is not None:
+                    for i in range(len(meta.kps_rhand)):
+                        self._shift_point_x(meta.kps_rhand, i, final_delta_right, width, limit_scale_to_canvas)
+                        
+                if hasattr(meta, "kps_lhand") and meta.kps_lhand is not None:
+                    for i in range(len(meta.kps_lhand)):
+                        self._shift_point_x(meta.kps_lhand, i, final_delta_left, width, limit_scale_to_canvas)
+
+        if vertical_offset_for_rest > 0.0:
+            self._offset_unselected_points(
+                meta,
+                vertical_offset_for_rest,
+                refs,
+                limit_scale_to_canvas and not shift_pose_to_canvas,
+                float(width),
+                float(height),
+            )
+
+        self._enforce_canvas_bounds(
+            meta,
+            float(width),
+            float(height),
+            limit_scale_to_canvas,
+            shift_pose_to_canvas,
+            float(head_top_padding),
+        )
+
+    def _shift_point_x(self, arr, idx, dx, max_width, limit):
+        if idx >= len(arr): return
+        coords = self._extract_coords(arr[idx])
+        if coords is None: return
+        new_x = coords[0] + dx
+        if limit:
+            new_x = float(np.clip(new_x, 0.0, float(max_width)))
+        self._assign_point(arr, idx, new_x, coords[1])
+
+    # --- Helper Methods from Original PoseDataEditor ---
+
+    def _required_refs_for_visibility(self, meta, target_upper):
+        if target_upper in ("ALL", "BODY"):
+            return []
+        if target_upper in BODY_GROUPS and target_upper != "ALL":
+            return [("kps_body", idx) for idx in BODY_GROUPS[target_upper]]
+        return []
+
+    def _is_point_visible(self, meta, arr_name, idx):
+        arr = getattr(meta, arr_name, None)
+        if arr is None or idx >= len(arr):
+            return False
+        point = arr[idx]
+        if point is None:
+            return False
+        if isinstance(point, np.ndarray):
+            if point.shape[-1] < 2:
+                return False
+            if np.isnan(point[:2]).any():
+                return False
+        elif isinstance(point, (list, tuple)):
+            if len(point) < 2 or point[0] is None or point[1] is None:
+                return False
+        else:
+            return False
+        prob_attr = getattr(meta, f"{arr_name}_p", None)
+        if prob_attr is not None:
+            if idx >= len(prob_attr) or prob_attr[idx] <= 0:
+                return False
+        return True
+
+    def _offset_unselected_points(self, meta, vertical_offset, selected_refs, clamp_points, width, height):
+        if vertical_offset <= 0.0:
+            return
+        selected_set = {(name, idx) for name, idx in selected_refs}
+        for arr_name in ("kps_body", "kps_lhand", "kps_rhand", "kps_face"):
+            arr = getattr(meta, arr_name, None)
+            if arr is None:
+                continue
+            for idx in range(len(arr)):
+                if (arr_name, idx) in selected_set:
+                    continue
+                coords = self._extract_coords(arr[idx])
+                if coords is None:
+                    continue
+                new_x = coords[0]
+                new_y = coords[1] - vertical_offset
+                if clamp_points:
+                    new_x = float(np.clip(new_x, 0.0, width))
+                    new_y = float(np.clip(new_y, 0.0, height))
+                self._assign_point(arr, idx, new_x, new_y)
+
+    def _enforce_canvas_bounds(self, meta, width, height, limit_to_canvas, shift_pose, head_top_padding):
+        if shift_pose:
+            self._keep_pose_within_canvas(meta, width, height, limit_to_canvas, head_top_padding)
+        elif limit_to_canvas:
+            self._clamp_pose(meta, width, height, head_top_padding, head_top_padding > 0.0)
+
+    def _keep_pose_within_canvas(self, meta, width, height, limit_to_canvas, head_top_padding):
+        all_points, head_points = self._collect_pose_points(meta)
+        if not all_points:
+            return
+        xs = [pt[2] for pt in all_points]
+        ys = [pt[3] for pt in all_points]
+        dx_min = -min(xs)
+        dx_max = width - max(xs)
+        dy_min = -min(ys)
+        dy_max = height - max(ys)
+        if head_points and head_top_padding > 0.0:
+            head_min_y = min(pt[3] for pt in head_points)
+            dy_min = max(dy_min, head_top_padding - head_min_y)
+        dx = self._select_shift(dx_min, dx_max)
+        dy = self._select_shift(dy_min, dy_max)
+        if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+            self._apply_translation(meta, dx, dy)
+        if limit_to_canvas:
+            self._clamp_pose(meta, width, height, head_top_padding, head_top_padding > 0.0)
+
+    def _collect_pose_points(self, meta):
+        all_points = []
+        head_points = []
+        head_indices = set(BODY_GROUPS.get("HEAD", []))
+        for arr_name in ("kps_body", "kps_lhand", "kps_rhand", "kps_face"):
+            arr = getattr(meta, arr_name, None)
+            if arr is None:
+                continue
+            for idx in range(len(arr)):
+                coords = self._extract_coords(arr[idx])
+                if coords is None:
+                    continue
+                all_points.append((arr_name, idx, coords[0], coords[1]))
+                if arr_name == "kps_body" and idx in head_indices:
+                    head_points.append((arr_name, idx, coords[0], coords[1]))
+        return all_points, head_points
+
+    def _apply_translation(self, meta, dx, dy):
+        if abs(dx) <= 1e-6 and abs(dy) <= 1e-6:
+            return
+        for arr_name in ("kps_body", "kps_lhand", "kps_rhand", "kps_face"):
+            arr = getattr(meta, arr_name, None)
+            if arr is None:
+                continue
+            for idx in range(len(arr)):
+                coords = self._extract_coords(arr[idx])
+                if coords is None:
+                    continue
+                self._assign_point(arr, idx, coords[0] + dx, coords[1] + dy)
+
+    def _clamp_pose(self, meta, width, height, head_top_padding, enforce_head_padding):
+        head_indices = set(BODY_GROUPS.get("HEAD", []))
+        for arr_name in ("kps_body", "kps_lhand", "kps_rhand", "kps_face"):
+            arr = getattr(meta, arr_name, None)
+            if arr is None:
+                continue
+            for idx in range(len(arr)):
+                coords = self._extract_coords(arr[idx])
+                if coords is None:
+                    continue
+                min_y = 0.0
+                if enforce_head_padding and arr_name == "kps_body" and idx in head_indices:
+                    min_y = head_top_padding
+                clamped_x = float(np.clip(coords[0], 0.0, width))
+                clamped_y = float(np.clip(coords[1], min_y, height))
+                self._assign_point(arr, idx, clamped_x, clamped_y)
+
+    def _extract_coords(self, point):
+        if point is None: return None
+        if isinstance(point, np.ndarray):
+            if point.ndim == 0 or point.shape[-1] < 2: return None
+            try:
+                x = float(point[0])
+                y = float(point[1])
+            except (TypeError, ValueError): return None
+        elif isinstance(point, (list, tuple)):
+            if len(point) < 2: return None
+            try:
+                x = float(point[0])
+                y = float(point[1])
+            except (TypeError, ValueError): return None
+        else: return None
+        try:
+            if not (math.isfinite(x) and math.isfinite(y)): return None
+        except (TypeError, ValueError): return None
+        return x, y
+
+    def _assign_point(self, arr, idx, x, y):
+        x_val = float(x)
+        y_val = float(y)
+        if isinstance(arr, np.ndarray):
+            if arr.ndim >= 2 and arr.shape[-1] >= 2:
+                arr[idx, 0] = x_val
+                arr[idx, 1] = y_val
+            else:
+                current = arr[idx]
+                if isinstance(current, np.ndarray) and current.shape[-1] >= 2:
+                    current[0] = x_val
+                    current[1] = y_val
+                    arr[idx] = current
+                else:
+                    arr[idx] = np.array([x_val, y_val], dtype=np.float32)
+            return
+        current = arr[idx]
+        if current is None:
+            current = [0.0, 0.0]
+        elif isinstance(current, tuple):
+            current = list(current)
+        elif not isinstance(current, list):
+            current = [float(current)]
+        while len(current) < 2:
+            current.append(0.0)
+        current[0] = x_val
+        current[1] = y_val
+        arr[idx] = current
+
+    def _select_shift(self, min_allowed, max_allowed):
+        if min_allowed <= 0.0 <= max_allowed:
+            return 0.0
+        if min_allowed > max_allowed:
+            return min_allowed if abs(min_allowed) <= abs(max_allowed) else max_allowed
+        return min_allowed if abs(min_allowed) <= abs(max_allowed) else max_allowed
+
+    def _has_lower_leg_points(self, refs):
+        if not refs: return False
+        right_leg_present = False
+        left_leg_present = False
+        for arr_name, idx in refs:
+            if arr_name != "kps_body": continue
+            if idx in (9, 10): right_leg_present = True
+            elif idx in (12, 13): left_leg_present = True
+            if right_leg_present and left_leg_present: return True
+        return right_leg_present and left_leg_present
+
+    def _resolve_selection(self, meta, target_region):
+        target = target_region.upper()
+        selections = []
+        if target == "ALL":
+            selections.append(("kps_body", BODY_GROUPS["ALL"]))
+            if getattr(meta, "kps_lhand", None) is not None: selections.append(("kps_lhand", "ALL"))
+            if getattr(meta, "kps_rhand", None) is not None: selections.append(("kps_rhand", "ALL"))
+            if getattr(meta, "kps_face", None) is not None: selections.append(("kps_face", "ALL"))
+            return selections
+        if target == "BODY":
+            selections.append(("kps_body", BODY_GROUPS["ALL"]))
+            return selections
+        if target in BODY_GROUPS:
+            selections.append(("kps_body", BODY_GROUPS[target]))
+            return selections
+        if target in HAND_GROUPS:
+            hand_target = HAND_GROUPS[target]
+            if hand_target in ("left", "both") and getattr(meta, "kps_lhand", None) is not None: selections.append(("kps_lhand", "ALL"))
+            if hand_target in ("right", "both") and getattr(meta, "kps_rhand", None) is not None: selections.append(("kps_rhand", "ALL"))
+            return selections
+        if target in FACE_GROUP and getattr(meta, "kps_face", None) is not None:
+            selections.append(("kps_face", "ALL"))
+            return selections
+        return selections
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -13335,6 +13955,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": PoseDataAutoBlackoutOnJitter,
     "PoseDataToMask": PoseDataToMask,
     "PoseDataToOvalMask": PoseDataToOvalMask,
+    "PoseDataEditorV2": PoseDataEditorV2,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": "Pose and Face Detection V7 (No Warp)",
@@ -13388,8 +14009,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     "PoseDataToMask": "PoseData to Mask",
     "PoseDataToOvalMask": "PoseData to Oval Mask",
+    "PoseDataEditorV2": "Pose Data Editor V2",
     
 }
+
 
 
 
