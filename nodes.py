@@ -13902,12 +13902,13 @@ class PoseDataSmartHandFilterTimed:
         return {
             "required": {
                 "pose_data": ("POSEDATA",),
-                "threshold": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Ab wann gilt ein Punkt als 'fehlend'? (Confidence Wert)."}),
-                "delete_broken_fingers": ("BOOLEAN", {"default": True, "tooltip": "Wenn EIN Punkt eines Fingers fehlt, wird der ganze Finger gelöscht."}),
-                "delete_if_half_missing": ("BOOLEAN", {"default": True, "tooltip": "Wenn mehr als 50% der Hand fehlen, wird die ganze Hand gelöscht."}),
-                "active_seconds": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 3600.0, "step": 0.01, "tooltip": "Wie lange der Filter aktiv bleibt (in Sekunden)."}),
-                "target_hand": (["BOTH", "LEFT", "RIGHT"], {"default": "BOTH", "tooltip": "Auf welche Hände die Logik angewendet wird."}),
-                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.01, "tooltip": "Framerate des Videos zur Berechnung der Zeit."}),
+                "threshold": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Ab welcher Confidence gilt ein Punkt als sichtbar?"}),
+                "delete_broken_fingers": ("BOOLEAN", {"default": True, "tooltip": "Löscht defekte Finger komplett."}),
+                "delete_incomplete_hand": ("BOOLEAN", {"default": True, "tooltip": "Aktiviert das Löschen der ganzen Hand bei zu wenig Punkten."}),
+                "hand_integrity_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Prozentualer Anteil (0.0-1.0) der Punkte, die da sein müssen, sonst wird die Hand gelöscht."}),
+                "active_seconds": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 3600.0, "step": 0.01, "tooltip": "Wie lange der Filter aktiv ist."}),
+                "target_hand": (["BOTH", "LEFT", "RIGHT"], {"default": "BOTH", "tooltip": "Zielhände."}),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.01, "tooltip": "Video Framerate."}),
                 "person_index": ("INT", {"default": -1, "min": -1, "max": 9999, "step": 1}),
             },
         }
@@ -13916,73 +13917,58 @@ class PoseDataSmartHandFilterTimed:
     RETURN_NAMES = ("pose_data",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Timed"
-    DESCRIPTION = "Smart Filter, der nur für eine bestimmte Zeit aktiv ist."
+    DESCRIPTION = "Smart Filter (Timed) mit einstellbarer Hand-Integrität."
 
-    def process(self, pose_data, threshold, delete_broken_fingers, delete_if_half_missing, active_seconds, target_hand, fps, person_index):
+    def process(self, pose_data, threshold, delete_broken_fingers, delete_incomplete_hand, hand_integrity_threshold, active_seconds, target_hand, fps, person_index):
         pose_data_copy = copy.deepcopy(pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
 
-        # Zeit in Frames umrechnen
         active_frames = int(active_seconds * fps)
 
-        # Iteration über Frames (pose_metas Liste)
         for frame_idx, meta in enumerate(pose_metas):
             if meta is None: continue
             
-            # Check Person Index bei Multi-Person Frames (falls Struktur so ist)
-            # Hier vereinfacht: Wir wenden es auf den Frame an.
-            
-            # TIMING LOGIK:
-            # Nur filtern, wenn wir noch innerhalb der 'active_seconds' sind.
+            # Nur innerhalb der Zeit filtern
             if frame_idx < active_frames:
-                
-                # Links bearbeiten?
                 if target_hand in ["BOTH", "LEFT"]:
-                    self._process_hand(meta, "kps_lhand", threshold, delete_broken_fingers, delete_if_half_missing)
+                    self._process_hand(meta, "kps_lhand", threshold, delete_broken_fingers, delete_incomplete_hand, hand_integrity_threshold)
                 
-                # Rechts bearbeiten?
                 if target_hand in ["BOTH", "RIGHT"]:
-                    self._process_hand(meta, "kps_rhand", threshold, delete_broken_fingers, delete_if_half_missing)
-
-            # Wenn frame_idx >= active_frames, passiert nichts -> Originaldaten bleiben
+                    self._process_hand(meta, "kps_rhand", threshold, delete_broken_fingers, delete_incomplete_hand, hand_integrity_threshold)
 
         return (pose_data_copy,)
 
-    def _process_hand(self, meta, arr_name, threshold, strict_fingers, strict_hand):
+    def _process_hand(self, meta, arr_name, threshold, strict_fingers, strict_hand_active, integrity_ratio):
         kps = getattr(meta, arr_name, None)
         kps_p = getattr(meta, f"{arr_name}_p", None)
 
         if kps is None or kps_p is None: return
         if len(kps) < 21: return
 
-        # 1. CHECK: Ganze Hand
-        if strict_hand:
+        # 1. CHECK: Hand Integrität
+        if strict_hand_active:
             valid_count = 0
             for p in kps_p:
                 if p > threshold:
                     valid_count += 1
             
-            if valid_count < 11:
+            min_required = int(21 * integrity_ratio)
+            if valid_count < min_required:
                 self._zero_indices(kps, kps_p, range(21))
                 return
 
         # 2. CHECK: Finger
         if strict_fingers:
             fingers = [
-                [1, 2, 3, 4],     # Daumen
-                [5, 6, 7, 8],     # Zeigefinger
-                [9, 10, 11, 12],  # Mittelfinger
-                [13, 14, 15, 16], # Ringfinger
-                [17, 18, 19, 20]  # Kleiner Finger
+                [1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12],
+                [13, 14, 15, 16], [17, 18, 19, 20]
             ]
-
             for finger_indices in fingers:
                 finger_broken = False
                 for i in finger_indices:
                     if kps_p[i] <= threshold:
                         finger_broken = True
                         break
-                
                 if finger_broken:
                     self._zero_indices(kps, kps_p, finger_indices)
 
@@ -13994,7 +13980,6 @@ class PoseDataSmartHandFilterTimed:
                     val[0] = 0.0; val[1] = 0.0
                 elif isinstance(val, np.ndarray):
                     val[0] = 0.0; val[1] = 0.0
-                
                 if i < len(kps_p):
                     kps_p[i] = 0.0
 
@@ -14118,6 +14103,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataConfidenceFilter": "Pose Data Confidence Filter",
     "PoseDataSmartHandFilterTimed": "Pose Data Smart Hand Filter (Timed)",
 }
+
 
 
 
