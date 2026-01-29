@@ -13969,6 +13969,191 @@ class PoseDataEditorV2:
         return selections
 
 
+
+class PoseDataHipHandDebug:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "hip_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.01, "tooltip": "Skaliert die Breite der Hüfte (X-Achse)."}),
+                "auto_hand_adjust": ("BOOLEAN", {"default": True, "tooltip": "Bewegt Hände automatisch mit der Hüfte."}),
+                "hand_offset": ("FLOAT", {"default": 0.0, "min": -500.0, "max": 500.0, "step": 1.0, "tooltip": "Zusätzlicher Abstand für die Hände."}),
+                "smooth_hand_entry": ("BOOLEAN", {"default": True, "tooltip": "Aktiviert den weichen Übergang."}),
+                "smooth_threshold": ("FLOAT", {"default": 0.15, "min": 0.01, "max": 0.5, "step": 0.01, "tooltip": "Höhenbereich über der Hüfte für den weichen Übergang."}),
+                "person_index": ("INT", {"default": -1, "min": -1, "max": 9999, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Debug"
+    DESCRIPTION = "Isolierte Logik für Hip-Width und Hand-Smoothing zum Debuggen."
+
+    def process(self, pose_data, hip_scale, auto_hand_adjust, hand_offset, smooth_hand_entry, smooth_threshold, person_index):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        indices = (
+            [person_index]
+            if isinstance(person_index, int) and person_index >= 0 and person_index < len(pose_metas)
+            else list(range(len(pose_metas)))
+        )
+
+        for idx in indices:
+            if pose_metas[idx] is not None:
+                self._apply_hip_logic(
+                    pose_metas[idx], 
+                    hip_scale, 
+                    auto_hand_adjust, 
+                    hand_offset, 
+                    smooth_hand_entry, 
+                    smooth_threshold
+                )
+
+        return (pose_data_copy,)
+
+    def _apply_hip_logic(self, meta, hip_scale, auto_hand_adjust, hand_offset, smooth_hand_entry, smooth_threshold):
+        body_arr = getattr(meta, "kps_body", None)
+        width = getattr(meta, "width", 1024) # Fallback, falls width fehlt
+        height = getattr(meta, "height", 1024)
+
+        if body_arr is None: return
+
+        # Indizes: 8 = Rechte Hüfte, 11 = Linke Hüfte
+        if 8 >= len(body_arr) or 11 >= len(body_arr): return
+
+        # 1. Hole Original-Koordinaten der Hüften
+        hip_r_orig = self._extract_coords(body_arr[8])
+        hip_l_orig = self._extract_coords(body_arr[11])
+
+        if hip_r_orig is None or hip_l_orig is None: return
+
+        # Berechne das Zentrum zwischen den Hüften
+        center_x = (hip_r_orig[0] + hip_l_orig[0]) / 2.0
+        
+        # 2. Skaliere Hüften (Nur X-Achse wird verändert, wie bei "Hip Width")
+        # Neue Position = Zentrum + (Abstand zum Zentrum * Scale)
+        
+        # Rechte Hüfte (Index 8)
+        dist_r = hip_r_orig[0] - center_x
+        new_hip_r_x = center_x + (dist_r * hip_scale)
+        self._assign_point(body_arr, 8, new_hip_r_x, hip_r_orig[1])
+
+        # Linke Hüfte (Index 11)
+        dist_l = hip_l_orig[0] - center_x
+        new_hip_l_x = center_x + (dist_l * hip_scale)
+        self._assign_point(body_arr, 11, new_hip_l_x, hip_l_orig[1])
+
+        # ---------------------------------------------------------
+        # HAND LOGIK START
+        # ---------------------------------------------------------
+        if auto_hand_adjust:
+            # Berechne wie weit sich die Hüfte tatsächlich bewegt hat (Delta)
+            delta_right = new_hip_r_x - hip_r_orig[0] # Normalerweise negativ (nach links) oder positiv je nach Orientierung
+            delta_left = new_hip_l_x - hip_l_orig[0]
+
+            # Basis-Verschiebung inkl. manuellem Offset
+            # Offset wirkt symmetrisch: Rechts -Offset, Links +Offset (Breiter)
+            base_shift_right = delta_right - float(hand_offset)
+            base_shift_left = delta_left + float(hand_offset)
+
+            # --- SMOOTHING LOGIK RECHTS ---
+            factor_right = 1.0
+            if smooth_hand_entry and 4 < len(body_arr): # Check Wrist Right (4)
+                wrist_coords = self._extract_coords(body_arr[4])
+                # Wir nutzen die Y-Position der Hüfte als Referenz
+                hip_y = hip_r_orig[1]
+                
+                if wrist_coords is not None and hip_y > 0:
+                    wrist_y = wrist_coords[1]
+                    safe_zone_px = float(height) * float(smooth_threshold)
+                    start_transition_y = hip_y - safe_zone_px
+                    
+                    if wrist_y < start_transition_y:
+                        factor_right = 0.0 # Hand zu weit oben
+                    elif wrist_y >= hip_y:
+                        factor_right = 1.0 # Hand unterhalb Hüfte
+                    else:
+                        # Interpolieren
+                        if safe_zone_px > 0:
+                            progress = (wrist_y - start_transition_y) / safe_zone_px
+                            factor_right = max(0.0, min(1.0, progress))
+
+            # --- SMOOTHING LOGIK LINKS ---
+            factor_left = 1.0
+            if smooth_hand_entry and 7 < len(body_arr): # Check Wrist Left (7)
+                wrist_coords = self._extract_coords(body_arr[7])
+                hip_y = hip_l_orig[1]
+                
+                if wrist_coords is not None and hip_y > 0:
+                    wrist_y = wrist_coords[1]
+                    safe_zone_px = float(height) * float(smooth_threshold)
+                    start_transition_y = hip_y - safe_zone_px
+                    
+                    if wrist_y < start_transition_y:
+                        factor_left = 0.0
+                    elif wrist_y >= hip_y:
+                        factor_left = 1.0
+                    else:
+                        if safe_zone_px > 0:
+                            progress = (wrist_y - start_transition_y) / safe_zone_px
+                            factor_left = max(0.0, min(1.0, progress))
+
+            final_shift_right = base_shift_right * factor_right
+            final_shift_left = base_shift_left * factor_left
+
+            # --- ANWENDEN ---
+            
+            # RECHTS: Elbow (3), Wrist (4) + Hand Array
+            for idx in [3, 4]:
+                self._shift_point_x(body_arr, idx, final_shift_right)
+            
+            if hasattr(meta, "kps_rhand") and meta.kps_rhand is not None:
+                for i in range(len(meta.kps_rhand)):
+                    self._shift_point_x(meta.kps_rhand, i, final_shift_right)
+
+            # LINKS: Elbow (6), Wrist (7) + Hand Array
+            for idx in [6, 7]:
+                self._shift_point_x(body_arr, idx, final_shift_left)
+                
+            if hasattr(meta, "kps_lhand") and meta.kps_lhand is not None:
+                for i in range(len(meta.kps_lhand)):
+                    self._shift_point_x(meta.kps_lhand, i, final_shift_left)
+
+
+    # --- HELPER (Minimal) ---
+    def _shift_point_x(self, arr, idx, dx):
+        if idx >= len(arr): return
+        coords = self._extract_coords(arr[idx])
+        if coords is None: return
+        if abs(dx) < 1e-9: return
+        # Wir clippen hier nicht mal, um zu sehen ob der Fehler vom Clipping kommt
+        # Wenn du Clipping willst, uncomment next line:
+        # new_x = max(0.0, min(coords[0] + dx, 10000.0)) 
+        self._assign_point(arr, idx, coords[0] + dx, coords[1])
+
+    def _extract_coords(self, point):
+        if point is None: return None
+        # Simple extraction for numpy or list
+        if isinstance(point, (list, tuple)):
+            return (float(point[0]), float(point[1])) if len(point) >= 2 else None
+        if isinstance(point, np.ndarray):
+            return (float(point[0]), float(point[1])) if point.size >= 2 else None
+        return None
+
+    def _assign_point(self, arr, idx, x, y):
+        val = arr[idx]
+        if isinstance(val, list):
+            val[0] = float(x)
+            val[1] = float(y)
+        elif isinstance(val, np.ndarray):
+            val[0] = float(x)
+            val[1] = float(y)
+
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -14022,6 +14207,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataToMask": PoseDataToMask,
     "PoseDataToOvalMask": PoseDataToOvalMask,
     "PoseDataEditorV2": PoseDataEditorV2,
+    "PoseDataHipHandDebug": PoseDataHipHandDebug,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": "Pose and Face Detection V7 (No Warp)",
@@ -14076,8 +14262,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataToMask": "PoseData to Mask",
     "PoseDataToOvalMask": "PoseData to Oval Mask",
     "PoseDataEditorV2": "Pose Data Editor V2",
+    "PoseDataHipHandDebug": "Pose Data Hip & Hand Debug",
     
 }
+
 
 
 
