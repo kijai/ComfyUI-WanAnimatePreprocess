@@ -13543,8 +13543,6 @@ class PoseDataHipHandDebug:
             val[1] = float(y)
 
 
-import copy
-import numpy as np
 
 class PoseDataHandOffsetTimed:
     @classmethod
@@ -13687,6 +13685,77 @@ class PoseDataHandOffsetTimed:
              arr[idx] = [new_x, new_y] # Fallback
 
 
+import copy
+import numpy as np
+
+class PoseDataHandDeleterTimed:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "active_seconds": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 3600.0, "step": 0.01, "tooltip": "Wie lange die Hände gelöscht bleiben (in Sekunden)."}),
+                "target_hand": (["BOTH", "LEFT", "RIGHT"], {"default": "BOTH", "tooltip": "Welche Hände gelöscht werden sollen."}),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.01, "tooltip": "Framerate des Videos zur Berechnung der Zeit."}),
+                "person_index": ("INT", {"default": -1, "min": -1, "max": 9999, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Timed"
+    DESCRIPTION = "Löscht Hände für eine bestimmte Zeit. Danach erscheinen sie sofort wieder (hart)."
+
+    def process(self, pose_data, active_seconds, target_hand, fps, person_index):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        # Parameter in Frames umrechnen
+        active_frames = int(active_seconds * fps)
+
+        for frame_idx, meta in enumerate(pose_metas):
+            if meta is None: continue
+
+            # Logik: Wenn innerhalb der Zeit, dann komplett löschen (0.0).
+            # Danach sofort wieder voll da (1.0).
+            if frame_idx < active_frames:
+                # Löschen
+                if target_hand in ["BOTH", "LEFT"]:
+                    self._zero_hand(meta, "kps_lhand")
+                
+                if target_hand in ["BOTH", "RIGHT"]:
+                    self._zero_hand(meta, "kps_rhand")
+            
+            # Wenn frame_idx >= active_frames, machen wir einfach nichts (= Hände bleiben original)
+
+        return (pose_data_copy,)
+
+    def _zero_hand(self, meta, arr_name):
+        kps = getattr(meta, arr_name, None)
+        kps_p = getattr(meta, f"{arr_name}_p", None) # Confidence Score Array
+
+        if kps is None: return
+
+        # Koordinaten nullen
+        for i in range(len(kps)):
+            self._zero_point(kps, i)
+        
+        # Confidence nullen (damit ControlNet weiß: "Hier ist nichts")
+        if kps_p is not None:
+            for i in range(len(kps_p)):
+                kps_p[i] = 0.0
+
+    def _zero_point(self, arr, idx):
+        val = arr[idx]
+        if isinstance(val, list):
+            val[0] = 0.0
+            val[1] = 0.0
+        elif isinstance(val, np.ndarray):
+            val[0] = 0.0
+            val[1] = 0.0
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -13739,10 +13808,10 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": PoseDataAutoBlackoutOnJitter,
     "PoseDataToMask": PoseDataToMask,
     "PoseDataToOvalMask": PoseDataToOvalMask,
-    "PoseDataEditorV2": PoseDataEditorV2,
     "PoseDataHipHandDebug": PoseDataHipHandDebug,
     "SavePoseDataNode": SavePoseDataNode,
     "PoseDataHandOffsetTimed": PoseDataHandOffsetTimed,
+    "PoseDataHandDeleterTimed": PoseDataHandDeleterTimed,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": "Pose and Face Detection V7 (No Warp)",
@@ -13796,12 +13865,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     "PoseDataToMask": "PoseData to Mask",
     "PoseDataToOvalMask": "PoseData to Oval Mask",
-    "PoseDataEditorV2": "Pose Data Editor V2",
     "PoseDataHipHandDebug": "Pose Data Hip & Hand Debug",
     "SavePoseDataNode": "Save Pose Data (Debug)",
     "PoseDataHandOffsetTimed": "Pose Data Hand Offset (Timed)",
+    "PoseDataHandDeleterTimed": "Pose Data Hand Deleter (Timed)",
     
 }
+
 
 
 
