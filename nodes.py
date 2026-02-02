@@ -13984,159 +13984,196 @@ class PoseDataSmartHandFilterTimed:
                     kps_p[i] = 0.0
 
 
-# ==============================================================================
-# FIX FOR DRAWING ORDER (ARMS ON TOP) - v2
-# ==============================================================================
+from .pose_utils.human_visualization import draw_handpose_new, AAPoseMeta
+import math
 
-class WanVideo_Draw_VIT_Pose_Keypoints_v2:
+# Hilfsfunktion mit korrigierter Zeichenreihenfolge (Arme zuletzt)
+def draw_aapose_v2(
+    img,
+    kp2ds,
+    threshold=0.5,
+    kp2ds_lhand=None,
+    kp2ds_rhand=None,
+    draw_hand=False,
+    stickwidth_type='v2',
+    body_stick_width=-1,
+    hand_stick_width=-1,
+    draw_head=True
+):
+    kp2ds = kp2ds.copy()
+    if not draw_head:
+        kp2ds[[0,14,15,16,17], 2] = 0
+    kp2ds_body = kp2ds
+
+    # Originale Reihenfolge der Gliedmaßen
+    # Indizes:
+    # 0, 1: Schultern
+    # 2, 3: Rechter Arm (soll nach hinten oder zuletzt, wenn man von vorne schaut, aber hier geht es um Layering)
+    # 4, 5: Linker Arm (der "grüne Streifen")
+    # 6-11: Rumpf und Beine ("blaue Streifen")
+    # 12-16: Gesicht
+    # 17, 18: Füße
+    
+    limbSeq_orig = [
+        [2, 3], [2, 6],  # 0, 1: Shoulders
+        [3, 4], [4, 5],  # 2, 3: Right Arm
+        [6, 7], [7, 8],  # 4, 5: Left Arm
+        [2, 9],          # 6: Right Body Side (Neck-Hip)
+        [9, 10], [10, 11], # 7, 8: Right Leg
+        [2, 12],         # 9: Left Body Side (Neck-Hip)
+        [12, 13], [13, 14], # 10, 11: Left Leg
+        [2, 1],          # 12: Neck-Nose
+        [1, 15], [15, 17], # 13, 14: Face Right
+        [1, 16], [16, 18], # 15, 16: Face Left
+        [14, 19],        # 17: Left Foot
+        [11, 20]         # 18: Right Foot
+    ]
+
+    colors_orig = [
+        [255, 0, 0], [255, 85, 0],      # 0, 1
+        [255, 170, 0], [255, 255, 0],   # 2, 3 (Right Arm - Orange/Yellow)
+        [170, 255, 0], [85, 255, 0],    # 4, 5 (Left Arm - Lime/Green)
+        [0, 255, 0],                    # 6 (Right Body - Green)
+        [0, 255, 85], [0, 255, 170],    # 7, 8 (Right Leg)
+        [0, 255, 255],                  # 9 (Left Body - Cyan/Blue)
+        [0, 170, 255], [0, 85, 255],    # 10, 11 (Left Leg - Blue)
+        [0, 0, 255],                    # 12 (Neck-Nose - Blue)
+        [85, 0, 255], [170, 0, 255],    # 13, 14 (Face)
+        [255, 0, 255], [255, 0, 170],   # 15, 16 (Face)
+        [255, 0, 85],                   # 17 (Foot)
+        [200, 200, 0]                   # 18 (Foot)
+    ]
+
+    # Wir definieren eine neue Reihenfolge, bei der die Arme (Indizes 2,3,4,5) ans Ende verschoben werden.
+    # Neue Reihenfolge der Indizes aus der Originalliste:
+    reordered_indices = [
+        0, 1,               # Schultern
+        6, 7, 8, 9, 10, 11, # Körper & Beine (zuerst zeichnen, damit sie "hinten" sind)
+        12, 13, 14, 15, 16, # Gesicht
+        17, 18,             # Füße
+        2, 3,               # Rechter Arm (jetzt drüber gezeichnet)
+        4, 5                # Linker Arm (jetzt drüber gezeichnet)
+    ]
+
+    limbSeq = [limbSeq_orig[i] for i in reordered_indices]
+    colors = [colors_orig[i] for i in reordered_indices]
+
+    H, W, C = img.shape
+    
+    if body_stick_width == -1:
+        stickwidth = max(int(min(H, W) / 200) - 1, 1)
+    else:
+        stickwidth = body_stick_width
+
+    for _idx, ((k1_index, k2_index), color) in enumerate(zip(limbSeq, colors)):
+        keypoint1 = kp2ds_body[k1_index - 1]
+        keypoint2 = kp2ds_body[k2_index - 1]
+
+        if keypoint1[-1] < threshold or keypoint2[-1] < threshold:
+            continue
+
+        Y = np.array([keypoint1[0], keypoint2[0]])
+        X = np.array([keypoint1[1], keypoint2[1]])
+        mX = np.mean(X)
+        mY = np.mean(Y)
+        length = ((X[0] - X[1]) ** 2 + (Y[0] - Y[1]) ** 2) ** 0.5
+        angle = math.degrees(math.atan2(X[0] - X[1], Y[0] - Y[1]))
+        polygon = cv2.ellipse2Poly((int(mY), int(mX)), (int(length / 2), stickwidth), int(angle), 0, 360, 1)
+        cv2.fillConvexPoly(img, polygon, [int(float(c) * 0.6) for c in color])
+
+    for _idx, (keypoint, color) in enumerate(zip(kp2ds_body, colors_orig)): # Punkte in Originalfarbe/Reihenfolge
+         # Hinweis: Die Punkte selbst (Kreise) werden hier evtl. übermalt, wenn wir die Reihenfolge ändern. 
+         # Aber meistens sind die Linien das Problem.
+         pass # Wir zeichnen die Punkte (Gelenke) separat am Ende, damit sie ganz oben sind?
+              # Der Originalcode zeichnet Punkte IN der Schleife oder danach.
+              # Originalcode zeichnet Punkte danach. Wir machen es auch so.
+
+    # Zeichne Gelenkpunkte (in Originalreihenfolge der Farben, damit die Farben stimmen)
+    for _idx, (keypoint, color) in enumerate(zip(kp2ds_body, colors_orig)): # Nutze colors_orig + dummy für Länge
+        if _idx >= len(colors_orig): break
+        if keypoint[-1] < threshold:
+            continue
+        x, y = keypoint[0], keypoint[1]
+        cv2.circle(img, (int(x), int(y)), stickwidth, colors_orig[_idx], thickness=-1)
+
+    if draw_hand:
+        img = draw_handpose_new(img, kp2ds_lhand, stickwidth_type=stickwidth_type, hand_score_th=threshold, hand_stick_width=hand_stick_width)
+        img = draw_handpose_new(img, kp2ds_rhand, stickwidth_type=stickwidth_type, hand_score_th=threshold, hand_stick_width=hand_stick_width)
+
+    return img
+
+
+class DrawViTPose_v2:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "pose_data": ("POSEDATA",),
-                "width": ("INT", {"default": 512, "min": 1, "max": 8192}),
-                "height": ("INT", {"default": 512, "min": 1, "max": 8192}),
-                "draw_body": ("BOOLEAN", {"default": True}),
-                "draw_face": ("BOOLEAN", {"default": True}),
-                "draw_hands": ("BOOLEAN", {"default": True}),
-            }
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Width of the generation"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Height of the generation"}),
+                "retarget_padding": ("INT", {"default": 16, "min": 0, "max": 512, "step": 1, "tooltip": "When > 0, the retargeted pose image is padded and resized to the target size"}),
+                "body_stick_width": ("INT", {"default": -1, "min": -1, "max": 20, "step": 1, "tooltip": "Width of the body sticks. Set to 0 to disable body drawing, -1 for auto"}),
+                "hand_stick_width": ("INT", {"default": -1, "min": -1, "max": 20, "step": 1, "tooltip": "Width of the hand sticks. Set to 0 to disable hand drawing, -1 for auto"}),
+                "draw_head": ("BOOLEAN", {"default": "True", "tooltip": "Whether to draw head keypoints"}),
+            },
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", )
+    RETURN_NAMES = ("pose_images", )
     FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Draws pose images from pose data with fixed z-order (Arms drawn last)."
 
-    def process(self, pose_data, width, height, draw_body, draw_face, draw_hands):
-        import cv2
-        import numpy as np
-        import torch
-        from .utils import tensor2pil, pil2tensor
+    def process(self, pose_data, width, height, body_stick_width, hand_stick_width, draw_head, retarget_padding=64):
 
-        # Mapping der Verbindungen für Standard OpenPose/COCO (grobe Annäherung für ViT)
-        # Wir identifizieren Arme, um sie später zu zeichnen.
-        # Format: (Start-Index, End-Index)
-        # 2-3 (R-Shoulder -> R-Elbow), 3-4 (R-Elbow -> R-Wrist)
-        # 5-6 (L-Shoulder -> L-Elbow), 6-7 (L-Elbow -> L-Wrist)
-        ARM_CONNECTIONS = {(2, 3), (3, 4), (5, 6), (6, 7)}
-        
-        # Standard COCO Limb Farben (OpenCV BGR Format)
-        # Wir nutzen eine vereinfachte Palette, ähnlich wie OpenPose Standard
-        colors = [
-            (255, 0, 0), (255, 85, 0), (255, 170, 0), (255, 255, 0),     # 0-3
-            (170, 255, 0), (85, 255, 0), (0, 255, 0), (0, 255, 85),      # 4-7
-            (0, 255, 170), (0, 255, 255), (0, 170, 255), (0, 85, 255),   # 8-11
-            (0, 0, 255), (85, 0, 255), (170, 0, 255), (255, 0, 255),     # 12-15
-            (255, 0, 170), (255, 0, 85)                                  # 16-17
-        ]
-        
-        # Limb Definitionen (COCO 18 style)
-        limbs = [
-            (1, 2), (1, 5), (2, 3), (3, 4), (5, 6), (6, 7),              # Oberkörper/Arme
-            (1, 8), (8, 9), (9, 10), (1, 11), (11, 12), (12, 13),        # Unterkörper
-            (1, 0), (0, 14), (14, 16), (0, 15), (15, 17)                 # Gesichtskontur grob
-        ]
-        
-        # Helper: Zeichne Pose mit "Arme zuletzt" Logik
-        def draw_pose_v2(img, keypoints, thick=3):
-            # Limbs aufteilen in "Arme" und "Rest"
-            limbs_body = []
-            limbs_arms = []
-            
-            for idx, (p1_idx, p2_idx) in enumerate(limbs):
-                # Indizes im pose_data sind oft 0-basiert. Wir nehmen an:
-                # 0:Nose, 1:Neck, 2:RSho, 3:RElb, 4:RWri, 5:LSho, 6:LElb, 7:LWri ...
-                # Prüfen ob Verbindung ein Arm ist
-                is_arm = (p1_idx, p2_idx) in ARM_CONNECTIONS or (p2_idx, p1_idx) in ARM_CONNECTIONS
-                
-                # Farb-Logik (einfach gehalten oder aus Liste)
-                color = colors[idx % len(colors)]
-                
-                if is_arm:
-                    limbs_arms.append((p1_idx, p2_idx, color))
-                else:
-                    limbs_body.append((p1_idx, p2_idx, color))
-            
-            # ZUERST Körper zeichnen (damit er "hinten" liegt)
-            to_draw_list = limbs_body + limbs_arms
-            
-            for (p1_idx, p2_idx, color) in to_draw_list:
-                if p1_idx >= len(keypoints) or p2_idx >= len(keypoints): continue
-                
-                x1, y1, c1 = keypoints[p1_idx]
-                x2, y2, c2 = keypoints[p2_idx]
-                
-                if c1 > 0.05 and c2 > 0.05: # Confidence check
-                    cv2.line(img, (int(x1), int(y1)), (int(x2), int(y2)), color, thick)
-                    
-            return img
+        retarget_image = pose_data.get("retarget_image", None)
+        pose_metas = pose_data["pose_metas"]
 
-        # --- Hauptlogik ---
-        batch_size = len(pose_data["pose_metas"])
-        out_tensor_list = []
+        draw_hand = hand_stick_width != 0
+        use_retarget_resize = retarget_padding > 0 and retarget_image is not None
 
-        for i in range(batch_size):
-            meta = pose_data["pose_metas"][i]
+        comfy_pbar = ProgressBar(len(pose_metas))
+        progress = 0
+        crop_target_image = None
+        pose_images = []
+
+        for idx, meta in enumerate(tqdm(pose_metas, desc="Drawing pose images v2")):
             canvas = np.zeros((height, width, 3), dtype=np.uint8)
             
-            # Original Logic Adapter: Daten aus Meta holen
-            # Wir nehmen an, dass 'kps_body' die Keypoints enthält
-            if meta is not None:
-                # Skalierung berechnen (Meta daten sind oft 0-1 normalisiert oder absolute pixel)
-                # Hier nehmen wir an, wir müssen sie auf canvas projizieren, 
-                # aber oft macht das die Vorverarbeitung. Wir schauen in die Original-Logik:
-                # Meist sind kps_body absolute Koordinaten relativ zum Crop oder Bild.
-                # Um sicher zu gehen, nutzen wir die Logic aus der originalen visualization.py,
-                # aber rufen unsere draw_pose_v2 auf.
-                
-                # Da wir hier keinen Zugriff auf die komplexe Original-Struktur haben, 
-                # nutzen wir einen Trick: Wir importieren die Original-Draw-Funktion,
-                # aber "patchen" die Zeichenreihenfolge nicht direkt, sondern bauen das Bild neu auf.
-                
-                # BESSERER WEG: Wir nutzen die `pose_data` Struktur direkt.
-                # Angenommen pose_data hat Keypoints.
-                
-                # Fallback: Wir nutzen einfach die Original-Logik, aber rendern Arme nochmal drüber!
-                # Das ist sicherer, als die ganze Logik neu zu schreiben.
-                
-                # 1. Original Zeichnung machen (Hintergrund + Body + Arme (falsch))
-                from .visualization import draw_pose_aligned
-                # Wir müssen 'meta' in das Format bringen, das draw_pose erwartet oder direkt nutzen
-                # Das ist etwas komplex ohne den exakten Context der Variable 'pose_data'.
-                
-                # FIX: Wir machen es einfacher. Wir kopieren die Logik der Original-Node
-                # und ändern nur den Aufruf der Zeichenfunktion.
-                
-                # Da ich den Code der originalen 'visualization.py' nicht sehe, 
-                # schreibe ich hier die Logik, die Arme *nochmal* drüber malt.
-                
-                # Wir holen uns die Keypoints aus dem Meta-Objekt
-                # (Achtung: Das hier ist Pseudo-Code-Logik basierend auf typischen WanAnimate Strukturen)
-                kps = meta.kps_body # Array [18, 2] oder [25, 2]
-                confs = meta.kps_body_p # Confidences
-                
-                # Kombinieren zu [N, 3] (x, y, conf)
-                full_kps = []
-                for idx in range(len(kps)):
-                    full_kps.append([kps[idx][0], kps[idx][1], confs[idx]])
-                
-                # 1. Grundbild erstellen (alles zeichnen wie gehabt)
-                # Wir rufen die existierende Funktion auf, um Face/Hands etc. korrekt zu haben
-                # Dazu importieren wir die Original-Klasse um deren Logik zu nutzen? Nein, zu kompliziert.
-                
-                # Wir bauen das Bild komplett neu auf mit V2 Logik
-                if draw_body:
-                     canvas = draw_pose_v2(canvas, full_kps, thick=4)
-                
-                # (Optional) Hände und Gesicht separat zeichnen falls nötig
-                # ... (hier gekürzt für Übersichtlichkeit, Fokus liegt auf Arm/Körper Konflikt)
-                
-            out_tensor_list.append(pil2tensor(tensor2pil(canvas)))
+            # Manuelle Vorbereitung der Daten wie in draw_aapose_by_meta_new
+            kp2ds = np.concatenate([meta.kps_body, meta.kps_body_p[:, None]], axis=1)
+            kp2ds_lhand = np.concatenate([meta.kps_lhand, meta.kps_lhand_p[:, None]], axis=1)
+            kp2ds_rhand = np.concatenate([meta.kps_rhand, meta.kps_rhand_p[:, None]], axis=1)
             
-        if not out_tensor_list:
-            return (torch.zeros((1, height, width, 3)),)
-            
-        return (torch.cat(out_tensor_list, dim=0),)
+            # Aufruf der gefixten Funktion
+            pose_image = draw_aapose_v2(
+                canvas, 
+                kp2ds, 
+                draw_hand=draw_hand, 
+                draw_head=draw_head, 
+                body_stick_width=body_stick_width, 
+                hand_stick_width=hand_stick_width,
+                kp2ds_lhand=kp2ds_lhand,
+                kp2ds_rhand=kp2ds_rhand
+            )
 
+            if crop_target_image is None:
+                crop_target_image = pose_image
+
+            if use_retarget_resize:
+                pose_image = resize_to_bounds(pose_image, height, width, crop_target_image=crop_target_image, extra_padding=retarget_padding)
+            else:
+                pose_image = padding_resize(pose_image, height, width)
+
+            pose_images.append(pose_image)
+            progress += 1
+            if progress % 10 == 0:
+                comfy_pbar.update_absolute(progress)
+
+        pose_images_np = np.stack(pose_images, 0)
+        pose_images_tensor = torch.from_numpy(pose_images_np).float() / 255.0
+
+        return (pose_images_tensor, )
 
 
 NODE_CLASS_MAPPINGS = {
@@ -14197,7 +14234,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataHandDeleterTimed": PoseDataHandDeleterTimed,
     "PoseDataConfidenceFilter": PoseDataConfidenceFilter,
     "PoseDataSmartHandFilterTimed": PoseDataSmartHandFilterTimed,
-    "WanVideo_Draw_VIT_Pose_Keypoints_v2": WanVideo_Draw_VIT_Pose_Keypoints_v2,
+    "DrawViTPose_v2": DrawViTPose_v2,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -14258,8 +14295,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataHandDeleterTimed": "Pose Data Hand Deleter (Timed)",
     "PoseDataConfidenceFilter": "Pose Data Confidence Filter",
     "PoseDataSmartHandFilterTimed": "Pose Data Smart Hand Filter (Timed)",
-    "WanVideo_Draw_VIT_Pose_Keypoints_v2": "Draw ViT Pose (v2 - Arms on Top)",
+    "DrawViTPose_v2": "Draw ViT Pose v2 (Fixed Order)",
 }
+
 
 
 
