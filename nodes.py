@@ -14175,6 +14175,193 @@ class DrawViTPose_v2:
 
         return (pose_images_tensor, )
 
+class PoseDataHipHandDebugV2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "hip_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.01, "tooltip": "Skaliert die Hüftbreite."}),
+                "auto_hand_adjust": ("BOOLEAN", {"default": True, "tooltip": "Wenn an, bewegen sich die Hände automatisch mit der Hüfte mit."}),
+                "move_elbows": ("BOOLEAN", {"default": True, "tooltip": "Wenn an, werden auch die Ellbogen verschoben. Wenn aus, nur Handgelenke und Hände."}),
+                "hand_offset": ("FLOAT", {"default": 0.0, "min": -500.0, "max": 500.0, "step": 1.0, "tooltip": "Manueller Zusatz-Offset für die Hände (funktioniert jetzt auch ohne Auto-Adjust)."}),
+                "smooth_hand_entry": ("BOOLEAN", {"default": True, "tooltip": "Verhindert Sprünge, wenn die Hand die Hüfthöhe passiert."}),
+                "smooth_threshold": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 0.5, "step": 0.01}),
+                "person_index": ("INT", {"default": -1, "min": -1, "max": 9999, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Debug"
+    DESCRIPTION = "V2: Debugging Node für Hüftbreite. Erlaubt nun Hand-Offset ohne Auto-Adjust und das Ausschließen der Ellbogen."
+
+    def process(self, pose_data, hip_scale, auto_hand_adjust, move_elbows, hand_offset, smooth_hand_entry, smooth_threshold, person_index):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        indices = (
+            [person_index]
+            if isinstance(person_index, int) and person_index >= 0 and person_index < len(pose_metas)
+            else list(range(len(pose_metas)))
+        )
+
+        for idx in indices:
+            if pose_metas[idx] is not None:
+                self._apply_hip_logic(
+                    pose_metas[idx], 
+                    hip_scale, 
+                    auto_hand_adjust, 
+                    move_elbows,
+                    hand_offset, 
+                    smooth_hand_entry, 
+                    smooth_threshold
+                )
+
+        return (pose_data_copy,)
+
+    def _apply_hip_logic(self, meta, hip_scale, auto_hand_adjust, move_elbows, hand_offset, smooth_hand_entry, smooth_threshold):
+        body_arr = getattr(meta, "kps_body", None)
+        width = getattr(meta, "width", 1024)
+        height = getattr(meta, "height", 1024)
+
+        if body_arr is None:
+            return
+        
+        # Indizes: 8 = Rechte Hüfte, 11 = Linke Hüfte
+        if 8 >= len(body_arr) or 11 >= len(body_arr):
+            return
+
+        # 1. Hole Original-Koordinaten der Hüften
+        hip_r_orig = self._extract_coords(body_arr[8])
+        hip_l_orig = self._extract_coords(body_arr[11])
+
+        if hip_r_orig is None or hip_l_orig is None:
+            return
+
+        # Berechne das Zentrum zwischen den Hüften
+        center_x = (hip_r_orig[0] + hip_l_orig[0]) / 2.0
+
+        # 2. Skaliere Hüften
+        # Rechte Hüfte (Index 8)
+        dist_r = hip_r_orig[0] - center_x
+        new_hip_r_x = center_x + (dist_r * hip_scale)
+        self._assign_point(body_arr, 8, new_hip_r_x, hip_r_orig[1])
+
+        # Linke Hüfte (Index 11)
+        dist_l = hip_l_orig[0] - center_x
+        new_hip_l_x = center_x + (dist_l * hip_scale)
+        self._assign_point(body_arr, 11, new_hip_l_x, hip_l_orig[1])
+
+        # ---------------------------------------------------------
+        # HAND LOGIK (V2 Update)
+        # ---------------------------------------------------------
+        
+        # Berechne Delta (Verschiebung durch Hüfte) nur wenn auto_hand_adjust an ist
+        delta_right = 0.0
+        delta_left = 0.0
+        
+        if auto_hand_adjust:
+            delta_right = new_hip_r_x - hip_r_orig[0]
+            delta_left = new_hip_l_x - hip_l_orig[0]
+
+        # Base shift: Hüftbewegung + Manueller Offset
+        # Der manuelle Offset wirkt nun immer, auch wenn delta 0 ist.
+        base_shift_right = delta_right - float(hand_offset)
+        base_shift_left = delta_left + float(hand_offset)
+
+        # --- SMOOTHING LOGIK RECHTS ---
+        factor_right = 1.0
+        if smooth_hand_entry and 4 < len(body_arr):
+            wrist_coords = self._extract_coords(body_arr[4])
+            hip_y = hip_r_orig[1]
+            if wrist_coords is not None and hip_y > 0:
+                wrist_y = wrist_coords[1]
+                safe_zone_px = float(height) * float(smooth_threshold)
+                start_transition_y = hip_y - safe_zone_px
+
+                if wrist_y < start_transition_y:
+                    factor_right = 0.0
+                elif wrist_y >= hip_y:
+                    factor_right = 1.0
+                else:
+                    if safe_zone_px > 0:
+                        progress = (wrist_y - start_transition_y) / safe_zone_px
+                        factor_right = max(0.0, min(1.0, progress))
+
+        # --- SMOOTHING LOGIK LINKS ---
+        factor_left = 1.0
+        if smooth_hand_entry and 7 < len(body_arr):
+            wrist_coords = self._extract_coords(body_arr[7])
+            hip_y = hip_l_orig[1]
+            if wrist_coords is not None and hip_y > 0:
+                wrist_y = wrist_coords[1]
+                safe_zone_px = float(height) * float(smooth_threshold)
+                start_transition_y = hip_y - safe_zone_px
+
+                if wrist_y < start_transition_y:
+                    factor_left = 0.0
+                elif wrist_y >= hip_y:
+                    factor_left = 1.0
+                else:
+                    if safe_zone_px > 0:
+                        progress = (wrist_y - start_transition_y) / safe_zone_px
+                        factor_left = max(0.0, min(1.0, progress))
+
+        final_shift_right = base_shift_right * factor_right
+        final_shift_left = base_shift_left * factor_left
+
+        # --- ANWENDEN (V2: Ellbogen optional) ---
+        
+        # Indizes Rechts: 3 (Ellbogen), 4 (Handgelenk)
+        indices_right = [4]
+        if move_elbows:
+            indices_right.append(3)
+            
+        for idx in indices_right:
+            if idx < len(body_arr):
+                self._shift_point_x(body_arr, idx, final_shift_right)
+        
+        if hasattr(meta, "kps_rhand") and meta.kps_rhand is not None:
+            for i in range(len(meta.kps_rhand)):
+                self._shift_point_x(meta.kps_rhand, i, final_shift_right)
+
+        # Indizes Links: 6 (Ellbogen), 7 (Handgelenk)
+        indices_left = [7]
+        if move_elbows:
+            indices_left.append(6)
+
+        for idx in indices_left:
+            if idx < len(body_arr):
+                self._shift_point_x(body_arr, idx, final_shift_left)
+        
+        if hasattr(meta, "kps_lhand") and meta.kps_lhand is not None:
+            for i in range(len(meta.kps_lhand)):
+                self._shift_point_x(meta.kps_lhand, i, final_shift_left)
+
+    def _extract_coords(self, point):
+        if point is None: return None
+        if isinstance(point, np.ndarray): return point
+        if isinstance(point, list) and len(point) >= 2: return point
+        return None
+
+    def _assign_point(self, arr, idx, x, y):
+        if idx < len(arr) and arr[idx] is not None:
+            if isinstance(arr[idx], np.ndarray):
+                arr[idx][0] = x
+                arr[idx][1] = y
+            elif isinstance(arr[idx], list):
+                arr[idx][0] = x
+                arr[idx][1] = y
+
+    def _shift_point_x(self, arr, idx, shift_x):
+        if idx < len(arr) and arr[idx] is not None:
+            if isinstance(arr[idx], np.ndarray):
+                arr[idx][0] += shift_x
+            elif isinstance(arr[idx], list):
+                arr[idx][0] += shift_x
+
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -14235,6 +14422,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataConfidenceFilter": PoseDataConfidenceFilter,
     "PoseDataSmartHandFilterTimed": PoseDataSmartHandFilterTimed,
     "DrawViTPose_v2": DrawViTPose_v2,
+    "PoseDataHipHandDebugV2": PoseDataHipHandDebugV2,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -14296,7 +14484,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataConfidenceFilter": "Pose Data Confidence Filter",
     "PoseDataSmartHandFilterTimed": "Pose Data Smart Hand Filter (Timed)",
     "DrawViTPose_v2": "Draw ViT Pose v2 (Fixed Order)",
+    "PoseDataHipHandDebugV2": "Pose Data Hip & Hand Debug V2",
 }
+
 
 
 
