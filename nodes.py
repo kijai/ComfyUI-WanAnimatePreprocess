@@ -14363,6 +14363,171 @@ class PoseDataHipHandDebugV2:
                 arr[idx][0] += shift_x
 
 
+class DrawViTPose_v3:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Width of the generation"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Height of the generation"}),
+                "retarget_padding": ("INT", {"default": 16, "min": 0, "max": 512, "step": 1, "tooltip": "When > 0, the retargeted pose image is padded and resized to the target size"}),
+                "body_stick_width": ("INT", {"default": -1, "min": -1, "max": 20, "step": 1, "tooltip": "Width of the body sticks. Set to 0 to disable body drawing, -1 for auto"}),
+                "hand_stick_width": ("INT", {"default": -1, "min": -1, "max": 20, "step": 1, "tooltip": "Width of the hand sticks. Set to 0 to disable hand drawing, -1 for auto"}),
+                "draw_head": ("BOOLEAN", {"default": "True", "tooltip": "Whether to draw head keypoints"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", )
+    RETURN_NAMES = ("pose_images", )
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Draws pose with layer order: Body (Back) -> Legs (Mid) -> Arms (Front)."
+
+    def process(self, pose_data, width, height, body_stick_width, hand_stick_width, draw_head, retarget_padding=64):
+        import cv2
+        import numpy as np
+        import torch
+        from .pose_utils.human_visualization import draw_handpose_new
+        from .utils import resize_to_bounds, padding_resize
+        import math
+
+        retarget_image = pose_data.get("retarget_image", None)
+        pose_metas = pose_data["pose_metas"]
+
+        draw_hand = hand_stick_width != 0
+        use_retarget_resize = retarget_padding > 0 and retarget_image is not None
+
+        comfy_pbar = ProgressBar(len(pose_metas))
+        progress = 0
+        crop_target_image = None
+        pose_images = []
+
+        # --- Definition der Verbindungen (Indizes basieren auf pose2d_utils Logik) ---
+        limbSeq_orig = [
+            [2, 3], [2, 6],  # 0, 1: Shoulders (Neck -> RSho, Neck -> LSho)
+            [3, 4], [4, 5],  # 2, 3: Right Arm (Sho->Elb, Elb->Wri)
+            [6, 7], [7, 8],  # 4, 5: Left Arm (Sho->Elb, Elb->Wri)
+            [2, 9],          # 6: Right Body (Neck->RHip)
+            [9, 10], [10, 11], # 7, 8: Right Leg (Hip->Knee, Knee->Ank)
+            [2, 12],         # 9: Left Body (Neck->LHip)
+            [12, 13], [13, 14], # 10, 11: Left Leg (Hip->Knee, Knee->Ank)
+            [2, 1],          # 12: Neck->Nose
+            [1, 15], [15, 17], # 13, 14: Face Right (Nose->Eye, Eye->Ear)
+            [1, 16], [16, 18], # 15, 16: Face Left
+            [14, 19],        # 17: Left Foot (Ank->Toe)
+            [11, 20]         # 18: Right Foot (Ank->Toe)
+        ]
+
+        colors_orig = [
+            [255, 0, 0], [255, 85, 0],      # 0, 1 (Shoulders)
+            [255, 170, 0], [255, 255, 0],   # 2, 3 (Right Arm)
+            [170, 255, 0], [85, 255, 0],    # 4, 5 (Left Arm)
+            [0, 255, 0],                    # 6 (Right Body)
+            [0, 255, 85], [0, 255, 170],    # 7, 8 (Right Leg)
+            [0, 255, 255],                  # 9 (Left Body)
+            [0, 170, 255], [0, 85, 255],    # 10, 11 (Left Leg)
+            [0, 0, 255],                    # 12 (Neck)
+            [85, 0, 255], [170, 0, 255],    # 13, 14 (Face)
+            [255, 0, 255], [255, 0, 170],   # 15, 16 (Face)
+            [255, 0, 85],                   # 17 (Foot L)
+            [200, 200, 0]                   # 18 (Foot R)
+        ]
+
+        # --- Z-ORDER SORTER ---
+        # Reihenfolge: Zuerst (Hintergrund) -> Zuletzt (Vordergrund)
+        
+        # 1. KÖRPER (Ganz hinten)
+        # Indizes: 0,1 (Schultern), 6 (Rumpf R), 9 (Rumpf L), 12-16 (Kopf)
+        indices_body = [0, 1, 6, 9, 12, 13, 14, 15, 16]
+
+        # 2. BEINE (Mitte - verdecken Körper)
+        # Indizes: 7, 8 (Bein R), 10, 11 (Bein L), 17, 18 (Füße)
+        indices_legs = [7, 8, 10, 11, 17, 18]
+
+        # 3. ARME (Ganz vorne - verdecken Beine & Körper)
+        # Indizes: 2, 3 (Arm R), 4, 5 (Arm L)
+        indices_arms = [2, 3, 4, 5]
+
+        # Die finale Liste zum Zeichnen
+        draw_order = indices_body + indices_legs + indices_arms
+
+        limbSeq = [limbSeq_orig[i] for i in draw_order]
+        colors = [colors_orig[i] for i in draw_order]
+
+        for idx, meta in enumerate(tqdm(pose_metas, desc="Drawing pose images v3")):
+            canvas = np.zeros((height, width, 3), dtype=np.uint8)
+            
+            # Daten vorbereiten
+            kp2ds = np.concatenate([meta.kps_body, meta.kps_body_p[:, None]], axis=1)
+            kp2ds_lhand = np.concatenate([meta.kps_lhand, meta.kps_lhand_p[:, None]], axis=1)
+            kp2ds_rhand = np.concatenate([meta.kps_rhand, meta.kps_rhand_p[:, None]], axis=1)
+
+            if not draw_head:
+                kp2ds[[0,14,15,16,17], 2] = 0
+            kp2ds_body = kp2ds
+
+            # Stick width berechnen
+            if body_stick_width == -1:
+                stickwidth = max(int(min(height, width) / 200) - 1, 1)
+            else:
+                stickwidth = body_stick_width
+
+            threshold = 0.5
+
+            # --- Zeichnen der Linien (in sortierter Reihenfolge) ---
+            for _idx, ((k1_index, k2_index), color) in enumerate(zip(limbSeq, colors)):
+                keypoint1 = kp2ds_body[k1_index - 1]
+                keypoint2 = kp2ds_body[k2_index - 1]
+
+                if keypoint1[-1] < threshold or keypoint2[-1] < threshold:
+                    continue
+
+                Y = np.array([keypoint1[0], keypoint2[0]])
+                X = np.array([keypoint1[1], keypoint2[1]])
+                mX = np.mean(X)
+                mY = np.mean(Y)
+                length = ((X[0] - X[1]) ** 2 + (Y[0] - Y[1]) ** 2) ** 0.5
+                angle = math.degrees(math.atan2(X[0] - X[1], Y[0] - Y[1]))
+                polygon = cv2.ellipse2Poly((int(mY), int(mX)), (int(length / 2), stickwidth), int(angle), 0, 360, 1)
+                cv2.fillConvexPoly(canvas, polygon, [int(float(c) * 0.6) for c in color])
+
+            # --- Zeichnen der Gelenkpunkte (Kreise) ---
+            # Diese zeichnen wir auch am Ende, damit sie sauber aussehen
+            for _idx, (keypoint, color) in enumerate(zip(kp2ds_body, colors_orig)): 
+                if _idx >= len(colors_orig): break
+                if keypoint[-1] < threshold:
+                    continue
+                x, y = keypoint[0], keypoint[1]
+                cv2.circle(canvas, (int(x), int(y)), stickwidth, colors_orig[_idx], thickness=-1)
+
+            # --- Hände ---
+            # Hände zeichnen wir hier als allerletztes Overlay
+            if draw_hand:
+                canvas = draw_handpose_new(canvas, kp2ds_lhand, stickwidth_type='v2', hand_score_th=threshold, hand_stick_width=hand_stick_width)
+                canvas = draw_handpose_new(canvas, kp2ds_rhand, stickwidth_type='v2', hand_score_th=threshold, hand_stick_width=hand_stick_width)
+
+            pose_image = canvas
+
+            if crop_target_image is None:
+                crop_target_image = pose_image
+
+            if use_retarget_resize:
+                pose_image = resize_to_bounds(pose_image, height, width, crop_target_image=crop_target_image, extra_padding=retarget_padding)
+            else:
+                pose_image = padding_resize(pose_image, height, width)
+
+            pose_images.append(pose_image)
+            progress += 1
+            if progress % 10 == 0:
+                comfy_pbar.update_absolute(progress)
+
+        pose_images_np = np.stack(pose_images, 0)
+        pose_images_tensor = torch.from_numpy(pose_images_np).float() / 255.0
+
+        return (pose_images_tensor, )
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -14423,6 +14588,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataSmartHandFilterTimed": PoseDataSmartHandFilterTimed,
     "DrawViTPose_v2": DrawViTPose_v2,
     "PoseDataHipHandDebugV2": PoseDataHipHandDebugV2,
+    "DrawViTPose_v3": DrawViTPose_v3,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -14485,7 +14651,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataSmartHandFilterTimed": "Pose Data Smart Hand Filter (Timed)",
     "DrawViTPose_v2": "Draw ViT Pose v2 (Fixed Order)",
     "PoseDataHipHandDebugV2": "Pose Data Hip & Hand Debug V2",
+    "DrawViTPose_v3": "Draw ViT Pose v3 (Body>Legs>Arms)",
 }
+
 
 
 
