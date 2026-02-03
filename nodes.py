@@ -14528,6 +14528,105 @@ class DrawViTPose_v3:
         return (pose_images_tensor, )
 
 
+class KeypointDeleter:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "delete_face": ("BOOLEAN", {"default": False, "tooltip": "Löscht Gesicht (Augen, Ohren, Nase)"}),
+                "delete_torso": ("BOOLEAN", {"default": False, "tooltip": "Löscht den Rumpf (Hals, Schultern, Hüften)"}),
+                "delete_arms": ("BOOLEAN", {"default": False, "tooltip": "Löscht BEIDE Arme komplett"}),
+                "delete_legs": ("BOOLEAN", {"default": False, "tooltip": "Löscht BEIDE Beine inkl. Zehen komplett"}),
+                "delete_left_arm": ("BOOLEAN", {"default": False, "tooltip": "Löscht nur den linken Arm"}),
+                "delete_right_arm": ("BOOLEAN", {"default": False, "tooltip": "Löscht nur den rechten Arm"}),
+                "delete_left_leg": ("BOOLEAN", {"default": False, "tooltip": "Löscht nur das linke Bein"}),
+                "delete_right_leg": ("BOOLEAN", {"default": False, "tooltip": "Löscht nur das rechte Bein"}),
+                "delete_hands": ("BOOLEAN", {"default": False, "tooltip": "Löscht detaillierte Finger/Hand-Keypoints"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Löscht ausgewählte Segmente (inkl. Torso) aus den Pose-Daten."
+
+    def process(self, pose_data, delete_face, delete_torso, delete_arms, delete_legs, delete_left_arm, delete_right_arm, delete_left_leg, delete_right_leg, delete_hands):
+        import copy
+        import numpy as np
+
+        new_pose_data = copy.deepcopy(pose_data)
+        pose_metas = new_pose_data['pose_metas']
+
+        # Indizes (COCO + Foot):
+        # 0:Nose, 1:Neck
+        # 2:RSho, 3:RElb, 4:RWri
+        # 5:LSho, 6:LElb, 7:LWri
+        # 8:RHip, 9:RKnee, 10:RAnk
+        # 11:LHip, 12:LKnee, 13:LAnk
+        # 14:REye, 15:LEye, 16:REar, 17:LEar
+        # 18:LToe, 19:RToe
+
+        face_indices = [0, 14, 15, 16, 17]
+        
+        # Torso: Hals (1), Schultern (2, 5), Hüften (8, 11)
+        # Wenn man diese löscht, verschwinden die Verbindungen im Rumpf.
+        torso_indices = [1, 2, 5, 8, 11]
+
+        right_arm_indices = [2, 3, 4]
+        left_arm_indices = [5, 6, 7]
+        
+        right_leg_indices = [8, 9, 10, 19]
+        left_leg_indices = [11, 12, 13, 18]
+
+        for meta in pose_metas:
+            # Gesicht
+            if delete_face:
+                meta.kps_body[face_indices, :] = 0
+                meta.kps_body_p[face_indices] = 0
+            
+            # Torso
+            if delete_torso:
+                meta.kps_body[torso_indices, :] = 0
+                meta.kps_body_p[torso_indices] = 0
+
+            # Arme
+            if delete_right_arm or delete_arms:
+                meta.kps_body[right_arm_indices, :] = 0
+                meta.kps_body_p[right_arm_indices] = 0
+                if hasattr(meta, 'kps_rhand'):
+                     meta.kps_rhand[:] = 0
+                     meta.kps_rhand_p[:] = 0
+
+            if delete_left_arm or delete_arms:
+                meta.kps_body[left_arm_indices, :] = 0
+                meta.kps_body_p[left_arm_indices] = 0
+                if hasattr(meta, 'kps_lhand'):
+                     meta.kps_lhand[:] = 0
+                     meta.kps_lhand_p[:] = 0
+
+            # Beine
+            if delete_right_leg or delete_legs:
+                meta.kps_body[right_leg_indices, :] = 0
+                meta.kps_body_p[right_leg_indices] = 0
+
+            if delete_left_leg or delete_legs:
+                meta.kps_body[left_leg_indices, :] = 0
+                meta.kps_body_p[left_leg_indices] = 0
+
+            # Hände
+            if delete_hands:
+                if hasattr(meta, 'kps_lhand'):
+                    meta.kps_lhand[:] = 0
+                    meta.kps_lhand_p[:] = 0
+                if hasattr(meta, 'kps_rhand'):
+                    meta.kps_rhand[:] = 0
+                    meta.kps_rhand_p[:] = 0
+
+        return (new_pose_data,)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -14589,6 +14688,7 @@ NODE_CLASS_MAPPINGS = {
     "DrawViTPose_v2": DrawViTPose_v2,
     "PoseDataHipHandDebugV2": PoseDataHipHandDebugV2,
     "DrawViTPose_v3": DrawViTPose_v3,
+    "KeypointDeleter": KeypointDeleter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -14652,7 +14752,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DrawViTPose_v2": "Draw ViT Pose v2 (Fixed Order)",
     "PoseDataHipHandDebugV2": "Pose Data Hip & Hand Debug V2",
     "DrawViTPose_v3": "Draw ViT Pose v3 (Body>Legs>Arms)",
+    "KeypointDeleter": "Keypoint Deleter (Remove Limbs)",
 }
+
 
 
 
