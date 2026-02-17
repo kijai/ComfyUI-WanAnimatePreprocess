@@ -14904,7 +14904,6 @@ class MaskPositionalCutterV3:
                 "background_color": (["black", "white"], {"default": "black", "tooltip": "Farbe der Balken, wenn die Box über den Bildrand hinausgeht."}),
             },
             "optional": {
-                # Diese Inputs akzeptieren SAM-Punkte/Boxen (Listen oder Tensoren) aus dem Frames Editor
                 "opt_positive_points": ("*",), 
                 "opt_negative_points": ("*",),
                 "opt_bboxes": ("*",), 
@@ -14915,7 +14914,7 @@ class MaskPositionalCutterV3:
     RETURN_NAMES = ("cropped_images", "cut_info", "trans_pos_points", "trans_neg_points", "trans_bboxes")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Masking"
-    DESCRIPTION = "Nimmt die größte Ausdehnung aller Masken als feste Box-Größe. Füllt Ränder am Bildrand mit Farbe auf (statt zu zoomen). Transformiert SAM-Punkte."
+    DESCRIPTION = "Filtert Punkte, die außerhalb des Ausschnitts liegen, automatisch heraus."
 
     def process(self, images, mask, padding, megapixels, background_color, opt_positive_points=None, opt_negative_points=None, opt_bboxes=None):
         import cv2
@@ -14929,18 +14928,12 @@ class MaskPositionalCutterV3:
         if mask.ndim == 2: mask = mask.unsqueeze(0)
         if mask.shape[0] < B: mask = mask.repeat(B, 1, 1)
         
-        # ----------------------------------------------------------------------
-        # SCHRITT 1: Globale maximale Größe und Mittelpunkte finden
-        # ----------------------------------------------------------------------
-        
+        # --- SCHRITT 1: Globale Max-Box finden ---
         centers = []
         global_max_w = 0
         global_max_h = 0
-        
-        # Letzte bekannte Position merken für leere Frames
         last_valid_center = (W/2, H/2)
         
-        # Erster Pass: Dimensionen und Center analysieren
         for i in range(B):
             m = mask[i].cpu().numpy()
             y_indices, x_indices = np.nonzero(m > 0.5)
@@ -14948,105 +14941,46 @@ class MaskPositionalCutterV3:
             if len(y_indices) == 0:
                 centers.append(None)
             else:
-                # BBox dieses Frames
                 y_min, y_max = y_indices.min(), y_indices.max()
                 x_min, x_max = x_indices.min(), x_indices.max()
-                
                 w = x_max - x_min
                 h = y_max - y_min
-                
-                # Global Max Update (Wir suchen die dickste/höchste Maske im ganzen Video)
                 if w > global_max_w: global_max_w = w
                 if h > global_max_h: global_max_h = h
-                
-                # Center berechnen
                 cx = x_min + w / 2
                 cy = y_min + h / 2
                 centers.append((cx, cy))
                 last_valid_center = (cx, cy)
 
-        # Fallback für komplett leere Masken
         if global_max_w == 0: global_max_w = 128
         if global_max_h == 0: global_max_h = 128
         
-        # Die Box-Größe ist: Max-Ausdehnung + Padding
-        # Diese Größe ist FIX für alle Frames!
         box_w = int(global_max_w + (padding * 2))
         box_h = int(global_max_h + (padding * 2))
         
-        # ----------------------------------------------------------------------
-        # SCHRITT 2: Zielauflösung berechnen (Target Tensor Größe)
-        # ----------------------------------------------------------------------
+        # --- SCHRITT 2: Zielauflösung ---
         target_pixel_count = megapixels * 1_000_000
         aspect_ratio = box_w / box_h
-        
         target_h_float = math.sqrt(target_pixel_count / aspect_ratio)
         target_w_float = target_h_float * aspect_ratio
-        
-        # Auf 8 runden
         target_w = int(round(target_w_float / 8) * 8)
         target_h = int(round(target_h_float / 8) * 8)
         target_w = max(64, target_w)
         target_h = max(64, target_h)
         
-        # Skalierungsfaktor (Original Box -> Target Tensor)
         scale_x = target_w / box_w
         scale_y = target_h / box_h
         
-        # Hintergrundfarbe vorbereiten
-        bg_val = 0 if background_color == "black" else 1.0 # Float Bilder sind 0..1
-        if images.dtype == torch.uint8: # Falls Input Int ist (eher selten in Comfy Tensor)
-            bg_val = 0 if background_color == "black" else 255
-
-        # ----------------------------------------------------------------------
-        # SCHRITT 3: Cropping & Point Transformation
-        # ----------------------------------------------------------------------
+        bg_val = 0 if background_color == "black" else 1.0
+        
+        # --- SCHRITT 3: Processing & Transformation ---
         cropped_images = []
         cut_infos = []
-        
         out_pos = []
         out_neg = []
         out_bbox = []
         
-        # --- Hilfsfunktionen für SAM Punkte ---
-        def transform_coords(coords, offset_x, offset_y, sx, sy):
-            # Transformiert Koordinaten: (x - offset) * scale
-            if coords is None: return None
-            
-            # Tensoren behandeln
-            is_tensor = hasattr(coords, "cpu")
-            if is_tensor: pts = coords.cpu().numpy()
-            else: pts = coords
-            
-            # Rekursive Struktur Behandlung (Batch -> Punkte -> XY)
-            # Wir nehmen an, wir kriegen hier die Punkte für EINEN Frame
-            # Struktur meist: [[x,y], [x,y]] oder [x,y,x,y] (BBox)
-            
-            def trans_single(p):
-                # p ist [x, y]
-                return [(p[0] - offset_x) * sx, (p[1] - offset_y) * sy]
-
-            new_pts = []
-            
-            # Fallunterscheidung: BBox [x1, y1, x2, y2] vs Punkte [[x,y],...]
-            if isinstance(pts, (list, tuple, np.ndarray)):
-                pts = np.array(pts)
-                if pts.ndim == 1 and len(pts) == 4: # Single BBox
-                    nx1 = (pts[0] - offset_x) * sx
-                    ny1 = (pts[1] - offset_y) * sy
-                    nx2 = (pts[2] - offset_x) * sx
-                    ny2 = (pts[3] - offset_y) * sy
-                    new_pts = [nx1, ny1, nx2, ny2]
-                elif pts.ndim == 2: # Liste von Punkten [[x,y], [x,y]]
-                    for p in pts:
-                        new_pts.append(trans_single(p))
-                elif pts.ndim == 1 and len(pts) == 2: # Single Point
-                    new_pts = [trans_single(pts)]
-            
-            if is_tensor:
-                return torch.tensor(new_pts, device=coords.device, dtype=coords.dtype)
-            return new_pts
-
+        # Helper für Inputs
         def get_item_safe(idx, data):
             if data is None: return None
             if isinstance(data, (list, tuple)):
@@ -15054,73 +14988,118 @@ class MaskPositionalCutterV3:
             if hasattr(data, "shape"):
                 return data[idx] if idx < data.shape[0] else data[-1]
             return data
+
+        # *** NEUE INTELLIGENTE TRANSFORMATION ***
+        def transform_coords_smart(coords, offset_x, offset_y, sx, sy, limit_w, limit_h, is_bbox=False):
+            if coords is None: return None
+            
+            is_tensor = hasattr(coords, "cpu")
+            if is_tensor: pts = coords.cpu().numpy()
+            else: pts = coords
+            
+            new_pts = []
+            
+            # --- Logik für Bounding Boxes ---
+            if is_bbox:
+                # Erwarte [x1, y1, x2, y2] oder Liste davon
+                pts = np.array(pts)
+                single = (pts.ndim == 1 and len(pts) == 4)
+                if single: pts = [pts]
+                
+                for b in pts:
+                    if len(b) < 4: continue
+                    # Transformieren
+                    nx1 = (b[0] - offset_x) * sx
+                    ny1 = (b[1] - offset_y) * sy
+                    nx2 = (b[2] - offset_x) * sx
+                    ny2 = (b[3] - offset_y) * sy
+                    
+                    # Clipping (Zurechtschneiden auf Bildbereich)
+                    nx1 = max(0, min(limit_w, nx1))
+                    ny1 = max(0, min(limit_h, ny1))
+                    nx2 = max(0, min(limit_w, nx2))
+                    ny2 = max(0, min(limit_h, ny2))
+                    
+                    # Nur hinzufügen, wenn die Box noch eine Größe hat
+                    if nx2 > nx1 and ny2 > ny1:
+                        new_pts.append([nx1, ny1, nx2, ny2])
+                        
+            # --- Logik für Punkte (Positive/Negative) ---
+            else:
+                # Erwarte [[x,y], [x,y]] oder [x,y]
+                pts = np.array(pts)
+                # Normalisieren auf Liste von [x,y]
+                if pts.ndim == 1 and len(pts) == 2: pts = [pts]
+                
+                for p in pts:
+                    if len(p) < 2: continue
+                    nx = (p[0] - offset_x) * sx
+                    ny = (p[1] - offset_y) * sy
+                    
+                    # FILTER: Ist der Punkt im Bild?
+                    # Wir geben 1px Toleranz am Rand
+                    if 0 <= nx < limit_w and 0 <= ny < limit_h:
+                        new_pts.append([nx, ny])
+            
+            # Wenn alles rausgefiltert wurde, geben wir None zurück (oder leere Liste)
+            if len(new_pts) == 0:
+                return None
+                
+            if is_tensor:
+                # Zurück zu Tensor, Format float32 ist meist am sichersten für Koordinaten
+                return torch.tensor(new_pts, device=coords.device, dtype=torch.float32)
+            return new_pts
+
         
-        # Loop über Frames
         for i in range(B):
             img = images[i].cpu().numpy()
             
-            # Center bestimmen (Lücken füllen mit letztem Center)
+            # Center Logic
             c = centers[i]
-            if c is None:
-                # Suche nächstes verfügbares Center vor oder zurück, oder nimm Bildmitte
-                # Einfachheit: Nimm das letzte gültige oder Bildmitte
-                cx, cy = last_valid_center if last_valid_center else (W/2, H/2)
-            else:
-                cx, cy = c
-                last_valid_center = (cx, cy)
+            if c is None: cx, cy = last_valid_center if last_valid_center else (W/2, H/2)
+            else: cx, cy = c; last_valid_center = (cx, cy)
             
-            # Koordinaten der Box im Originalbild berechnen
-            # x1, y1 ist Top-Left der Box
             x1 = int(cx - box_w / 2)
             y1 = int(cy - box_h / 2)
             x2 = x1 + box_w
             y2 = y1 + box_h
             
-            # --- Canvas erstellen (mit Randfarbe) ---
+            # Image Cut Logic
             canvas = np.full((box_h, box_w, C), bg_val, dtype=img.dtype)
+            src_x1, src_y1 = max(0, x1), max(0, y1)
+            src_x2, src_y2 = min(W, x2), min(H, y2)
+            dst_x1, dst_y1 = src_x1 - x1, src_y1 - y1
+            dst_x2, dst_y2 = dst_x1 + (src_x2 - src_x1), dst_y1 + (src_y2 - src_y1)
             
-            # Schnittmenge berechnen (Was ist tatsächlich im Bild?)
-            src_x1 = max(0, x1)
-            src_y1 = max(0, y1)
-            src_x2 = min(W, x2)
-            src_y2 = min(H, y2)
-            
-            # Koordinaten im Canvas (Wo fügen wir das Bild ein?)
-            dst_x1 = src_x1 - x1
-            dst_y1 = src_y1 - y1
-            dst_x2 = dst_x1 + (src_x2 - src_x1)
-            dst_y2 = dst_y1 + (src_y2 - src_y1)
-            
-            # Kopieren, falls Schnittmenge existiert
             if src_x2 > src_x1 and src_y2 > src_y1:
                 canvas[dst_y1:dst_y2, dst_x1:dst_x2] = img[src_y1:src_y2, src_x1:src_x2]
             
-            # --- Skalieren auf Tensor-Größe (Megapixel) ---
-            # Lanczos4 für beste Qualität
             final_img = cv2.resize(canvas, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
             cropped_images.append(final_img)
             
-            # --- Punkte transformieren ---
-            # WICHTIG: Die Transformation basiert auf der Position der Box (x1, y1), 
-            # egal ob x1 negativ ist (out of bounds) oder nicht.
-            # Da wir eine "virtuelle Box" haben, passen die relativen Koordinaten immer.
-            
+            # --- POINTS & BBOX TRANSFORM WITH FILTER ---
             curr_pos = get_item_safe(i, opt_positive_points)
             curr_neg = get_item_safe(i, opt_negative_points)
             curr_box = get_item_safe(i, opt_bboxes)
             
-            t_pos = transform_coords(curr_pos, x1, y1, scale_x, scale_y)
-            t_neg = transform_coords(curr_neg, x1, y1, scale_x, scale_y)
-            t_box = transform_coords(curr_box, x1, y1, scale_x, scale_y)
+            # Wir übergeben jetzt target_w/h als Limit
+            t_pos = transform_coords_smart(curr_pos, x1, y1, scale_x, scale_y, target_w, target_h, is_bbox=False)
+            t_neg = transform_coords_smart(curr_neg, x1, y1, scale_x, scale_y, target_w, target_h, is_bbox=False)
+            t_box = transform_coords_smart(curr_box, x1, y1, scale_x, scale_y, target_w, target_h, is_bbox=True)
             
-            if t_pos is not None: out_pos.append(t_pos)
-            if t_neg is not None: out_neg.append(t_neg)
-            if t_box is not None: out_bbox.append(t_box)
+            # Um die Listenstruktur zu erhalten (auch wenn leer), hängen wir sie an
+            # Achtung: ComfyUI mag manchmal keine Nones in Listen, wenn der Downstream-Node iteriert.
+            # Wir hängen es nur an, wenn es Daten gibt, oder leere Listen?
+            # Am sichersten ist: Wenn None zurückkommt, hängen wir eine leere Liste/Tensor an, 
+            # damit der Batch-Index stimmt.
+            
+            out_pos.append(t_pos if t_pos is not None else [])
+            out_neg.append(t_neg if t_neg is not None else [])
+            out_bbox.append(t_box if t_box is not None else [])
 
-            # Info speichern für Joiner
             info = {
-                "bbox": (x1, y1, x2, y2), # Position im Original (kann negativ sein)
-                "crop_shape": (box_w, box_h), # Größe der unskalierten Box
+                "bbox": (x1, y1, x2, y2),
+                "crop_shape": (box_w, box_h),
                 "target_shape": (target_w, target_h), 
                 "original_shape": (W, H)
             }
@@ -15128,12 +15107,10 @@ class MaskPositionalCutterV3:
             
         cropped_tensor = torch.from_numpy(np.stack(cropped_images, 0))
         
-        # Output Punkte formatieren
-        res_pos = out_pos if opt_positive_points is not None else None
-        res_neg = out_neg if opt_negative_points is not None else None
-        res_box = out_bbox if opt_bboxes is not None else None
+        # Die Outputs sind jetzt Listen von (Tensoren oder Listen), die leer sein können.
+        # Das sollte für die meisten Nodes (wie SAM) okay sein, solange sie Checks haben.
         
-        return (cropped_tensor, cut_infos, res_pos, res_neg, res_box)
+        return (cropped_tensor, cut_infos, out_pos, out_neg, out_bbox)
 
 
 class MaskPositionalJoinerV3:
@@ -15364,6 +15341,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalCutterV3": "Mask Positional Cutter V3 (Global Max + Points)",
     "MaskPositionalJoinerV3": "Mask Positional Joiner V3",
 }
+
 
 
 
