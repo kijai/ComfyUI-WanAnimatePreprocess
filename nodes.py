@@ -14892,7 +14892,7 @@ class MaskPositionalJoiner:
 # Neue Nodes: Mask Positional Cutter V3 (Global Max, Edge Padding & Points)
 # ==============================================================================
 # ==============================================================================
-# Node: Mask Positional Cutter V3 (Fix: Empty List Crash)
+# Node: Mask Positional Cutter V3 (Final & SAM3 Verified)
 # ==============================================================================
 
 class MaskPositionalCutterV3:
@@ -14913,11 +14913,12 @@ class MaskPositionalCutterV3:
             }
         }
 
+    # 8 Outputs: JSON Strings für EasySAM, RAW Listen für andere Nodes
     RETURN_TYPES = ("IMAGE", "MASK_CUT_INFO_V3", "STRING", "STRING", "STRING", "*", "*", "*")
     RETURN_NAMES = ("cropped_images", "cut_info", "trans_pos_json", "trans_neg_json", "trans_bbox_json", "trans_pos_raw", "trans_neg_raw", "trans_bbox_raw")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Masking"
-    DESCRIPTION = "Filtert Punkte und gibt sie als JSON und RAW zurück. (Crash Fix für leere Listen)"
+    DESCRIPTION = "Schneidet Masken aus und transformiert Punkte exakt für EasySAM3 (JSON Output)."
 
     def process(self, images, mask, padding, megapixels, background_color, opt_positive_points=None, opt_negative_points=None, opt_bboxes=None):
         import cv2
@@ -14984,44 +14985,47 @@ class MaskPositionalCutterV3:
         out_neg = []
         out_bbox = []
         
-        # *** FIX: Sicherer Zugriff, auch bei leeren Listen ***
+        # Helper: Holt Daten sicher aus Batch, auch wenn leer
         def get_item_safe(idx, data):
             if data is None: return None
-            
-            # JSON Parse Versuch
+            # JSON Parse Versuch (falls String reinkommt)
             if isinstance(data, str):
                 try: data = json.loads(data)
                 except: pass
             
-            # Listen/Tuple Behandlung
+            # Listen/Tuple/Tensor Behandlung
             if isinstance(data, (list, tuple)):
-                if len(data) == 0: return None # <-- FIX: Leere Liste abfangen
+                if len(data) == 0: return None
                 return data[idx] if idx < len(data) else data[-1]
             
-            # Tensor Behandlung
             if hasattr(data, "shape"):
-                if data.shape[0] == 0: return None # <-- FIX: Leeren Tensor abfangen
+                if data.shape[0] == 0: return None
                 return data[idx] if idx < data.shape[0] else data[-1]
                 
             return data
 
+        # *** ROBUSTE TRANSFORMATION ***
         def transform_coords_smart(coords, offset_x, offset_y, sx, sy, limit_w, limit_h, is_bbox=False):
             if coords is None: return []
             
+            # 1. Zu Numpy konvertieren
             is_tensor = hasattr(coords, "cpu")
             if is_tensor: pts = coords.cpu().numpy()
-            else: pts = coords
+            else: pts = np.array(coords) 
             
-            # Wenn pts leer ist
-            if len(pts) == 0: return []
-
+            # 2. Crash Prevention: Leere oder 0-d Arrays
+            if pts.size == 0 or pts.ndim == 0:
+                return []
+                
             new_pts = []
             
             if is_bbox:
-                pts = np.array(pts)
-                single = (pts.ndim == 1 and len(pts) == 4)
-                if single: pts = [pts]
-                
+                # Normalisiere auf [[x1, y1, x2, y2], ...]
+                if pts.ndim == 1 and len(pts) == 4:
+                    pts = pts.reshape(1, 4)
+                elif pts.ndim == 1: 
+                    return []
+                    
                 for b in pts:
                     if len(b) < 4: continue
                     nx1 = (b[0] - offset_x) * sx
@@ -15029,23 +15033,29 @@ class MaskPositionalCutterV3:
                     nx2 = (b[2] - offset_x) * sx
                     ny2 = (b[3] - offset_y) * sy
                     
+                    # Clipping am Bildrand
                     nx1 = max(0, min(limit_w, nx1))
                     ny1 = max(0, min(limit_h, ny1))
                     nx2 = max(0, min(limit_w, nx2))
                     ny2 = max(0, min(limit_h, ny2))
                     
                     if nx2 > nx1 and ny2 > ny1:
+                        # WICHTIG: float() für JSON Kompatibilität
                         new_pts.append([float(nx1), float(ny1), float(nx2), float(ny2)])
                         
-            else:
-                pts = np.array(pts)
-                if pts.ndim == 1 and len(pts) == 2: pts = [pts]
+            else: # Points
+                # Normalisiere auf [[x, y], ...]
+                if pts.ndim == 1 and len(pts) == 2:
+                    pts = pts.reshape(1, 2)
+                elif pts.ndim == 1:
+                    return []
                 
                 for p in pts:
                     if len(p) < 2: continue
                     nx = (p[0] - offset_x) * sx
                     ny = (p[1] - offset_y) * sy
                     
+                    # Filter: Ist Punkt im neuen Bild?
                     if 0 <= nx < limit_w and 0 <= ny < limit_h:
                         new_pts.append([float(nx), float(ny)])
             
@@ -15099,6 +15109,7 @@ class MaskPositionalCutterV3:
             
         cropped_tensor = torch.from_numpy(np.stack(cropped_images, 0))
         
+        # --- JSON String Konvertierung (für EasySAM) ---
         def to_json_str(data_list):
             if not data_list: return ""
             try: return json.dumps(data_list)
@@ -15109,7 +15120,6 @@ class MaskPositionalCutterV3:
         res_box_json = to_json_str(out_bbox)
         
         return (cropped_tensor, cut_infos, res_pos_json, res_neg_json, res_box_json, out_pos, out_neg, out_bbox)
-        
 
 class MaskPositionalJoinerV3:
     @classmethod
@@ -15340,6 +15350,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalCutterV3": "Mask Positional Cutter V3 (Global Max + Points)",
     "MaskPositionalJoinerV3": "Mask Positional Joiner V3",
 }
+
 
 
 
