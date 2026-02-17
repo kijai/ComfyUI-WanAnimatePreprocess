@@ -14629,6 +14629,262 @@ class KeypointDeleter:
 
         return (new_pose_data,)
 
+# ==============================================================================
+# Neue Nodes: Mask Positional Cutter & Joiner (Megapixel Version)
+# ==============================================================================
+
+class MaskPositionalCutter:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "mask": ("MASK",),
+                "padding": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1, "tooltip": "Pixel-Padding um die Maske herum."}),
+                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 16.0, "step": 0.1, "tooltip": "Zielauflösung in Megapixeln (z.B. 1.0 = ca. 1024x1024). 0 = Originalgröße behalten."}),
+                "force_size": (["No", "Yes"], {"default": "No", "tooltip": "Erzwingt exakt die Megapixel-Größe, auch wenn das Bild dafür stark vergrößert werden muss."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK_CUT_INFO")
+    RETURN_NAMES = ("cropped_images", "cut_info")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Masking"
+    DESCRIPTION = "Schneidet Masken aus, berechnet das optimale Seitenverhältnis über den ganzen Batch und skaliert auf Ziel-Megapixel (Lanczos)."
+
+    def process(self, images, mask, padding, megapixels, force_size):
+        import cv2
+        import numpy as np
+        import torch
+        import math
+        
+        B, H, W, C = images.shape
+        
+        # Maske vorbereiten
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        if mask.shape[0] < B:
+            mask = mask.repeat(B, 1, 1)
+            
+        cropped_images = []
+        cut_infos = []
+
+        # 1. Bounding Boxes für ALLE Frames berechnen
+        bboxes = []
+        max_crop_w = 0
+        max_crop_h = 0
+        
+        for i in range(B):
+            m = mask[i].cpu().numpy()
+            y_indices, x_indices = np.nonzero(m > 0.5)
+            
+            if len(y_indices) == 0:
+                bbox = (0, 0, 0, 0)
+            else:
+                y_min, y_max = y_indices.min(), y_indices.max()
+                x_min, x_max = x_indices.min(), x_indices.max()
+                
+                # Padding anwenden
+                y_min = max(0, y_min - padding)
+                x_min = max(0, x_min - padding)
+                y_max = min(H, y_max + padding)
+                x_max = min(W, x_max + padding)
+                
+                bbox = (x_min, y_min, x_max, y_max)
+            
+            bboxes.append(bbox)
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            
+            # Wir merken uns die maximal benötigte Breite/Höhe im gesamten Batch
+            if w > max_crop_w: max_crop_w = w
+            if h > max_crop_h: max_crop_h = h
+            
+        # Fallback für leere Masken
+        if max_crop_w == 0: max_crop_w = 64
+        if max_crop_h == 0: max_crop_h = 64
+
+        # 2. Zielauflösung berechnen (Megapixel Logic)
+        if megapixels > 0:
+            target_pixel_count = megapixels * 1_000_000
+            
+            # Das Seitenverhältnis basiert auf der maximalen Ausdehnung im Batch
+            aspect_ratio = max_crop_w / max_crop_h 
+            
+            # Formel: h * (h * aspect) = pixel_count  =>  h^2 = pixel / aspect
+            target_h = math.sqrt(target_pixel_count / aspect_ratio)
+            target_w = target_h * aspect_ratio
+            
+            # Auf Vielfache von 8 runden (wichtig für Video-Modelle)
+            target_w = int(round(target_w / 8) * 8)
+            target_h = int(round(target_h / 8) * 8)
+            
+            # Verhindern, dass wir extrem klein werden
+            target_w = max(64, target_w)
+            target_h = max(64, target_h)
+            
+            # Wenn "force_size" aus ist, skalieren wir nur runter, nicht hoch (optional, hier skalieren wir immer auf Ziel)
+            # Der User will meistens genau die Megapixel, also lassen wir es so.
+        else:
+            # Originalgröße der größten Box behalten
+            target_w = int(round(max_crop_w / 8) * 8)
+            target_h = int(round(max_crop_h / 8) * 8)
+
+        # 3. Cropping & Resizing mit Lanczos
+        for i in range(B):
+            img = images[i].cpu().numpy()
+            bbox = bboxes[i]
+            x1, y1, x2, y2 = bbox
+            w, h = x2 - x1, y2 - y1
+            
+            valid = True
+            if w <= 0 or h <= 0:
+                # Fallback schwarz
+                final_img = np.zeros((target_h, target_w, C), dtype=img.dtype)
+                valid = False
+                orig_crop_shape = (0, 0)
+                pad_l, pad_t = 0, 0
+                resize_mode = "Fit"
+            else:
+                crop = img[y1:y2, x1:x2]
+                orig_crop_shape = (w, h)
+                
+                # Wir nutzen immer "Fit (Black Bars)" Logik relativ zum berechneten Target,
+                # aber da das Target auf dem Seitenverhältnis des Inhalts basiert, 
+                # sind die Black Bars minimal (nur vorhanden, wenn sich die Form der Maske stark ändert zwischen Frames).
+                
+                # Skalierungsfaktor berechnen
+                scale = min(target_w / w, target_h / h)
+                nw, nh = int(w * scale), int(h * scale)
+                
+                # Lanczos Resize (cv2.INTER_LANCZOS4 ist high quality)
+                resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+                
+                # In den Target-Container einfügen (zentriert)
+                final_img = np.zeros((target_h, target_w, C), dtype=img.dtype)
+                
+                pad_l = (target_w - nw) // 2
+                pad_t = (target_h - nh) // 2
+                
+                # Clip um sicherzugehen
+                end_y = min(pad_t + nh, target_h)
+                end_x = min(pad_l + nw, target_w)
+                h_part = end_y - pad_t
+                w_part = end_x - pad_l
+                
+                final_img[pad_t:end_y, pad_l:end_x] = resized[:h_part, :w_part]
+                resize_mode = "Fit"
+
+            cropped_images.append(final_img)
+            
+            # Info speichern
+            info = {
+                "bbox": bbox,
+                "original_image_shape": (W, H),
+                "crop_shape": orig_crop_shape, # Originalgröße des Ausschnitts
+                "target_shape": (target_w, target_h), # Größe des Tensors
+                "padding": (pad_l, pad_t), # Zentrierungs-Padding
+                "resize_mode": resize_mode,
+                "valid": valid
+            }
+            cut_infos.append(info)
+            
+        cropped_tensor = torch.from_numpy(np.stack(cropped_images, 0))
+        return (cropped_tensor, cut_infos)
+
+
+class MaskPositionalJoiner:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "destination_images": ("IMAGE",),
+                "processed_images": ("IMAGE",),
+                "cut_info": ("MASK_CUT_INFO",),
+                "feather": ("INT", {"default": 0, "min": 0, "max": 256, "step": 1, "tooltip": "Weicher Rand beim Einfügen."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("joined_images",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Masking"
+    DESCRIPTION = "Fügt die bearbeiteten Ausschnitte wieder an die ursprüngliche Position ein (reversiert Lanczos-Skalierung)."
+
+    def process(self, destination_images, processed_images, cut_info, feather):
+        import cv2
+        import numpy as np
+        import torch
+        
+        dest_np = destination_images.detach().clone().cpu().numpy()
+        proc_np = processed_images.cpu().numpy()
+        
+        B_dest = len(dest_np)
+        B_proc = len(proc_np)
+        
+        for i in range(B_dest):
+            if i >= len(cut_info): break
+            info = cut_info[i]
+            if not info["valid"]: continue
+                
+            proc_idx = i % B_proc
+            proc_img = proc_np[proc_idx]
+            
+            x1, y1, x2, y2 = info["bbox"]
+            orig_w, orig_h = info["crop_shape"]
+            pad_l, pad_t = info["padding"]
+            target_w, target_h = info["target_shape"]
+            
+            # Aktuelle Größe prüfen (falls Wan ge-upscaled hat)
+            curr_h, curr_w = proc_img.shape[:2]
+            
+            scale_factor_w = curr_w / target_w
+            scale_factor_h = curr_h / target_h
+            
+            curr_pad_l = int(pad_l * scale_factor_w)
+            curr_pad_t = int(pad_t * scale_factor_h)
+            
+            # Inhalt extrahieren (ohne die schwarzen Balken vom "Fit")
+            # Wir wissen, dass orig_w/orig_h verhältnisgleich in den Container gepasst haben.
+            # Breite des Inhalts im aktuellen Bild:
+            content_w_curr = curr_w - 2 * curr_pad_l
+            content_h_curr = curr_h - 2 * curr_pad_t
+            
+            # Extrahiere den validen Bereich
+            # Manchmal gibt es Rundungsfehler um 1px, daher min/max checks
+            y_start = max(0, curr_pad_t)
+            y_end = min(curr_h, curr_pad_t + content_h_curr)
+            x_start = max(0, curr_pad_l)
+            x_end = min(curr_w, curr_pad_l + content_w_curr)
+            
+            actual_content = proc_img[y_start:y_end, x_start:x_end]
+            
+            if actual_content.size == 0:
+                continue
+
+            # Zurückskalieren auf Originalgröße (Lanczos für beste Qualität beim Downscaling)
+            restored_crop = cv2.resize(actual_content, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
+            
+            # Einfügen
+            dest_slice = dest_np[i, y1:y2, x1:x2]
+            
+            if feather > 0:
+                mask = np.ones((orig_h, orig_w), dtype=np.float32)
+                f = min(feather, orig_w//2, orig_h//2)
+                if f > 0:
+                    grad = np.linspace(0, 1, f)
+                    mask[:f, :] *= grad[:, None]
+                    mask[-f:, :] *= grad[::-1, None]
+                    mask[:, :f] *= grad[None, :]
+                    mask[:, -f:] *= grad[None, ::-1]
+                
+                mask = mask[:, :, None]
+                blended = restored_crop * mask + dest_slice * (1.0 - mask)
+                dest_np[i, y1:y2, x1:x2] = blended
+            else:
+                dest_np[i, y1:y2, x1:x2] = restored_crop
+                
+        return (torch.from_numpy(dest_np),)
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -14692,6 +14948,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataHipHandDebugV2": PoseDataHipHandDebugV2,
     "DrawViTPose_v3": DrawViTPose_v3,
     "KeypointDeleter": KeypointDeleter,
+    "MaskPositionalCutter": MaskPositionalCutter,
+    "MaskPositionalJoiner": MaskPositionalJoiner,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -14756,7 +15014,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataHipHandDebugV2": "Pose Data Hip & Hand Debug V2",
     "DrawViTPose_v3": "Draw ViT Pose v3 (Body>Legs>Arms)",
     "KeypointDeleter": "Keypoint Deleter (Remove Limbs)",
+    "MaskPositionalCutter": "Mask Positional Cutter (Wan)",
+    "MaskPositionalJoiner": "Mask Positional Joiner (Wan)",
 }
+
 
 
 
