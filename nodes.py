@@ -14891,6 +14891,9 @@ class MaskPositionalJoiner:
 # ==============================================================================
 # Neue Nodes: Mask Positional Cutter V3 (Global Max, Edge Padding & Points)
 # ==============================================================================
+# ==============================================================================
+# Node: Mask Positional Cutter V3 (Fix: Empty List Crash)
+# ==============================================================================
 
 class MaskPositionalCutterV3:
     @classmethod
@@ -14910,17 +14913,18 @@ class MaskPositionalCutterV3:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK_CUT_INFO_V3", "*", "*", "*")
-    RETURN_NAMES = ("cropped_images", "cut_info", "trans_pos_points", "trans_neg_points", "trans_bboxes")
+    RETURN_TYPES = ("IMAGE", "MASK_CUT_INFO_V3", "STRING", "STRING", "STRING", "*", "*", "*")
+    RETURN_NAMES = ("cropped_images", "cut_info", "trans_pos_json", "trans_neg_json", "trans_bbox_json", "trans_pos_raw", "trans_neg_raw", "trans_bbox_raw")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Masking"
-    DESCRIPTION = "Filtert Punkte, die außerhalb des Ausschnitts liegen, automatisch heraus."
+    DESCRIPTION = "Filtert Punkte und gibt sie als JSON und RAW zurück. (Crash Fix für leere Listen)"
 
     def process(self, images, mask, padding, megapixels, background_color, opt_positive_points=None, opt_negative_points=None, opt_bboxes=None):
         import cv2
         import numpy as np
         import torch
         import math
+        import json
         
         B, H, W, C = images.shape
         
@@ -14980,55 +14984,61 @@ class MaskPositionalCutterV3:
         out_neg = []
         out_bbox = []
         
-        # Helper für Inputs
+        # *** FIX: Sicherer Zugriff, auch bei leeren Listen ***
         def get_item_safe(idx, data):
             if data is None: return None
+            
+            # JSON Parse Versuch
+            if isinstance(data, str):
+                try: data = json.loads(data)
+                except: pass
+            
+            # Listen/Tuple Behandlung
             if isinstance(data, (list, tuple)):
+                if len(data) == 0: return None # <-- FIX: Leere Liste abfangen
                 return data[idx] if idx < len(data) else data[-1]
+            
+            # Tensor Behandlung
             if hasattr(data, "shape"):
+                if data.shape[0] == 0: return None # <-- FIX: Leeren Tensor abfangen
                 return data[idx] if idx < data.shape[0] else data[-1]
+                
             return data
 
-        # *** NEUE INTELLIGENTE TRANSFORMATION ***
         def transform_coords_smart(coords, offset_x, offset_y, sx, sy, limit_w, limit_h, is_bbox=False):
-            if coords is None: return None
+            if coords is None: return []
             
             is_tensor = hasattr(coords, "cpu")
             if is_tensor: pts = coords.cpu().numpy()
             else: pts = coords
             
+            # Wenn pts leer ist
+            if len(pts) == 0: return []
+
             new_pts = []
             
-            # --- Logik für Bounding Boxes ---
             if is_bbox:
-                # Erwarte [x1, y1, x2, y2] oder Liste davon
                 pts = np.array(pts)
                 single = (pts.ndim == 1 and len(pts) == 4)
                 if single: pts = [pts]
                 
                 for b in pts:
                     if len(b) < 4: continue
-                    # Transformieren
                     nx1 = (b[0] - offset_x) * sx
                     ny1 = (b[1] - offset_y) * sy
                     nx2 = (b[2] - offset_x) * sx
                     ny2 = (b[3] - offset_y) * sy
                     
-                    # Clipping (Zurechtschneiden auf Bildbereich)
                     nx1 = max(0, min(limit_w, nx1))
                     ny1 = max(0, min(limit_h, ny1))
                     nx2 = max(0, min(limit_w, nx2))
                     ny2 = max(0, min(limit_h, ny2))
                     
-                    # Nur hinzufügen, wenn die Box noch eine Größe hat
                     if nx2 > nx1 and ny2 > ny1:
-                        new_pts.append([nx1, ny1, nx2, ny2])
+                        new_pts.append([float(nx1), float(ny1), float(nx2), float(ny2)])
                         
-            # --- Logik für Punkte (Positive/Negative) ---
             else:
-                # Erwarte [[x,y], [x,y]] oder [x,y]
                 pts = np.array(pts)
-                # Normalisieren auf Liste von [x,y]
                 if pts.ndim == 1 and len(pts) == 2: pts = [pts]
                 
                 for p in pts:
@@ -15036,25 +15046,14 @@ class MaskPositionalCutterV3:
                     nx = (p[0] - offset_x) * sx
                     ny = (p[1] - offset_y) * sy
                     
-                    # FILTER: Ist der Punkt im Bild?
-                    # Wir geben 1px Toleranz am Rand
                     if 0 <= nx < limit_w and 0 <= ny < limit_h:
-                        new_pts.append([nx, ny])
+                        new_pts.append([float(nx), float(ny)])
             
-            # Wenn alles rausgefiltert wurde, geben wir None zurück (oder leere Liste)
-            if len(new_pts) == 0:
-                return None
-                
-            if is_tensor:
-                # Zurück zu Tensor, Format float32 ist meist am sichersten für Koordinaten
-                return torch.tensor(new_pts, device=coords.device, dtype=torch.float32)
             return new_pts
 
-        
         for i in range(B):
             img = images[i].cpu().numpy()
             
-            # Center Logic
             c = centers[i]
             if c is None: cx, cy = last_valid_center if last_valid_center else (W/2, H/2)
             else: cx, cy = c; last_valid_center = (cx, cy)
@@ -15077,25 +15076,18 @@ class MaskPositionalCutterV3:
             final_img = cv2.resize(canvas, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
             cropped_images.append(final_img)
             
-            # --- POINTS & BBOX TRANSFORM WITH FILTER ---
+            # --- POINTS ---
             curr_pos = get_item_safe(i, opt_positive_points)
             curr_neg = get_item_safe(i, opt_negative_points)
             curr_box = get_item_safe(i, opt_bboxes)
             
-            # Wir übergeben jetzt target_w/h als Limit
             t_pos = transform_coords_smart(curr_pos, x1, y1, scale_x, scale_y, target_w, target_h, is_bbox=False)
             t_neg = transform_coords_smart(curr_neg, x1, y1, scale_x, scale_y, target_w, target_h, is_bbox=False)
             t_box = transform_coords_smart(curr_box, x1, y1, scale_x, scale_y, target_w, target_h, is_bbox=True)
             
-            # Um die Listenstruktur zu erhalten (auch wenn leer), hängen wir sie an
-            # Achtung: ComfyUI mag manchmal keine Nones in Listen, wenn der Downstream-Node iteriert.
-            # Wir hängen es nur an, wenn es Daten gibt, oder leere Listen?
-            # Am sichersten ist: Wenn None zurückkommt, hängen wir eine leere Liste/Tensor an, 
-            # damit der Batch-Index stimmt.
-            
-            out_pos.append(t_pos if t_pos is not None else [])
-            out_neg.append(t_neg if t_neg is not None else [])
-            out_bbox.append(t_box if t_box is not None else [])
+            out_pos.append(t_pos)
+            out_neg.append(t_neg)
+            out_bbox.append(t_box)
 
             info = {
                 "bbox": (x1, y1, x2, y2),
@@ -15107,11 +15099,17 @@ class MaskPositionalCutterV3:
             
         cropped_tensor = torch.from_numpy(np.stack(cropped_images, 0))
         
-        # Die Outputs sind jetzt Listen von (Tensoren oder Listen), die leer sein können.
-        # Das sollte für die meisten Nodes (wie SAM) okay sein, solange sie Checks haben.
-        
-        return (cropped_tensor, cut_infos, out_pos, out_neg, out_bbox)
+        def to_json_str(data_list):
+            if not data_list: return ""
+            try: return json.dumps(data_list)
+            except: return ""
 
+        res_pos_json = to_json_str(out_pos)
+        res_neg_json = to_json_str(out_neg)
+        res_box_json = to_json_str(out_bbox)
+        
+        return (cropped_tensor, cut_infos, res_pos_json, res_neg_json, res_box_json, out_pos, out_neg, out_bbox)
+        
 
 class MaskPositionalJoinerV3:
     @classmethod
@@ -15204,6 +15202,7 @@ class MaskPositionalJoinerV3:
                 dest_np[i, src_y1:src_y2, src_x1:src_x2] = to_paste
                 
         return (torch.from_numpy(dest_np),)
+
 
 
 NODE_CLASS_MAPPINGS = {
@@ -15341,6 +15340,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalCutterV3": "Mask Positional Cutter V3 (Global Max + Points)",
     "MaskPositionalJoinerV3": "Mask Positional Joiner V3",
 }
+
 
 
 
