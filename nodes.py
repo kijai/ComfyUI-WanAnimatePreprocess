@@ -15213,7 +15213,270 @@ class MaskPositionalJoinerV3:
                 
         return (torch.from_numpy(dest_np),)
 
+# ==============================================================================
+# Node: Mask Positional Cutter V4 (Cut Main Mask & Optional Mask)
+# ==============================================================================
 
+class MaskPositionalCutterV4:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "mask": ("MASK",), # Die Hauptmaske (bestimmt den Ausschnitt)
+                "padding": ("INT", {"default": 20, "min": 0, "max": 1024, "step": 1, "tooltip": "Zusätzlicher Rand um die maximale Ausdehnung der Person."}),
+                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 16.0, "step": 0.1, "tooltip": "Zielauflösung des Tensors in MP."}),
+                "background_color": (["black", "white"], {"default": "black", "tooltip": "Farbe der Balken beim BILD, wenn die Box über den Bildrand hinausgeht. (Masken werden immer schwarz gefüllt)."}),
+            },
+            "optional": {
+                "opt_mask": ("MASK",), # ZUSÄTZLICHE Maske, die auch geschnitten werden soll
+                "opt_positive_points": ("*",), 
+                "opt_negative_points": ("*",),
+                "opt_bboxes": ("*",), 
+            }
+        }
+
+    # Outputs erweitert um: mask_cutted, mask_cutted_opt
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "MASK_CUT_INFO_V3", "STRING", "STRING", "STRING", "*", "*", "*")
+    RETURN_NAMES = ("cropped_images", "mask_cutted", "mask_cutted_opt", "cut_info", "trans_pos_json", "trans_neg_json", "trans_bbox_json", "trans_pos_raw", "trans_neg_raw", "trans_bbox_raw")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Masking"
+    DESCRIPTION = "V4: Schneidet Bilder, die Hauptmaske und eine optionale Zusatzmaske synchron zu. Robust gegen Fehler."
+
+    def process(self, images, mask, padding, megapixels, background_color, opt_mask=None, opt_positive_points=None, opt_negative_points=None, opt_bboxes=None):
+        import cv2
+        import numpy as np
+        import torch
+        import math
+        import json
+        
+        B, H, W, C = images.shape
+        
+        # 1. Hauptmaske vorbereiten
+        if mask.ndim == 2: mask = mask.unsqueeze(0)
+        if mask.shape[0] < B: mask = mask.repeat(B, 1, 1)
+
+        # 2. Optionale Maske vorbereiten (falls vorhanden)
+        has_opt_mask = False
+        if opt_mask is not None:
+            has_opt_mask = True
+            if opt_mask.ndim == 2: opt_mask = opt_mask.unsqueeze(0)
+            if opt_mask.shape[0] < B: opt_mask = opt_mask.repeat(B, 1, 1)
+        
+        # --- SCHRITT 1: Globale Max-Box finden ---
+        centers = []
+        global_max_w = 0
+        global_max_h = 0
+        last_valid_center = (W/2, H/2)
+        
+        for i in range(B):
+            m = mask[i].cpu().numpy()
+            y_indices, x_indices = np.nonzero(m > 0.5)
+            
+            if len(y_indices) == 0:
+                centers.append(None)
+            else:
+                y_min, y_max = y_indices.min(), y_indices.max()
+                x_min, x_max = x_indices.min(), x_indices.max()
+                w = x_max - x_min
+                h = y_max - y_min
+                if w > global_max_w: global_max_w = w
+                if h > global_max_h: global_max_h = h
+                cx = x_min + w / 2
+                cy = y_min + h / 2
+                centers.append((cx, cy))
+                last_valid_center = (cx, cy)
+
+        if global_max_w == 0: global_max_w = 128
+        if global_max_h == 0: global_max_h = 128
+        
+        box_w = int(global_max_w + (padding * 2))
+        box_h = int(global_max_h + (padding * 2))
+        
+        # --- SCHRITT 2: Zielauflösung ---
+        target_pixel_count = megapixels * 1_000_000
+        aspect_ratio = box_w / box_h
+        target_h_float = math.sqrt(target_pixel_count / aspect_ratio)
+        target_w_float = target_h_float * aspect_ratio
+        target_w = int(round(target_w_float / 8) * 8)
+        target_h = int(round(target_h_float / 8) * 8)
+        target_w = max(64, target_w)
+        target_h = max(64, target_h)
+        
+        scale_x = target_w / box_w
+        scale_y = target_h / box_h
+        
+        # Bild Hintergrundfarbe
+        img_bg_val = 0 if background_color == "black" else 1.0
+        # Masken Hintergrund ist immer 0 (schwarz)
+        mask_bg_val = 0.0
+        
+        # --- SCHRITT 3: Processing Helper ---
+        # Funktion, die das Ausschneiden und Skalieren übernimmt (für Bild und Masken gleich)
+        def crop_and_resize_content(source_data, x1, y1, box_w, box_h, target_w, target_h, fill_val, is_mask=False):
+            src_h, src_w = source_data.shape[:2]
+            
+            # Canvas erstellen
+            if is_mask:
+                # Masken sind meist 2D (H, W) oder (H, W, 1)
+                canvas = np.full((box_h, box_w), fill_val, dtype=np.float32)
+            else:
+                # Bilder sind (H, W, C)
+                canvas = np.full((box_h, box_w, C), fill_val, dtype=source_data.dtype)
+            
+            src_x1 = max(0, x1)
+            src_y1 = max(0, y1)
+            src_x2 = min(src_w, x1 + box_w)
+            src_y2 = min(src_h, y1 + box_h)
+            
+            dst_x1 = src_x1 - x1
+            dst_y1 = src_y1 - y1
+            dst_x2 = dst_x1 + (src_x2 - src_x1)
+            dst_y2 = dst_y1 + (src_y2 - src_y1)
+            
+            if src_x2 > src_x1 and src_y2 > src_y1:
+                # Copy Logic
+                if is_mask:
+                    # Sicherstellen, dass wir Shapes matchen (falls Source 3D ist aber Canvas 2D)
+                    chunk = source_data[src_y1:src_y2, src_x1:src_x2]
+                    canvas[dst_y1:dst_y2, dst_x1:dst_x2] = chunk
+                else:
+                    canvas[dst_y1:dst_y2, dst_x1:dst_x2] = source_data[src_y1:src_y2, src_x1:src_x2]
+            
+            # Resize
+            # Lanczos4 ist gut, aber bei Masken (0/1) kann es overshoot geben (<0 oder >1)
+            # Wir nutzen Lanczos für Schärfe und clippen danach.
+            result = cv2.resize(canvas, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+            
+            if is_mask:
+                # Clip Mask zurück auf 0..1
+                result = np.clip(result, 0.0, 1.0)
+                
+            return result
+
+        # --- SCHRITT 4: Loop ---
+        cropped_images = []
+        cropped_masks = []
+        cropped_opt_masks = []
+        
+        cut_infos = []
+        out_pos, out_neg, out_bbox = [], [], []
+        
+        # Helper: Holt Daten sicher
+        def get_item_safe(idx, data):
+            if data is None: return None
+            if isinstance(data, str):
+                try: data = json.loads(data)
+                except: pass
+            if isinstance(data, (list, tuple)):
+                if len(data) == 0: return None
+                return data[idx] if idx < len(data) else data[-1]
+            if hasattr(data, "shape"):
+                if data.shape[0] == 0: return None
+                return data[idx] if idx < data.shape[0] else data[-1]
+            return data
+
+        # Robuste Transformation (vom V3 Fix übernommen)
+        def transform_coords_smart(coords, offset_x, offset_y, sx, sy, limit_w, limit_h, is_bbox=False):
+            if coords is None: return []
+            is_tensor = hasattr(coords, "cpu")
+            if is_tensor: pts = coords.cpu().numpy()
+            else: pts = np.array(coords)
+            
+            if pts.size == 0 or pts.ndim == 0: return []
+            new_pts = []
+            if is_bbox:
+                if pts.ndim == 1 and len(pts) == 4: pts = pts.reshape(1, 4)
+                elif pts.ndim == 1: return []
+                for b in pts:
+                    if len(b) < 4: continue
+                    nx1, ny1 = (b[0]-offset_x)*sx, (b[1]-offset_y)*sy
+                    nx2, ny2 = (b[2]-offset_x)*sx, (b[3]-offset_y)*sy
+                    nx1 = max(0, min(limit_w, nx1))
+                    ny1 = max(0, min(limit_h, ny1))
+                    nx2 = max(0, min(limit_w, nx2))
+                    ny2 = max(0, min(limit_h, ny2))
+                    if nx2>nx1 and ny2>ny1: new_pts.append([float(nx1), float(ny1), float(nx2), float(ny2)])
+            else:
+                if pts.ndim == 1 and len(pts) == 2: pts = pts.reshape(1, 2)
+                elif pts.ndim == 1: return []
+                for p in pts:
+                    if len(p) < 2: continue
+                    nx, ny = (p[0]-offset_x)*sx, (p[1]-offset_y)*sy
+                    if 0<=nx<limit_w and 0<=ny<limit_h: new_pts.append([float(nx), float(ny)])
+            return new_pts
+
+        for i in range(B):
+            img = images[i].cpu().numpy()
+            msk = mask[i].cpu().numpy() # Hauptmaske
+            
+            c = centers[i]
+            if c is None: cx, cy = last_valid_center if last_valid_center else (W/2, H/2)
+            else: cx, cy = c; last_valid_center = (cx, cy)
+            
+            x1 = int(cx - box_w / 2)
+            y1 = int(cy - box_h / 2)
+            x2 = x1 + box_w
+            y2 = y1 + box_h
+            
+            # 1. BILD zuschneiden
+            final_img = crop_and_resize_content(img, x1, y1, box_w, box_h, target_w, target_h, img_bg_val, is_mask=False)
+            cropped_images.append(final_img)
+            
+            # 2. HAUPT-MASKE zuschneiden
+            final_mask = crop_and_resize_content(msk, x1, y1, box_w, box_h, target_w, target_h, mask_bg_val, is_mask=True)
+            cropped_masks.append(final_mask)
+            
+            # 3. OPTIONALE MASKE zuschneiden (falls vorhanden)
+            if has_opt_mask:
+                o_msk = opt_mask[i].cpu().numpy()
+                final_opt_mask = crop_and_resize_content(o_msk, x1, y1, box_w, box_h, target_w, target_h, mask_bg_val, is_mask=True)
+                cropped_opt_masks.append(final_opt_mask)
+            
+            # --- POINTS ---
+            curr_pos = get_item_safe(i, opt_positive_points)
+            curr_neg = get_item_safe(i, opt_negative_points)
+            curr_box = get_item_safe(i, opt_bboxes)
+            
+            t_pos = transform_coords_smart(curr_pos, x1, y1, scale_x, scale_y, target_w, target_h, is_bbox=False)
+            t_neg = transform_coords_smart(curr_neg, x1, y1, scale_x, scale_y, target_w, target_h, is_bbox=False)
+            t_box = transform_coords_smart(curr_box, x1, y1, scale_x, scale_y, target_w, target_h, is_bbox=True)
+            
+            out_pos.append(t_pos)
+            out_neg.append(t_neg)
+            out_bbox.append(t_box)
+
+            info = {
+                "bbox": (x1, y1, x2, y2),
+                "crop_shape": (box_w, box_h),
+                "target_shape": (target_w, target_h), 
+                "original_shape": (W, H)
+            }
+            cut_infos.append(info)
+            
+        # Ergebnisse stapeln
+        cropped_tensor = torch.from_numpy(np.stack(cropped_images, 0))
+        mask_tensor = torch.from_numpy(np.stack(cropped_masks, 0))
+        
+        if has_opt_mask:
+            opt_mask_tensor = torch.from_numpy(np.stack(cropped_opt_masks, 0))
+        else:
+            # Falls keine optionale Maske da ist, geben wir eine leere (schwarze) Maske zurück
+            # Damit der Output nicht "None" ist und Fehler wirft.
+            opt_mask_tensor = torch.zeros((B, target_h, target_w), dtype=torch.float32)
+        
+        # JSON convert
+        def to_json_str(data_list):
+            if not data_list: return ""
+            try: return json.dumps(data_list)
+            except: return ""
+
+        res_pos_json = to_json_str(out_pos)
+        res_neg_json = to_json_str(out_neg)
+        res_box_json = to_json_str(out_bbox)
+        
+        # RETURN ORDER: Image, Mask, OptMask, Info, JSONs..., RAWs...
+        return (cropped_tensor, mask_tensor, opt_mask_tensor, cut_infos, res_pos_json, res_neg_json, res_box_json, out_pos, out_neg, out_bbox)
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -15281,6 +15544,7 @@ NODE_CLASS_MAPPINGS = {
     "MaskPositionalJoiner": MaskPositionalJoiner,
     "MaskPositionalCutterV3": MaskPositionalCutterV3,
     "MaskPositionalJoinerV3": MaskPositionalJoinerV3,
+    "MaskPositionalCutterV4": MaskPositionalCutterV4,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -15349,7 +15613,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalJoiner": "Mask Positional Joiner (Wan)",
     "MaskPositionalCutterV3": "Mask Positional Cutter V3 (Global Max + Points)",
     "MaskPositionalJoinerV3": "Mask Positional Joiner V3",
+    "MaskPositionalCutterV4": "Mask Positional Cutter V4 (Dual Mask Output)",
 }
+
 
 
 
