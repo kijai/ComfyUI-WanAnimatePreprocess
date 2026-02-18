@@ -15478,6 +15478,340 @@ class MaskPositionalCutterV4:
         # RETURN ORDER: Image, Mask, OptMask, Info, JSONs..., RAWs...
         return (cropped_tensor, mask_tensor, opt_mask_tensor, cut_infos, res_pos_json, res_neg_json, res_box_json, out_pos, out_neg, out_bbox)
 
+
+# ==============================================================================
+# Node: Mask Positional Cutter V5 (Smart Border Detection)
+# ==============================================================================
+
+class MaskPositionalCutterV5:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "mask": ("MASK",), 
+                "padding": ("INT", {"default": 20, "min": 0, "max": 1024, "step": 1, "tooltip": "Zusätzlicher Rand um die Person."}),
+                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 16.0, "step": 0.1, "tooltip": "Zielauflösung in MP."}),
+                "background_color": (["black", "white"], {"default": "black", "tooltip": "Füllfarbe für den Rand."}),
+            },
+            "optional": {
+                "opt_mask": ("MASK",), # Zweite Maske (z.B. Kleidung/Gesicht)
+                "opt_positive_points": ("*",), 
+                "opt_negative_points": ("*",),
+                "opt_bboxes": ("*",), 
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "MASK_CUT_INFO_V5", "STRING", "STRING", "STRING", "*", "*", "*")
+    RETURN_NAMES = ("cropped_images", "mask_cutted", "mask_cutted_opt", "cut_info", "trans_pos_json", "trans_neg_json", "trans_bbox_json", "trans_pos_raw", "trans_neg_raw", "trans_bbox_raw")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Masking"
+    DESCRIPTION = "V5: Erkennt Bildränder. Gibt Info weiter, damit der Joiner am Rand NICHT fadert (kein Durchschimmern)."
+
+    def process(self, images, mask, padding, megapixels, background_color, opt_mask=None, opt_positive_points=None, opt_negative_points=None, opt_bboxes=None):
+        import cv2
+        import numpy as np
+        import torch
+        import math
+        import json
+        
+        B, H, W, C = images.shape
+        
+        # Masken vorbereiten
+        if mask.ndim == 2: mask = mask.unsqueeze(0)
+        if mask.shape[0] < B: mask = mask.repeat(B, 1, 1)
+
+        has_opt_mask = False
+        if opt_mask is not None:
+            has_opt_mask = True
+            if opt_mask.ndim == 2: opt_mask = opt_mask.unsqueeze(0)
+            if opt_mask.shape[0] < B: opt_mask = opt_mask.repeat(B, 1, 1)
+        
+        # --- 1. Global Max Box ---
+        centers = []
+        global_max_w = 0
+        global_max_h = 0
+        last_valid_center = (W/2, H/2)
+        
+        for i in range(B):
+            m = mask[i].cpu().numpy()
+            y_indices, x_indices = np.nonzero(m > 0.5)
+            
+            if len(y_indices) == 0:
+                centers.append(None)
+            else:
+                y_min, y_max = y_indices.min(), y_indices.max()
+                x_min, x_max = x_indices.min(), x_indices.max()
+                w = x_max - x_min
+                h = y_max - y_min
+                if w > global_max_w: global_max_w = w
+                if h > global_max_h: global_max_h = h
+                cx = x_min + w / 2
+                cy = y_min + h / 2
+                centers.append((cx, cy))
+                last_valid_center = (cx, cy)
+
+        if global_max_w == 0: global_max_w = 128
+        if global_max_h == 0: global_max_h = 128
+        
+        box_w = int(global_max_w + (padding * 2))
+        box_h = int(global_max_h + (padding * 2))
+        
+        # --- 2. Zielauflösung ---
+        target_pixel_count = megapixels * 1_000_000
+        aspect_ratio = box_w / box_h
+        target_h_float = math.sqrt(target_pixel_count / aspect_ratio)
+        target_w_float = target_h_float * aspect_ratio
+        target_w = int(round(target_w_float / 8) * 8)
+        target_h = int(round(target_h_float / 8) * 8)
+        target_w = max(64, target_w)
+        target_h = max(64, target_h)
+        
+        scale_x = target_w / box_w
+        scale_y = target_h / box_h
+        
+        img_bg_val = 0 if background_color == "black" else 1.0
+        mask_bg_val = 0.0
+        
+        # --- 3. Crop Helper ---
+        def crop_and_resize_content(source_data, x1, y1, box_w, box_h, target_w, target_h, fill_val, is_mask=False):
+            src_h, src_w = source_data.shape[:2]
+            if is_mask:
+                canvas = np.full((box_h, box_w), fill_val, dtype=np.float32)
+            else:
+                canvas = np.full((box_h, box_w, C), fill_val, dtype=source_data.dtype)
+            
+            src_x1 = max(0, x1)
+            src_y1 = max(0, y1)
+            src_x2 = min(src_w, x1 + box_w)
+            src_y2 = min(src_h, y1 + box_h)
+            
+            dst_x1 = src_x1 - x1
+            dst_y1 = src_y1 - y1
+            dst_x2 = dst_x1 + (src_x2 - src_x1)
+            dst_y2 = dst_y1 + (src_y2 - src_y1)
+            
+            if src_x2 > src_x1 and src_y2 > src_y1:
+                if is_mask:
+                    chunk = source_data[src_y1:src_y2, src_x1:src_x2]
+                    canvas[dst_y1:dst_y2, dst_x1:dst_x2] = chunk
+                else:
+                    canvas[dst_y1:dst_y2, dst_x1:dst_x2] = source_data[src_y1:src_y2, src_x1:src_x2]
+            
+            result = cv2.resize(canvas, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+            if is_mask: result = np.clip(result, 0.0, 1.0)
+            return result
+
+        # --- 4. Loop ---
+        cropped_images, cropped_masks, cropped_opt_masks = [], [], []
+        cut_infos = []
+        out_pos, out_neg, out_bbox = [], [], []
+        
+        def get_item_safe(idx, data):
+            if data is None: return None
+            if isinstance(data, str):
+                try: data = json.loads(data)
+                except: pass
+            if isinstance(data, (list, tuple)):
+                if len(data) == 0: return None
+                return data[idx] if idx < len(data) else data[-1]
+            if hasattr(data, "shape"):
+                if data.shape[0] == 0: return None
+                return data[idx] if idx < data.shape[0] else data[-1]
+            return data
+
+        def transform_coords_smart(coords, offset_x, offset_y, sx, sy, limit_w, limit_h, is_bbox=False):
+            if coords is None: return []
+            is_tensor = hasattr(coords, "cpu")
+            if is_tensor: pts = coords.cpu().numpy()
+            else: pts = np.array(coords)
+            if pts.size == 0 or pts.ndim == 0: return []
+            new_pts = []
+            if is_bbox:
+                if pts.ndim == 1 and len(pts) == 4: pts = pts.reshape(1, 4)
+                elif pts.ndim == 1: return []
+                for b in pts:
+                    if len(b) < 4: continue
+                    nx1, ny1 = (b[0]-offset_x)*sx, (b[1]-offset_y)*sy
+                    nx2, ny2 = (b[2]-offset_x)*sx, (b[3]-offset_y)*sy
+                    nx1 = max(0, min(limit_w, nx1))
+                    ny1 = max(0, min(limit_h, ny1))
+                    nx2 = max(0, min(limit_w, nx2))
+                    ny2 = max(0, min(limit_h, ny2))
+                    if nx2>nx1 and ny2>ny1: new_pts.append([float(nx1), float(ny1), float(nx2), float(ny2)])
+            else:
+                if pts.ndim == 1 and len(pts) == 2: pts = pts.reshape(1, 2)
+                elif pts.ndim == 1: return []
+                for p in pts:
+                    if len(p) < 2: continue
+                    nx, ny = (p[0]-offset_x)*sx, (p[1]-offset_y)*sy
+                    if 0<=nx<limit_w and 0<=ny<limit_h: new_pts.append([float(nx), float(ny)])
+            return new_pts
+
+        for i in range(B):
+            img = images[i].cpu().numpy()
+            msk = mask[i].cpu().numpy()
+            
+            c = centers[i]
+            if c is None: cx, cy = last_valid_center if last_valid_center else (W/2, H/2)
+            else: cx, cy = c; last_valid_center = (cx, cy)
+            
+            x1 = int(cx - box_w / 2)
+            y1 = int(cy - box_h / 2)
+            x2 = x1 + box_w
+            y2 = y1 + box_h
+            
+            # --- NEU IN V5: Border Padding Detection ---
+            # Wir berechnen, wie viel "Schwarz" an jeder Seite hinzugefügt wurde.
+            # Wenn pad > 0, bedeutet das, wir sind am Bildrand -> Joiner darf dort NICHT fadern!
+            pad_l = max(0, -x1)
+            pad_t = max(0, -y1)
+            pad_r = max(0, x2 - W)
+            pad_b = max(0, y2 - H)
+            
+            # Crops
+            final_img = crop_and_resize_content(img, x1, y1, box_w, box_h, target_w, target_h, img_bg_val, False)
+            cropped_images.append(final_img)
+            
+            final_mask = crop_and_resize_content(msk, x1, y1, box_w, box_h, target_w, target_h, mask_bg_val, True)
+            cropped_masks.append(final_mask)
+            
+            if has_opt_mask:
+                o_msk = opt_mask[i].cpu().numpy()
+                final_opt_mask = crop_and_resize_content(o_msk, x1, y1, box_w, box_h, target_w, target_h, mask_bg_val, True)
+                cropped_opt_masks.append(final_opt_mask)
+            
+            # Points
+            curr_pos = get_item_safe(i, opt_positive_points)
+            curr_neg = get_item_safe(i, opt_negative_points)
+            curr_box = get_item_safe(i, opt_bboxes)
+            
+            out_pos.append(transform_coords_smart(curr_pos, x1, y1, scale_x, scale_y, target_w, target_h, False))
+            out_neg.append(transform_coords_smart(curr_neg, x1, y1, scale_x, scale_y, target_w, target_h, False))
+            out_bbox.append(transform_coords_smart(curr_box, x1, y1, scale_x, scale_y, target_w, target_h, True))
+
+            info = {
+                "bbox": (x1, y1, x2, y2),
+                "crop_shape": (box_w, box_h),
+                "target_shape": (target_w, target_h), 
+                "original_shape": (W, H),
+                "padding_borders": (pad_l, pad_t, pad_r, pad_b) # Wichtig für Joiner V5
+            }
+            cut_infos.append(info)
+            
+        cropped_tensor = torch.from_numpy(np.stack(cropped_images, 0))
+        mask_tensor = torch.from_numpy(np.stack(cropped_masks, 0))
+        opt_mask_tensor = torch.from_numpy(np.stack(cropped_opt_masks, 0)) if has_opt_mask else torch.zeros((B, target_h, target_w), dtype=torch.float32)
+        
+        def to_json_str(d):
+            if not d: return ""
+            try: return json.dumps(d)
+            except: return ""
+
+        return (cropped_tensor, mask_tensor, opt_mask_tensor, cut_infos, 
+                to_json_str(out_pos), to_json_str(out_neg), to_json_str(out_bbox), 
+                out_pos, out_neg, out_bbox)
+
+
+class MaskPositionalJoinerV5:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "destination_images": ("IMAGE",),
+                "processed_images": ("IMAGE",),
+                "cut_info": ("MASK_CUT_INFO_V5",), # Muss V5 Info sein
+                "feather": ("INT", {"default": 10, "min": 0, "max": 256, "step": 1, "tooltip": "Weicher Rand NUR an Schnittkanten innerhalb des Bildes."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("joined_images",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Masking"
+    DESCRIPTION = "V5: Fügt Bilder ein und nutzt Smart Feathering (kein Fade an Bildrändern/Padding)."
+
+    def process(self, destination_images, processed_images, cut_info, feather):
+        import cv2
+        import numpy as np
+        import torch
+        
+        dest_np = destination_images.detach().clone().cpu().numpy()
+        proc_np = processed_images.cpu().numpy()
+        
+        B_dest = len(dest_np)
+        B_proc = len(proc_np)
+        
+        for i in range(B_dest):
+            if i >= len(cut_info): break
+            info = cut_info[i]
+            
+            proc_idx = i % B_proc
+            proc_img = proc_np[proc_idx]
+            
+            x1, y1, x2, y2 = info["bbox"]
+            box_w, box_h = info["crop_shape"]
+            img_W, img_H = info["original_shape"]
+            # Die Padding-Info vom Cutter: (Left, Top, Right, Bottom)
+            # Wenn Wert > 0, dann ist dort der Bildrand -> KEIN Feather.
+            pad_l, pad_t, pad_r, pad_b = info.get("padding_borders", (0,0,0,0))
+            
+            # 1. Zurückskalieren auf Box-Größe
+            restored_crop = cv2.resize(proc_img, (int(box_w), int(box_h)), interpolation=cv2.INTER_LANCZOS4)
+            
+            # 2. Schnittmenge berechnen
+            src_x1 = max(0, x1)
+            src_y1 = max(0, y1)
+            src_x2 = min(img_W, x2)
+            src_y2 = min(img_H, y2)
+            
+            crop_x1 = src_x1 - x1
+            crop_y1 = src_y1 - y1
+            crop_x2 = crop_x1 + (src_x2 - src_x1)
+            crop_y2 = crop_y1 + (src_y2 - src_y1)
+            
+            if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+                continue
+                
+            # Valid Content ausschneiden
+            to_paste = restored_crop[crop_y1:crop_y2, crop_x1:crop_x2]
+            dest_area = dest_np[i, src_y1:src_y2, src_x1:src_x2]
+            
+            # 3. Smart Feathering
+            if feather > 0:
+                h_p, w_p = to_paste.shape[:2]
+                mask = np.ones((h_p, w_p), dtype=np.float32)
+                f = min(feather, w_p//2, h_p//2)
+                
+                if f > 0:
+                    grad = np.linspace(0, 1, f)
+                    
+                    # Logik: Wir faden NUR, wenn wir NICHT am Bildrand/Padding sind.
+                    # pad_l == 0 bedeutet: Die Box war links komplett im Bild. -> Kante ist Schnitt im Bild -> FADE.
+                    # pad_l > 0  bedeutet: Die Box war links außerhalb. -> Kante ist Bildrand -> HARD CUT (kein Fade).
+                    
+                    # Oben
+                    if pad_t == 0: 
+                        mask[:f, :] *= grad[:, None]
+                    # Unten
+                    if pad_b == 0:
+                        mask[-f:, :] *= grad[::-1, None]
+                    # Links
+                    if pad_l == 0:
+                        mask[:, :f] *= grad[None, :]
+                    # Rechts
+                    if pad_r == 0:
+                        mask[:, -f:] *= grad[None, ::-1]
+                
+                mask = mask[:, :, None]
+                blended = to_paste * mask + dest_area * (1.0 - mask)
+                dest_np[i, src_y1:src_y2, src_x1:src_x2] = blended
+            else:
+                dest_np[i, src_y1:src_y2, src_x1:src_x2] = to_paste
+                
+        return (torch.from_numpy(dest_np),)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -15545,6 +15879,8 @@ NODE_CLASS_MAPPINGS = {
     "MaskPositionalCutterV3": MaskPositionalCutterV3,
     "MaskPositionalJoinerV3": MaskPositionalJoinerV3,
     "MaskPositionalCutterV4": MaskPositionalCutterV4,
+    "MaskPositionalCutterV5": MaskPositionalCutterV5,
+    "MaskPositionalJoinerV5": MaskPositionalJoinerV5,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -15614,7 +15950,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalCutterV3": "Mask Positional Cutter V3 (Global Max + Points)",
     "MaskPositionalJoinerV3": "Mask Positional Joiner V3",
     "MaskPositionalCutterV4": "Mask Positional Cutter V4 (Dual Mask Output)",
+    "MaskPositionalCutterV5": "Mask Positional Cutter V5 (Smart Border Feather)",
+    "MaskPositionalJoinerV5": "Mask Positional Joiner V5 (Smart Border Feather)",
+    
 }
+
 
 
 
