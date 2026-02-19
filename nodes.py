@@ -16819,6 +16819,401 @@ class MaskPositionalJoinerV8:
         return (torch.from_numpy(dest_np),)
 
 
+# ==============================================================================
+# Node: Mask Positional Cutter V9 (Smooth Camera & Mask Containment)
+# ==============================================================================
+
+class MaskPositionalCutterV9:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "mask": ("MASK",), 
+                "padding": ("INT", {"default": 20, "min": 0, "max": 1024, "step": 1, "tooltip": "Sicherheitsrand um die Person."}),
+                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 16.0, "step": 0.1, "tooltip": "Zielauflösung in MP."}),
+                "camera_smooth_window": ("INT", {"default": 5, "min": 0, "max": 100, "step": 1, "tooltip": "Glättet das Wackeln (0 = Aus, Höher = Smoother)."}),
+                "keep_mask_100_percent_inside": (["yes", "no"], {"default": "yes", "tooltip": "Erzwingt, dass trotz Glättung keine weißen Stellen der Maske abgeschnitten werden."}),
+                "background_color": (["black", "white"], {"default": "black", "tooltip": "Füllfarbe am Bildrand."}),
+            },
+            "optional": {
+                "opt_mask": ("MASK",),
+                "opt_positive_points": ("*",), 
+                "opt_negative_points": ("*",),
+                "opt_bboxes": ("*",), 
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "MASK_CUT_INFO_V9", "STRING", "STRING", "STRING", "*", "*", "*")
+    RETURN_NAMES = ("cropped_images", "mask_cutted", "mask_cutted_opt", "cut_info", "trans_pos_json", "trans_neg_json", "trans_bbox_json", "trans_pos_raw", "trans_neg_raw", "trans_bbox_raw")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Masking"
+    DESCRIPTION = "V9: Cutter mit Gimbal-Smooth-Kamerafahrt und 100% Masken-Containment Garantie."
+
+    def process(self, images, mask, padding, megapixels, camera_smooth_window, keep_mask_100_percent_inside, background_color, opt_mask=None, opt_positive_points=None, opt_negative_points=None, opt_bboxes=None):
+        import cv2
+        import numpy as np
+        import torch
+        import math
+        import json
+        
+        B, H, W, C = images.shape
+        if mask.ndim == 2: mask = mask.unsqueeze(0)
+        if mask.shape[0] < B: mask = mask.repeat(B, 1, 1)
+
+        has_opt_mask = False
+        if opt_mask is not None:
+            has_opt_mask = True
+            if opt_mask.ndim == 2: opt_mask = opt_mask.unsqueeze(0)
+            if opt_mask.shape[0] < B: opt_mask = opt_mask.repeat(B, 1, 1)
+        
+        # --- 1. Positionen und Maximal-Größen sammeln ---
+        raw_centers = []
+        mask_bounds = [] # Speichert die genauen Ränder der Maske pro Frame
+        
+        global_max_w = 0
+        global_max_h = 0
+        
+        for i in range(B):
+            m = mask[i].cpu().numpy()
+            y_indices, x_indices = np.nonzero(m > 0.5)
+            if len(y_indices) == 0:
+                raw_centers.append(None)
+                mask_bounds.append(None)
+            else:
+                x1, x2 = x_indices.min(), x_indices.max()
+                y1, y2 = y_indices.min(), y_indices.max()
+                w = x2 - x1
+                h = y2 - y1
+                
+                if w > global_max_w: global_max_w = w
+                if h > global_max_h: global_max_h = h
+                
+                cx = x1 + w / 2
+                cy = y1 + h / 2
+                raw_centers.append((cx, cy))
+                mask_bounds.append((x1, y1, x2, y2))
+
+        # Fallback-Größen
+        if global_max_w == 0: global_max_w = 128
+        if global_max_h == 0: global_max_h = 128
+        
+        box_w = int(global_max_w + (padding * 2))
+        box_h = int(global_max_h + (padding * 2))
+        
+        # Lücken in den Centern füllen (falls Maske kurz fehlt)
+        valid_centers = []
+        last_valid = (W/2, H/2)
+        # Suche ersten validen Punkt
+        for c in raw_centers:
+            if c is not None:
+                last_valid = c
+                break
+                
+        for c in raw_centers:
+            if c is not None:
+                last_valid = c
+            valid_centers.append(last_valid)
+
+        # --- 2. CAMERA SMOOTHING (Gimbal Effekt) ---
+        smoothed_centers = []
+        if camera_smooth_window > 0:
+            pad_w = camera_smooth_window
+            for i in range(B):
+                start = max(0, i - pad_w)
+                end = min(B, i + pad_w + 1)
+                window = valid_centers[start:end]
+                avg_cx = sum(c[0] for c in window) / len(window)
+                avg_cy = sum(c[1] for c in window) / len(window)
+                smoothed_centers.append((avg_cx, avg_cy))
+        else:
+            smoothed_centers = valid_centers.copy()
+
+        # --- 3. STRICT MASK CONTAINMENT (Die weiße Maske bleibt 100% drin) ---
+        if keep_mask_100_percent_inside == "yes":
+            for i in range(B):
+                if mask_bounds[i] is not None:
+                    x1, y1, x2, y2 = mask_bounds[i]
+                    cx, cy = smoothed_centers[i]
+                    
+                    # Berechne den Spielraum, den der Mittelpunkt hat, ohne die Maske abzuschneiden
+                    # Damit x1 im Bild ist, muss: cx - box_w/2 <= x1  => cx <= x1 + box_w/2
+                    # Damit x2 im Bild ist, muss: cx + box_w/2 >= x2  => cx >= x2 - box_w/2
+                    min_cx = x2 - box_w / 2
+                    max_cx = x1 + box_w / 2
+                    
+                    min_cy = y2 - box_h / 2
+                    max_cy = y1 + box_h / 2
+                    
+                    # Clamp den Mittelpunkt hart in diesen sicheren Bereich
+                    safe_cx = max(min_cx, min(max_cx, cx))
+                    safe_cy = max(min_cy, min(max_cy, cy))
+                    
+                    smoothed_centers[i] = (safe_cx, safe_cy)
+
+        # --- 4. Zielauflösung berechnen ---
+        target_pixel_count = megapixels * 1_000_000
+        aspect_ratio = box_w / box_h
+        target_h_float = math.sqrt(target_pixel_count / aspect_ratio)
+        target_w_float = target_h_float * aspect_ratio
+        target_w = int(round(target_w_float / 8) * 8)
+        target_h = int(round(target_h_float / 8) * 8)
+        target_w = max(64, target_w)
+        target_h = max(64, target_h)
+        scale_x = target_w / box_w
+        scale_y = target_h / box_h
+        
+        img_bg_val = 0 if background_color == "black" else 1.0
+        mask_bg_val = 0.0
+        
+        # --- 5. Crop Helper ---
+        def crop_and_resize_content(source_data, x1, y1, box_w, box_h, target_w, target_h, fill_val, is_mask=False):
+            src_h, src_w = source_data.shape[:2]
+            if is_mask: canvas = np.full((box_h, box_w), fill_val, dtype=np.float32)
+            else: canvas = np.full((box_h, box_w, C), fill_val, dtype=source_data.dtype)
+            src_x1, src_y1 = max(0, x1), max(0, y1)
+            src_x2, src_y2 = min(src_w, x1 + box_w), min(src_h, y1 + box_h)
+            dst_x1, dst_y1 = src_x1 - x1, src_y1 - y1
+            dst_x2, dst_y2 = dst_x1 + (src_x2 - src_x1), dst_y1 + (src_y2 - src_y1)
+            if src_x2 > src_x1 and src_y2 > src_y1:
+                if is_mask: canvas[dst_y1:dst_y2, dst_x1:dst_x2] = source_data[src_y1:src_y2, src_x1:src_x2]
+                else: canvas[dst_y1:dst_y2, dst_x1:dst_x2] = source_data[src_y1:src_y2, src_x1:src_x2]
+            result = cv2.resize(canvas, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+            if is_mask: result = np.clip(result, 0.0, 1.0)
+            return result
+
+        cropped_images, cropped_masks, cropped_opt_masks = [], [], []
+        cut_infos, out_pos, out_neg, out_bbox = [], [], [], []
+        
+        def get_item_safe(idx, data):
+            if data is None: return None
+            if isinstance(data, str):
+                try: data = json.loads(data)
+                except: pass
+            if isinstance(data, (list, tuple)):
+                if len(data) == 0: return None
+                return data[idx] if idx < len(data) else data[-1]
+            if hasattr(data, "shape"):
+                if data.shape[0] == 0: return None
+                return data[idx] if idx < data.shape[0] else data[-1]
+            return data
+
+        def transform_coords_smart(coords, offset_x, offset_y, sx, sy, limit_w, limit_h, is_bbox=False):
+            if coords is None: return []
+            is_tensor = hasattr(coords, "cpu")
+            if is_tensor: pts = coords.cpu().numpy()
+            else: pts = np.array(coords)
+            if pts.size == 0 or pts.ndim == 0: return []
+            new_pts = []
+            if is_bbox:
+                if pts.ndim == 1 and len(pts) == 4: pts = pts.reshape(1, 4)
+                elif pts.ndim == 1: return []
+                for b in pts:
+                    if len(b) < 4: continue
+                    nx1, ny1, nx2, ny2 = (b[0]-offset_x)*sx, (b[1]-offset_y)*sy, (b[2]-offset_x)*sx, (b[3]-offset_y)*sy
+                    nx1, ny1 = max(0, min(limit_w, nx1)), max(0, min(limit_h, ny1))
+                    nx2, ny2 = max(0, min(limit_w, nx2)), max(0, min(limit_h, ny2))
+                    if nx2>nx1 and ny2>ny1: new_pts.append([float(nx1), float(ny1), float(nx2), float(ny2)])
+            else:
+                if pts.ndim == 1 and len(pts) == 2: pts = pts.reshape(1, 2)
+                elif pts.ndim == 1: return []
+                for p in pts:
+                    if len(p) < 2: continue
+                    nx, ny = (p[0]-offset_x)*sx, (p[1]-offset_y)*sy
+                    if 0<=nx<limit_w and 0<=ny<limit_h: new_pts.append([float(nx), float(ny)])
+            return new_pts
+
+        for i in range(B):
+            img = images[i].cpu().numpy()
+            msk = mask[i].cpu().numpy()
+            
+            # Wir nutzen den gesmoothten und gesicherten Center!
+            cx, cy = smoothed_centers[i]
+            
+            x1 = int(cx - box_w / 2)
+            y1 = int(cy - box_h / 2)
+            x2 = x1 + box_w
+            y2 = y1 + box_h
+            
+            pad_l, pad_t = max(0, -x1), max(0, -y1)
+            pad_r, pad_b = max(0, x2 - W), max(0, y2 - H)
+            
+            cropped_images.append(crop_and_resize_content(img, x1, y1, box_w, box_h, target_w, target_h, img_bg_val, False))
+            cropped_masks.append(crop_and_resize_content(msk, x1, y1, box_w, box_h, target_w, target_h, mask_bg_val, True))
+            if has_opt_mask:
+                cropped_opt_masks.append(crop_and_resize_content(opt_mask[i].cpu().numpy(), x1, y1, box_w, box_h, target_w, target_h, mask_bg_val, True))
+            
+            curr_pos = get_item_safe(i, opt_positive_points)
+            curr_neg = get_item_safe(i, opt_negative_points)
+            curr_box = get_item_safe(i, opt_bboxes)
+            out_pos.append(transform_coords_smart(curr_pos, x1, y1, scale_x, scale_y, target_w, target_h, False))
+            out_neg.append(transform_coords_smart(curr_neg, x1, y1, scale_x, scale_y, target_w, target_h, False))
+            out_bbox.append(transform_coords_smart(curr_box, x1, y1, scale_x, scale_y, target_w, target_h, True))
+
+            info = {
+                "bbox": (x1, y1, x2, y2),
+                "crop_shape": (box_w, box_h),
+                "target_shape": (target_w, target_h), 
+                "original_shape": (W, H),
+                "padding_borders": (pad_l, pad_t, pad_r, pad_b),
+                "initial_padding": padding
+            }
+            cut_infos.append(info)
+            
+        cropped_tensor = torch.from_numpy(np.stack(cropped_images, 0))
+        mask_tensor = torch.from_numpy(np.stack(cropped_masks, 0))
+        opt_mask_tensor = torch.from_numpy(np.stack(cropped_opt_masks, 0)) if has_opt_mask else torch.zeros((B, target_h, target_w), dtype=torch.float32)
+        
+        def to_json_str(d):
+            if not d: return ""
+            try: return json.dumps(d)
+            except: return ""
+
+        return (cropped_tensor, mask_tensor, opt_mask_tensor, cut_infos, 
+                to_json_str(out_pos), to_json_str(out_neg), to_json_str(out_bbox), 
+                out_pos, out_neg, out_bbox)
+
+
+# ==============================================================================
+# Node: Mask Positional Joiner V9
+# ==============================================================================
+
+class MaskPositionalJoinerV9:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "destination_images": ("IMAGE",),
+                "processed_images": ("IMAGE",),
+                "cut_info": ("MASK_CUT_INFO_V9",), # <--- V9 Update
+                "feather": ("INT", {"default": 10, "min": 0, "max": 256, "step": 1, "tooltip": "Weicher Rand."}),
+                "padding_minus": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1, "tooltip": "Schneidet Ränder ab. Stoppt automatisch vor der Maske."}),
+            },
+            "optional": {
+                "opt_mask_cutted": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("joined_images",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Masking"
+    DESCRIPTION = "V9: Nutzt die gecuttete Maske als Schutzschild. Kein Padding/Feather in die Maske!"
+
+    def process(self, destination_images, processed_images, cut_info, feather, padding_minus, opt_mask_cutted=None):
+        import cv2
+        import numpy as np
+        import torch
+        
+        dest_np = destination_images.detach().clone().cpu().numpy()
+        proc_np = processed_images.cpu().numpy()
+        
+        B_dest = len(dest_np)
+        B_proc = len(proc_np)
+        
+        for i in range(B_dest):
+            if i >= len(cut_info): break
+            info = cut_info[i]
+            
+            proc_idx = i % B_proc
+            proc_img = proc_np[proc_idx]
+            
+            bbox_x1, bbox_y1, bbox_x2, bbox_y2 = info["bbox"]
+            box_w, box_h = info["crop_shape"]
+            img_W, img_H = info["original_shape"]
+            
+            # 1. Bild zurückskalieren
+            restored_crop = cv2.resize(proc_img, (int(box_w), int(box_h)), interpolation=cv2.INTER_LANCZOS4)
+            
+            # 2. Masken-Analyse
+            pad_l = pad_r = pad_t = pad_b = padding_minus
+            restored_mask = None
+            
+            if opt_mask_cutted is not None:
+                msk_img = opt_mask_cutted[proc_idx].cpu().numpy()
+                restored_mask = cv2.resize(msk_img, (int(box_w), int(box_h)), interpolation=cv2.INTER_LINEAR)
+                
+                y_ind, x_ind = np.nonzero(restored_mask > 0.1)
+                if len(y_ind) > 0:
+                    m_x1, m_x2 = x_ind.min(), x_ind.max()
+                    m_y1, m_y2 = y_ind.min(), y_ind.max()
+                    
+                    safe_l = m_x1
+                    safe_r = int(box_w) - m_x2
+                    safe_t = m_y1
+                    safe_b = int(box_h) - m_y2
+                    
+                    pad_l = max(0, min(pad_l, safe_l))
+                    pad_r = max(0, min(pad_r, safe_r))
+                    pad_t = max(0, min(pad_t, safe_t))
+                    pad_b = max(0, min(pad_b, safe_b))
+                else:
+                    pad_l = pad_r = pad_t = pad_b = 0
+
+            # 3. Lokalen Ausschnitt definieren
+            local_x1 = pad_l
+            local_y1 = pad_t
+            local_x2 = int(box_w) - pad_r
+            local_y2 = int(box_h) - pad_b
+            
+            if local_x2 <= local_x1 or local_y2 <= local_y1: continue
+
+            # 4. Position auf dem Originalbild
+            dest_x1 = bbox_x1 + local_x1
+            dest_y1 = bbox_y1 + local_y1
+            dest_x2 = bbox_x1 + local_x2
+            dest_y2 = bbox_y1 + local_y2
+            
+            visible_dest_x1 = max(0, dest_x1)
+            visible_dest_y1 = max(0, dest_y1)
+            visible_dest_x2 = min(img_W, dest_x2)
+            visible_dest_y2 = min(img_H, dest_y2)
+            
+            if visible_dest_x2 <= visible_dest_x1 or visible_dest_y2 <= visible_dest_y1: continue
+                
+            offset_x = visible_dest_x1 - dest_x1
+            offset_y = visible_dest_y1 - dest_y1
+            
+            final_src_x1 = local_x1 + offset_x
+            final_src_y1 = local_y1 + offset_y
+            final_src_x2 = final_src_x1 + (visible_dest_x2 - visible_dest_x1)
+            final_src_y2 = final_src_y1 + (visible_dest_y2 - visible_dest_y1)
+            
+            to_paste = restored_crop[final_src_y1:final_src_y2, final_src_x1:final_src_x2]
+            dest_area = dest_np[i, visible_dest_y1:visible_dest_y2, visible_dest_x1:visible_dest_x2]
+            
+            # 6. Feathering (Mit Masken-Schutz)
+            if feather > 0:
+                h_p, w_p = to_paste.shape[:2]
+                alpha = np.ones((h_p, w_p), dtype=np.float32)
+                
+                f_l = min(feather, w_p//2)
+                f_r = min(feather, w_p//2)
+                f_t = min(feather, h_p//2)
+                f_b = min(feather, h_p//2)
+                
+                do_fade_l = visible_dest_x1 > 0
+                do_fade_r = visible_dest_x2 < img_W
+                do_fade_t = visible_dest_y1 > 0
+                do_fade_b = visible_dest_y2 < img_H
+                
+                if do_fade_l and f_l > 0: alpha[:, :f_l] *= np.linspace(0, 1, f_l)[None, :]
+                if do_fade_r and f_r > 0: alpha[:, -f_r:] *= np.linspace(1, 0, f_r)[None, :]
+                if do_fade_t and f_t > 0: alpha[:f_t, :] *= np.linspace(0, 1, f_t)[:, None]
+                if do_fade_b and f_b > 0: alpha[-f_b:, :] *= np.linspace(1, 0, f_b)[:, None]
+                
+                if restored_mask is not None:
+                    mask_slice = restored_mask[final_src_y1:final_src_y2, final_src_x1:final_src_x2]
+                    alpha = np.maximum(alpha, mask_slice)
+                
+                alpha = alpha[:, :, None]
+                blended = to_paste * alpha + dest_area * (1.0 - alpha)
+                dest_np[i, visible_dest_y1:visible_dest_y2, visible_dest_x1:visible_dest_x2] = blended
+            else:
+                dest_np[i, visible_dest_y1:visible_dest_y2, visible_dest_x1:visible_dest_x2] = to_paste
+                
+        return (torch.from_numpy(dest_np),)
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -16894,6 +17289,8 @@ NODE_CLASS_MAPPINGS = {
     "MaskPositionalJoinerV7": MaskPositionalJoinerV7,
     "MaskPositionalCutterV8": MaskPositionalCutterV8,
     "MaskPositionalJoinerV8": MaskPositionalJoinerV8,
+    "MaskPositionalCutterV9": MaskPositionalCutterV9,
+    "MaskPositionalJoinerV9": MaskPositionalJoinerV9,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -16971,8 +17368,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalJoinerV7": "Mask Positional Joiner V7 (Safe Padding Limit)",
     "MaskPositionalCutterV8": "Mask Positional Cutter V8 (Mask Output)",
     "MaskPositionalJoinerV8": "Mask Positional Joiner V8 (Smart Mask Protect)",
+    "MaskPositionalCutterV9": "Mask Positional Cutter V9 (Smooth & Secure)",
+    "MaskPositionalJoinerV9": "Mask Positional Joiner V9 (Smooth & Secure)",
     
 }
+
 
 
 
