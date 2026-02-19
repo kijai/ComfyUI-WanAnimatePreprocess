@@ -17481,6 +17481,254 @@ class MaskPositionalCutterV10:
                 out_pos, out_neg, out_bbox)
 
 
+# ==============================================================================
+# Node: Mask Positional Cutter V11 (Multi-Pass Gimbal Smooth)
+# ==============================================================================
+
+class MaskPositionalCutterV11:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "mask": ("MASK",), 
+                "padding": ("INT", {"default": 30, "min": 0, "max": 1024, "step": 1, "tooltip": "Sicherheitsrand. Wichtig als Puffer für weiches Smoothing!"}),
+                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 16.0, "step": 0.1, "tooltip": "Zielauflösung in MP."}),
+                "camera_smooth_window": ("INT", {"default": 10, "min": 0, "max": 100, "step": 1, "tooltip": "Wie viele Frames vor/zurück beachtet werden."}),
+                "smoothing_passes": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1, "tooltip": "NEU: Wie oft die Glättung angewendet wird. 3-5 eliminiert Mikroruckler (Gauß-Effekt)."}),
+                "keep_mask_100_percent_inside": (["yes", "no"], {"default": "yes", "tooltip": "Verhindert, dass die Person abgeschnitten wird."}),
+                "background_color": (["black", "white"], {"default": "black", "tooltip": "Füllfarbe am Bildrand."}),
+            },
+            "optional": {
+                "opt_mask": ("MASK",),
+                "opt_positive_points": ("*",), 
+                "opt_negative_points": ("*",),
+                "opt_bboxes": ("*",), 
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "MASK_CUT_INFO_V9", "STRING", "STRING", "STRING", "*", "*", "*")
+    RETURN_NAMES = ("cropped_images", "mask_cutted", "mask_cutted_opt", "cut_info", "trans_pos_json", "trans_neg_json", "trans_bbox_json", "trans_pos_raw", "trans_neg_raw", "trans_bbox_raw")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Masking"
+    DESCRIPTION = "V11: Multi-Pass Smoothing und vorberechnetes Clamping für absolut perfekte, mikrorucklerfreie Gimbal-Kamerafahrten."
+
+    def process(self, images, mask, padding, megapixels, camera_smooth_window, smoothing_passes, keep_mask_100_percent_inside, background_color, opt_mask=None, opt_positive_points=None, opt_negative_points=None, opt_bboxes=None):
+        import cv2
+        import numpy as np
+        import torch
+        import math
+        import json
+        
+        B, H, W, C = images.shape
+        if mask.ndim == 2: mask = mask.unsqueeze(0)
+        if mask.shape[0] < B: mask = mask.repeat(B, 1, 1)
+
+        has_opt_mask = False
+        if opt_mask is not None:
+            has_opt_mask = True
+            if opt_mask.ndim == 2: opt_mask = opt_mask.unsqueeze(0)
+            if opt_mask.shape[0] < B: opt_mask = opt_mask.repeat(B, 1, 1)
+        
+        # --- 1. Positionen und Maximal-Größen sammeln ---
+        raw_centers = []
+        mask_bounds = [] 
+        
+        global_max_w = 0
+        global_max_h = 0
+        
+        for i in range(B):
+            m = mask[i].cpu().numpy()
+            y_indices, x_indices = np.nonzero(m > 0.5)
+            if len(y_indices) == 0:
+                raw_centers.append(None)
+                mask_bounds.append(None)
+            else:
+                x1, x2 = x_indices.min(), x_indices.max()
+                y1, y2 = y_indices.min(), y_indices.max()
+                w = x2 - x1
+                h = y2 - y1
+                
+                if w > global_max_w: global_max_w = w
+                if h > global_max_h: global_max_h = h
+                
+                cx = x1 + w / 2.0
+                cy = y1 + h / 2.0
+                raw_centers.append((cx, cy))
+                mask_bounds.append((x1, y1, x2, y2))
+
+        if global_max_w == 0: global_max_w = 128
+        if global_max_h == 0: global_max_h = 128
+        
+        box_w = int(global_max_w + (padding * 2))
+        box_h = int(global_max_h + (padding * 2))
+        
+        valid_centers = []
+        last_valid = (W/2.0, H/2.0)
+        for c in raw_centers:
+            if c is not None:
+                last_valid = c
+                break
+        for c in raw_centers:
+            if c is not None: last_valid = c
+            valid_centers.append(last_valid)
+
+        # --- 2. PRE-CLAMPING (Die harte Masken-Garantie ZUERST) ---
+        # Wir zwingen die unruhigen Center in die Masken-Box, bevor wir glätten!
+        pre_smoothed_centers = []
+        for i in range(B):
+            cx, cy = valid_centers[i]
+            if keep_mask_100_percent_inside == "yes" and mask_bounds[i] is not None:
+                x1, y1, x2, y2 = mask_bounds[i]
+                
+                # Wie viel darf der Center wackeln, ohne dass die Maske den Rahmen verlässt?
+                min_cx = x2 - box_w / 2.0
+                max_cx = x1 + box_w / 2.0
+                min_cy = y2 - box_h / 2.0
+                max_cy = y1 + box_h / 2.0
+                
+                if min_cx <= max_cx: cx = max(min_cx, min(max_cx, cx))
+                if min_cy <= max_cy: cy = max(min_cy, min(max_cy, cy))
+            
+            pre_smoothed_centers.append((cx, cy))
+
+        # --- 3. MULTI-PASS SMOOTHING (Der Gimbal-Gauß-Effekt gegen Mikroruckler) ---
+        # Jetzt machen wir die Route absolut butterweich.
+        smoothed_centers = pre_smoothed_centers.copy()
+        if camera_smooth_window > 0:
+            pad_w = camera_smooth_window
+            for _ in range(smoothing_passes):
+                temp_centers = []
+                for i in range(B):
+                    start = max(0, i - pad_w)
+                    end = min(B, i + pad_w + 1)
+                    window = smoothed_centers[start:end]
+                    avg_cx = sum(c[0] for c in window) / len(window)
+                    avg_cy = sum(c[1] for c in window) / len(window)
+                    temp_centers.append((avg_cx, avg_cy))
+                smoothed_centers = temp_centers
+
+        # --- 4. Zielauflösung berechnen ---
+        target_pixel_count = megapixels * 1_000_000
+        aspect_ratio = box_w / box_h
+        target_h_float = math.sqrt(target_pixel_count / aspect_ratio)
+        target_w_float = target_h_float * aspect_ratio
+        target_w = int(round(target_w_float / 8) * 8)
+        target_h = int(round(target_h_float / 8) * 8)
+        target_w = max(64, target_w)
+        target_h = max(64, target_h)
+        
+        scale_x = target_w / float(box_w)
+        scale_y = target_h / float(box_h)
+        
+        img_bg_val = 0.0 if background_color == "black" else 1.0
+        mask_bg_val = 0.0
+        
+        def get_item_safe(idx, data):
+            if data is None: return None
+            if isinstance(data, str):
+                try: data = json.loads(data)
+                except: pass
+            if isinstance(data, (list, tuple)):
+                if len(data) == 0: return None
+                return data[idx] if idx < len(data) else data[-1]
+            if hasattr(data, "shape"):
+                if data.shape[0] == 0: return None
+                return data[idx] if idx < data.shape[0] else data[-1]
+            return data
+
+        def transform_coords_affine(coords, t_x, t_y, sx, sy, limit_w, limit_h, is_bbox=False):
+            if coords is None: return []
+            is_tensor = hasattr(coords, "cpu")
+            if is_tensor: pts = coords.cpu().numpy()
+            else: pts = np.array(coords)
+            if pts.size == 0 or pts.ndim == 0: return []
+            new_pts = []
+            if is_bbox:
+                if pts.ndim == 1 and len(pts) == 4: pts = pts.reshape(1, 4)
+                elif pts.ndim == 1: return []
+                for b in pts:
+                    if len(b) < 4: continue
+                    nx1, ny1 = b[0]*sx + t_x, b[1]*sy + t_y
+                    nx2, ny2 = b[2]*sx + t_x, b[3]*sy + t_y
+                    nx1, ny1 = max(0, min(limit_w, nx1)), max(0, min(limit_h, ny1))
+                    nx2, ny2 = max(0, min(limit_w, nx2)), max(0, min(limit_h, ny2))
+                    if nx2>nx1 and ny2>ny1: new_pts.append([float(nx1), float(ny1), float(nx2), float(ny2)])
+            else:
+                if pts.ndim == 1 and len(pts) == 2: pts = pts.reshape(1, 2)
+                elif pts.ndim == 1: return []
+                for p in pts:
+                    if len(p) < 2: continue
+                    nx, ny = p[0]*sx + t_x, p[1]*sy + t_y
+                    if 0<=nx<limit_w and 0<=ny<limit_h: new_pts.append([float(nx), float(ny)])
+            return new_pts
+
+        cropped_images, cropped_masks, cropped_opt_masks = [], [], []
+        cut_infos, out_pos, out_neg, out_bbox = [], [], [], []
+
+        for i in range(B):
+            img = images[i].cpu().numpy()
+            msk = mask[i].cpu().numpy()
+            
+            cx, cy = smoothed_centers[i]
+            
+            # Sub-Pixel Verschiebungs-Matrix für cv2.warpAffine
+            t_x = (target_w / 2.0) - (cx * scale_x)
+            t_y = (target_h / 2.0) - (cy * scale_y)
+            
+            M = np.array([[scale_x, 0, t_x], [0, scale_y, t_y]], dtype=np.float64)
+            
+            # Wunderschöner Sub-Pixel Warp
+            final_img = cv2.warpAffine(img, M, (target_w, target_h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=(img_bg_val,)*C)
+            cropped_images.append(final_img)
+            
+            final_mask = cv2.warpAffine(msk, M, (target_w, target_h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=mask_bg_val)
+            final_mask = np.clip(final_mask, 0.0, 1.0)
+            cropped_masks.append(final_mask)
+            
+            if has_opt_mask:
+                o_msk = opt_mask[i].cpu().numpy()
+                final_opt = cv2.warpAffine(o_msk, M, (target_w, target_h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=mask_bg_val)
+                cropped_opt_masks.append(np.clip(final_opt, 0.0, 1.0))
+            
+            curr_pos = get_item_safe(i, opt_positive_points)
+            curr_neg = get_item_safe(i, opt_negative_points)
+            curr_box = get_item_safe(i, opt_bboxes)
+            out_pos.append(transform_coords_affine(curr_pos, t_x, t_y, scale_x, scale_y, target_w, target_h, False))
+            out_neg.append(transform_coords_affine(curr_neg, t_x, t_y, scale_x, scale_y, target_w, target_h, False))
+            out_bbox.append(transform_coords_affine(curr_box, t_x, t_y, scale_x, scale_y, target_w, target_h, True))
+
+            int_x1 = int(round(cx - box_w / 2.0))
+            int_y1 = int(round(cy - box_h / 2.0))
+            int_x2 = int_x1 + box_w
+            int_y2 = int_y1 + box_h
+            
+            pad_l, pad_t = max(0, -int_x1), max(0, -int_y1)
+            pad_r, pad_b = max(0, int_x2 - W), max(0, int_y2 - H)
+
+            info = {
+                "bbox": (int_x1, int_y1, int_x2, int_y2),
+                "crop_shape": (box_w, box_h),
+                "target_shape": (target_w, target_h), 
+                "original_shape": (W, H),
+                "padding_borders": (pad_l, pad_t, pad_r, pad_b),
+                "initial_padding": padding
+            }
+            cut_infos.append(info)
+            
+        cropped_tensor = torch.from_numpy(np.stack(cropped_images, 0))
+        mask_tensor = torch.from_numpy(np.stack(cropped_masks, 0))
+        opt_mask_tensor = torch.from_numpy(np.stack(cropped_opt_masks, 0)) if has_opt_mask else torch.zeros((B, target_h, target_w), dtype=torch.float32)
+        
+        def to_json_str(d):
+            if not d: return ""
+            try: return json.dumps(d)
+            except: return ""
+
+        return (cropped_tensor, mask_tensor, opt_mask_tensor, cut_infos, 
+                to_json_str(out_pos), to_json_str(out_neg), to_json_str(out_bbox), 
+                out_pos, out_neg, out_bbox)
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -17559,6 +17807,7 @@ NODE_CLASS_MAPPINGS = {
     "MaskPositionalCutterV9": MaskPositionalCutterV9,
     "MaskPositionalJoinerV9": MaskPositionalJoinerV9,
     "MaskPositionalCutterV10": MaskPositionalCutterV10,
+    "MaskPositionalCutterV11": MaskPositionalCutterV11,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -17639,8 +17888,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalCutterV9": "Mask Positional Cutter V9 (Smooth & Secure)",
     "MaskPositionalJoinerV9": "Mask Positional Joiner V9 (Smooth & Secure)",
     "MaskPositionalCutterV10": "Mask Positional Cutter V10 (Sub-Pixel Anti-Jitter)",
+    "MaskPositionalCutterV11": "Mask Positional Cutter V11 (Ultimate Anti-Jitter)",
     
 }
+
 
 
 
