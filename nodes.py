@@ -19317,6 +19317,75 @@ class MaskPositionalJoinerV18:
             
         return (torch.from_numpy(dest_np),)
 
+# ==============================================================================
+# Node: Wan Video Synchronizer (Frame Fixer & Overlap Remover)
+# ==============================================================================
+
+class WanVideoSynchronizer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "expected_length": ("INT", {"default": 16, "min": 1, "max": 1024, "step": 1, "tooltip": "Wie viele Frames sollte WanAnimate eigentlich generieren? (Meistens 16)"}),
+                "overlap_drop": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1, "tooltip": "Wie viele Frames sollen am ANFANG gelöscht werden (um Overlap-Stottern zu verhindern)? Beim First-Pass auf 0 lassen, im Loop auf deinen Overlap-Wert stellen."}),
+                "index_from_end": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1, "tooltip": "Welcher Frame soll verdoppelt/gelöscht werden, wenn die Länge nicht stimmt? (0 = Letzter Frame)"}),
+            },
+            "optional": {
+                "opt_mask": ("MASK", {"tooltip": "Falls du eine Maske hast, schließe sie hier an, damit sie synchron zum Bild geschnitten wird."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("synced_images", "synced_mask")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Sync"
+    DESCRIPTION = "Repariert Frame-Drops von WanAnimate und schneidet Overlap-Frames sauber ab, BEVOR das Video zusammengefügt wird."
+
+    def process(self, images, expected_length, overlap_drop, index_from_end, opt_mask=None):
+        import torch
+
+        img_list = [img for img in images]
+        mask_list = [m for m in opt_mask] if opt_mask is not None else None
+
+        # 1. Ziel-Länge berechnen (Was nach dem Overlap-Drop übrig bleiben MUSS)
+        target_len = max(1, expected_length - overlap_drop)
+
+        # 2. Overlap abschneiden (Am Anfang der Liste)
+        if overlap_drop > 0:
+            # Sicherheitshalber: Nicht mehr abschneiden, als da ist
+            safe_drop = min(overlap_drop, len(img_list) - 1)
+            img_list = img_list[safe_drop:]
+            if mask_list is not None:
+                mask_list = mask_list[safe_drop:]
+
+        # 3. Synchronisieren (Falls WanAnimate Frames verschluckt oder addiert hat)
+        def fix_list(lst, t_len, is_tensor=True):
+            # Zu lang? -> Löschen
+            while len(lst) > t_len:
+                idx = max(0, len(lst) - 1 - index_from_end)
+                lst.pop(idx)
+            # Zu kurz? -> Verdoppeln
+            while len(lst) < t_len:
+                idx = max(0, len(lst) - 1 - index_from_end)
+                lst.insert(idx, lst[idx].clone() if is_tensor else lst[idx].copy())
+
+        fix_list(img_list, target_len, True)
+        if mask_list is not None:
+            fix_list(mask_list, target_len, True)
+
+        # Wieder zu ComfyUI Tensoren machen
+        out_img = torch.stack(img_list)
+        
+        if mask_list is not None:
+            out_mask = torch.stack(mask_list)
+        else:
+            # Dummy Maske zurückgeben, damit ComfyUI nicht meckert
+            out_mask = torch.zeros((1, out_img.shape[1], out_img.shape[2]), dtype=torch.float32)
+
+        return (out_img, out_mask)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -19406,6 +19475,8 @@ NODE_CLASS_MAPPINGS = {
     "MaskPositionalJoinerV16": MaskPositionalJoinerV16,
     "WanFrameSyncSettingsV4": WanFrameSyncSettingsV4,
     "MaskPositionalJoinerV18": MaskPositionalJoinerV18,
+    "WanVideoSynchronizer": WanVideoSynchronizer,
+    
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -19497,8 +19568,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalJoinerV16": "Mask Positional Joiner V16 (Dual Input Auto-Sync)",
     "WanFrameSyncSettingsV4": "Wan Frame Sync Settings V4",
     "MaskPositionalJoinerV18": "Mask Positional Joiner V18 (Overlap Killer)",
+    "WanVideoSynchronizer": "Wan Video Synchronizer",
     
 }
+
 
 
 
