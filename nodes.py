@@ -19083,6 +19083,240 @@ class MaskPositionalJoinerV16:
         return (torch.from_numpy(dest_np),)
 
 
+# ==============================================================================
+# Node: Wan Frame Sync Settings V4 (Mit Overlap Drop)
+# ==============================================================================
+
+class WanFrameSyncSettingsV4:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "target_sequence": (["Foreground (Wan Output)", "Background (Source)"], {"default": "Foreground (Wan Output)", "tooltip": "Welches Video soll manipuliert werden, falls die Längen abweichen?"}),
+                "index_from_end": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1, "tooltip": "0 = letzter Frame, 1 = vorletzter Frame, etc."}),
+                "current_iteration": ("INT", {"default": 0, "min": 0, "max": 9999, "step": 1, "tooltip": "Dein Loop-Index (0 für den ersten Durchgang)."}),
+                "expected_len_first_pass": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1, "tooltip": "Ziellänge für den 1. Durchgang. Bei 0 = Auto-Sync."}),
+                "expected_len_loop_pass": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1, "tooltip": "Ziellänge für Loop-Durchgänge. Bei 0 = Auto-Sync."}),
+                "overlap_drop_frames": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1, "tooltip": "Schneidet am ANFANG von Loop-Chunks (Iteration > 0) diese Menge an Frames ab, um doppelte Overlaps zu verhindern."}),
+            }
+        }
+
+    RETURN_TYPES = ("FRAME_SYNC_SETTINGS",)
+    RETURN_NAMES = ("sync_settings",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Masking"
+    DESCRIPTION = "Steuert Längen, Drop-Indizes und das Abschneiden von Overlap-Frames."
+
+    def process(self, target_sequence, index_from_end, current_iteration, expected_len_first_pass, expected_len_loop_pass, overlap_drop_frames):
+        settings = {
+            "target": target_sequence,
+            "idx_from_end": index_from_end,
+            "iteration": current_iteration,
+            "exp_len_first": expected_len_first_pass,
+            "exp_len_loop": expected_len_loop_pass,
+            "overlap_drop": overlap_drop_frames
+        }
+        return (settings,)
+
+
+# ==============================================================================
+# Node: Mask Positional Joiner V18 (Overlap Drop & Smart Sync)
+# ==============================================================================
+
+class MaskPositionalJoinerV18:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "destination_images": ("IMAGE",),
+                "processed_images": ("IMAGE",),
+                "cut_info": ("MASK_CUT_INFO_V14",), # Akzeptiert V14 Cutter Info
+                "feather": ("INT", {"default": 10, "min": 0, "max": 256, "step": 1}),
+                "padding_minus": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1}),
+            },
+            "optional": {
+                "opt_mask_cutted": ("MASK",),
+                "sync_settings": ("FRAME_SYNC_SETTINGS",), # HIER die V4 Settings anstecken
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("joined_images",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Masking"
+    DESCRIPTION = "V18: Beherrscht Context-Overlap. Schneidet doppelte Frames automatisch ab und synchronisiert Längen."
+
+    def process(self, destination_images, processed_images, cut_info, feather, padding_minus, opt_mask_cutted=None, sync_settings=None):
+        import cv2
+        import numpy as np
+        import torch
+        import math
+        
+        dest_list = [img for img in destination_images]
+        proc_list = [img for img in processed_images]
+        mask_list = [m for m in opt_mask_cutted] if opt_mask_cutted is not None else None
+        cut_list = list(cut_info)
+        
+        # --- 1. FRAME SYNCHRONIZATION (Längen-Ausgleich am Ende) ---
+        if sync_settings:
+            target_name = sync_settings["target"]
+            idx_from_end = sync_settings["idx_from_end"]
+            iteration = sync_settings["iteration"]
+            overlap_drop = sync_settings["overlap_drop"]
+            
+            if iteration == 0:
+                exp_len = sync_settings["exp_len_first"]
+            else:
+                exp_len = sync_settings["exp_len_loop"]
+                
+            def fix_list(lst, t_len, is_tensor=True):
+                while len(lst) > t_len:
+                    idx = max(0, len(lst) - 1 - idx_from_end)
+                    lst.pop(idx)
+                while len(lst) < t_len:
+                    idx = max(0, len(lst) - 1 - idx_from_end)
+                    lst.insert(idx, lst[idx].clone() if is_tensor else lst[idx].copy())
+            
+            if exp_len > 0:
+                fix_list(dest_list, exp_len, True)
+                fix_list(proc_list, exp_len, True)
+                fix_list(cut_list, exp_len, False)
+                if mask_list is not None: fix_list(mask_list, exp_len, True)
+            else:
+                if len(dest_list) != len(proc_list):
+                    if target_name == "Foreground (Wan Output)":
+                        t_len = len(dest_list)
+                        fix_list(proc_list, t_len, True)
+                        if mask_list is not None: fix_list(mask_list, t_len, True)
+                    else:
+                        t_len = len(proc_list)
+                        fix_list(dest_list, t_len, True)
+                        fix_list(cut_list, t_len, False)
+
+            # --- 2. OVERLAP DROP (Schneidet den Anfang ab, außer bei Iteration 0) ---
+            if iteration > 0 and overlap_drop > 0:
+                # Verhindert Crash, falls overlap_drop größer als die Liste ist
+                safe_drop = min(overlap_drop, len(dest_list) - 1) 
+                
+                dest_list = dest_list[safe_drop:]
+                proc_list = proc_list[safe_drop:]
+                cut_list = cut_list[safe_drop:]
+                if mask_list is not None:
+                    mask_list = mask_list[safe_drop:]
+
+        # --- 3. Zurück zu Arrays/Tensoren ---
+        dest_np = torch.stack(dest_list).cpu().numpy()
+        proc_np = torch.stack(proc_list).cpu().numpy()
+        if mask_list is not None: opt_mask_cutted = torch.stack(mask_list)
+        else: opt_mask_cutted = None
+            
+        B_dest = len(dest_np)
+        B_proc = len(proc_np)
+        
+        # --- 4. Joiner Logik (Sub-Pixel Matrix) ---
+        for i in range(B_dest):
+            if i >= len(cut_list): break
+            info = cut_list[i]
+            
+            proc_idx = i % B_proc
+            proc_img = proc_np[proc_idx]
+            
+            curr_h, curr_w = proc_img.shape[:2]       
+            dest_h, dest_w = dest_np[i].shape[:2]     
+            
+            cx, cy = info["cx"], info["cy"]
+            box_w, box_h = info["crop_shape"]
+            img_W, img_H = info["original_shape"]
+            
+            bg_scale_x = float(dest_w) / float(img_W)
+            bg_scale_y = float(dest_h) / float(img_H)
+            
+            cx_bg = cx * bg_scale_x
+            cy_bg = cy * bg_scale_y
+            box_w_bg = box_w * bg_scale_x
+            box_h_bg = box_h * bg_scale_y
+            
+            fg_scale_x = float(curr_w) / box_w_bg
+            fg_scale_y = float(curr_h) / box_h_bg
+            
+            M_inv = np.array([
+                [1.0 / fg_scale_x, 0, cx_bg - box_w_bg / 2.0],
+                [0, 1.0 / fg_scale_y, cy_bg - box_h_bg / 2.0]
+            ], dtype=np.float64)
+            
+            pm_scale_x = float(curr_w) / float(box_w)
+            pm_scale_y = float(curr_h) / float(box_h)
+            
+            pm_x = padding_minus * pm_scale_x
+            pm_y = padding_minus * pm_scale_y
+            
+            safe_pm_l = safe_pm_r = pm_x
+            safe_pm_t = safe_pm_b = pm_y
+            
+            msk_img = None
+            if opt_mask_cutted is not None:
+                raw_msk = opt_mask_cutted[proc_idx].cpu().numpy()
+                if raw_msk.shape[:2] != (curr_h, curr_w):
+                    msk_img = cv2.resize(raw_msk, (curr_w, curr_h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    msk_img = raw_msk
+                    
+                y_ind, x_ind = np.nonzero(msk_img > 0.1)
+                if len(y_ind) > 0:
+                    m_x1, m_x2 = x_ind.min(), x_ind.max()
+                    m_y1, m_y2 = y_ind.min(), y_ind.max()
+                    safe_pm_l = min(pm_x, m_x1)
+                    safe_pm_r = min(pm_x, curr_w - m_x2)
+                    safe_pm_t = min(pm_y, m_y1)
+                    safe_pm_b = min(pm_y, curr_h - m_y2)
+                else:
+                    safe_pm_l = safe_pm_r = safe_pm_t = safe_pm_b = 0
+            
+            alpha = np.zeros((curr_h, curr_w), dtype=np.float32)
+            
+            start_x = int(math.floor(safe_pm_l))
+            end_x = int(math.ceil(curr_w - safe_pm_r))
+            start_y = int(math.floor(safe_pm_t))
+            end_y = int(math.ceil(curr_h - safe_pm_b))
+            
+            if end_x > start_x and end_y > start_y:
+                alpha[start_y:end_y, start_x:end_x] = 1.0
+                
+                if feather > 0:
+                    f_x = int(feather * pm_scale_x)
+                    f_y = int(feather * pm_scale_y)
+                    
+                    dist_l = cx_bg - box_w_bg/2.0
+                    dist_r = dest_w - (cx_bg + box_w_bg/2.0)
+                    dist_t = cy_bg - box_h_bg/2.0
+                    dist_b = dest_h - (cy_bg + box_h_bg/2.0)
+                    
+                    do_fade_l = (dist_l > 0.5) or (start_x > 0)
+                    do_fade_r = (dist_r > 0.5) or (end_x < curr_w)
+                    do_fade_t = (dist_t > 0.5) or (start_y > 0)
+                    do_fade_b = (dist_b > 0.5) or (end_y < curr_h)
+                    
+                    f_l = min(f_x, (end_x - start_x)//2)
+                    f_r = min(f_x, (end_x - start_x)//2)
+                    f_t = min(f_y, (end_y - start_y)//2)
+                    f_b = min(f_y, (end_y - start_y)//2)
+                    
+                    if do_fade_l and f_l > 0: alpha[start_y:end_y, start_x:start_x+f_l] *= np.linspace(0, 1, f_l)[None, :]
+                    if do_fade_r and f_r > 0: alpha[start_y:end_y, end_x-f_r:end_x] *= np.linspace(1, 0, f_r)[None, :]
+                    if do_fade_t and f_t > 0: alpha[start_y:start_y+f_t, start_x:end_x] *= np.linspace(0, 1, f_t)[:, None]
+                    if do_fade_b and f_b > 0: alpha[end_y-f_b:end_y, start_x:end_x] *= np.linspace(1, 0, f_b)[:, None]
+            
+            if msk_img is not None:
+                alpha = np.maximum(alpha, msk_img)
+            
+            warped_proc = cv2.warpAffine(proc_img, M_inv, (dest_w, dest_h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0))
+            warped_alpha = cv2.warpAffine(alpha, M_inv, (dest_w, dest_h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+            
+            warped_alpha = warped_alpha[:, :, None]
+            dest_np[i] = warped_proc * warped_alpha + dest_np[i] * (1.0 - warped_alpha)
+            
+        return (torch.from_numpy(dest_np),)
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -19170,6 +19404,8 @@ NODE_CLASS_MAPPINGS = {
     "MaskPositionalJoinerV14": MaskPositionalJoinerV14,
     "WanFrameSyncSettingsV2": WanFrameSyncSettingsV2,
     "MaskPositionalJoinerV16": MaskPositionalJoinerV16,
+    "WanFrameSyncSettingsV4": WanFrameSyncSettingsV4,
+    "MaskPositionalJoinerV18": MaskPositionalJoinerV18,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -19259,8 +19495,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalJoinerV14": "Mask Positional Joiner V14 (Total Size Agnostic)",
     "WanFrameSyncSettingsV2": "Wan Frame Sync Settings V2",
     "MaskPositionalJoinerV16": "Mask Positional Joiner V16 (Dual Input Auto-Sync)",
+    "WanFrameSyncSettingsV4": "Wan Frame Sync Settings V4",
+    "MaskPositionalJoinerV18": "Mask Positional Joiner V18 (Overlap Killer)",
     
 }
+
 
 
 
