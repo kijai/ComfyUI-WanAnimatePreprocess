@@ -15558,6 +15558,305 @@ class MaskPositionalJoinerV21:
             
         return (torch.from_numpy(dest_np),)
 
+
+class PoseDataHipHandDebugV3:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "hip_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.01, "tooltip": "Skaliert die Hüftbreite."}),
+                "auto_hand_adjust": ("BOOLEAN", {"default": True, "tooltip": "Wenn an, bewegen sich die Hände automatisch mit der Hüfte mit."}),
+                "move_elbows": ("BOOLEAN", {"default": True, "tooltip": "Wenn an, werden auch die Ellbogen verschoben."}),
+                "hand_offset_px": ("FLOAT", {"default": 0.0, "min": -500.0, "max": 500.0, "step": 1.0, "tooltip": "Manueller Zusatz-Offset für die Hände in Pixeln."}),
+                "hand_offset_norm": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "Manueller Zusatz-Offset für die Hände normiert."}),
+                "elbow_offset_px": ("FLOAT", {"default": 0.0, "min": -500.0, "max": 500.0, "step": 1.0, "tooltip": "Manueller Zusatz-Offset für die Ellbogen in Pixeln."}),
+                "elbow_offset_norm": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "Manueller Zusatz-Offset für die Ellbogen normiert."}),
+                "smooth_hand_entry": ("BOOLEAN", {"default": True, "tooltip": "Verhindert Sprünge, wenn die Hand die Hüfthöhe passiert."}),
+                "smooth_threshold": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 0.5, "step": 0.01}),
+                "person_index": ("INT", {"default": -1, "min": -1, "max": 9999, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Debug"
+    DESCRIPTION = "V3: Zusätzliche Ellbogen-Offsets und normierte Offsets (mit 2 Nachkommastellen)."
+
+    def process(self, pose_data, hip_scale, auto_hand_adjust, move_elbows, hand_offset_px, hand_offset_norm, elbow_offset_px, elbow_offset_norm, smooth_hand_entry, smooth_threshold, person_index):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+
+        indices = (
+            [person_index]
+            if isinstance(person_index, int) and person_index >= 0 and person_index < len(pose_metas)
+            else list(range(len(pose_metas)))
+        )
+
+        for idx in indices:
+            if pose_metas[idx] is not None:
+                self._apply_hip_logic(
+                    pose_metas[idx], hip_scale, auto_hand_adjust, move_elbows, 
+                    hand_offset_px, hand_offset_norm, elbow_offset_px, elbow_offset_norm,
+                    smooth_hand_entry, smooth_threshold
+                )
+
+        return (pose_data_copy,)
+
+    def _apply_hip_logic(self, meta, hip_scale, auto_hand_adjust, move_elbows, hand_offset_px, hand_offset_norm, elbow_offset_px, elbow_offset_norm, smooth_hand_entry, smooth_threshold):
+        body_arr = getattr(meta, "kps_body", None)
+        width = getattr(meta, "width", 1024)
+        height = getattr(meta, "height", 1024)
+
+        if body_arr is None:
+            return
+
+        if 8 >= len(body_arr) or 11 >= len(body_arr):
+            return
+
+        hip_r_orig = self._extract_coords(body_arr[8])
+        hip_l_orig = self._extract_coords(body_arr[11])
+
+        if hip_r_orig is None or hip_l_orig is None:
+            return
+
+        center_x = (hip_r_orig[0] + hip_l_orig[0]) / 2.0
+
+        dist_r = hip_r_orig[0] - center_x
+        new_hip_r_x = center_x + (dist_r * hip_scale)
+        self._assign_point(body_arr, 8, new_hip_r_x, hip_r_orig[1])
+
+        dist_l = hip_l_orig[0] - center_x
+        new_hip_l_x = center_x + (dist_l * hip_scale)
+        self._assign_point(body_arr, 11, new_hip_l_x, hip_l_orig[1])
+
+        delta_right = 0.0
+        delta_left = 0.0
+
+        if auto_hand_adjust:
+            delta_right = new_hip_r_x - hip_r_orig[0]
+            delta_left = new_hip_l_x - hip_l_orig[0]
+
+        actual_hand_offset = float(hand_offset_px) + (float(hand_offset_norm) * float(width))
+        actual_elbow_offset = float(elbow_offset_px) + (float(elbow_offset_norm) * float(width))
+
+        base_shift_right = delta_right - actual_hand_offset
+        base_shift_left = delta_left + actual_hand_offset
+
+        factor_right = 1.0
+        if smooth_hand_entry and 4 < len(body_arr):
+            wrist_coords = self._extract_coords(body_arr[4])
+            hip_y = hip_r_orig[1]
+            if wrist_coords is not None and hip_y > 0:
+                wrist_y = wrist_coords[1]
+                safe_zone_px = float(height) * float(smooth_threshold)
+                start_transition_y = hip_y - safe_zone_px
+
+                if wrist_y < start_transition_y:
+                    factor_right = 0.0
+                elif wrist_y >= hip_y:
+                    factor_right = 1.0
+                else:
+                    if safe_zone_px > 0:
+                        progress = (wrist_y - start_transition_y) / safe_zone_px
+                        factor_right = max(0.0, min(1.0, progress))
+
+        factor_left = 1.0
+        if smooth_hand_entry and 7 < len(body_arr):
+            wrist_coords = self._extract_coords(body_arr[7])
+            hip_y = hip_l_orig[1]
+            if wrist_coords is not None and hip_y > 0:
+                wrist_y = wrist_coords[1]
+                safe_zone_px = float(height) * float(smooth_threshold)
+                start_transition_y = hip_y - safe_zone_px
+
+                if wrist_y < start_transition_y:
+                    factor_left = 0.0
+                elif wrist_y >= hip_y:
+                    factor_left = 1.0
+                else:
+                    if safe_zone_px > 0:
+                        progress = (wrist_y - start_transition_y) / safe_zone_px
+                        factor_left = max(0.0, min(1.0, progress))
+
+        final_shift_right = base_shift_right * factor_right
+        final_shift_left = base_shift_left * factor_left
+
+        if 4 < len(body_arr):
+            self._shift_point_x(body_arr, 4, final_shift_right)
+        if hasattr(meta, "kps_rhand") and meta.kps_rhand is not None:
+            for i in range(len(meta.kps_rhand)):
+                self._shift_point_x(meta.kps_rhand, i, final_shift_right)
+
+        if 7 < len(body_arr):
+            self._shift_point_x(body_arr, 7, final_shift_left)
+        if hasattr(meta, "kps_lhand") and meta.kps_lhand is not None:
+            for i in range(len(meta.kps_lhand)):
+                self._shift_point_x(meta.kps_lhand, i, final_shift_left)
+
+        # Ellbogen verschieben (3 und 6)
+        if move_elbows or actual_elbow_offset != 0.0:
+            elbow_shift_right = (final_shift_right if move_elbows else 0.0) - actual_elbow_offset
+            elbow_shift_left = (final_shift_left if move_elbows else 0.0) + actual_elbow_offset
+
+            if 3 < len(body_arr):
+                self._shift_point_x(body_arr, 3, elbow_shift_right)
+            if 6 < len(body_arr):
+                self._shift_point_x(body_arr, 6, elbow_shift_left)
+
+    def _extract_coords(self, point):
+        if point is None: return None
+        if isinstance(point, np.ndarray): return point
+        if isinstance(point, list) and len(point) >= 2: return point
+        if isinstance(point, tuple) and len(point) >= 2: return list(point)
+        return None
+
+    def _assign_point(self, arr, idx, x, y):
+        if idx < len(arr) and arr[idx] is not None:
+            if isinstance(arr[idx], np.ndarray):
+                arr[idx][0] = x
+                arr[idx][1] = y
+            elif isinstance(arr[idx], list):
+                arr[idx][0] = x
+                arr[idx][1] = y
+            elif isinstance(arr[idx], tuple):
+                tmp = list(arr[idx])
+                tmp[0] = x
+                tmp[1] = y
+                arr[idx] = tuple(tmp)
+
+    def _shift_point_x(self, arr, idx, shift_x):
+        if idx < len(arr) and arr[idx] is not None:
+            if isinstance(arr[idx], np.ndarray):
+                arr[idx][0] += shift_x
+            elif isinstance(arr[idx], list):
+                arr[idx][0] += shift_x
+            elif isinstance(arr[idx], tuple):
+                tmp = list(arr[idx])
+                tmp[0] += shift_x
+                arr[idx] = tuple(tmp)
+
+
+class PoseDataToMaskV2:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1}),
+                "stick_width": ("INT", {
+                    "default": 10, "min": 1, "max": 300, "step": 1, 
+                    "display": "slider", "slider_max": 200
+                }),
+                "head_circle_px": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0, "step": 1.0, "tooltip": "Fester Radius für den Kopfkreis in Pixeln."}),
+                "head_circle_norm": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Normierter Radius relativ zur Schulterbreite (passt sich pro Frame dynamisch an)."}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Erstellt Maske (V2). Füllt Körper & Stirn. Fügt optional einen Kreis für den Kopf hinzu."
+
+    def process(self, pose_data, width, height, stick_width, head_circle_px, head_circle_norm):
+        pose_metas = pose_data["pose_metas"]
+        mask_list = []
+        last_valid_mask = np.zeros((height, width), dtype=np.float32)
+
+        for meta in pose_metas:
+            kps = meta.kps_body
+            scores = meta.kps_body_p
+
+            def get_pt(idx):
+                if idx < len(scores) and scores[idx] > 0.3:
+                    return (int(kps[idx][0]), int(kps[idx][1]))
+                return None
+
+            p_lsh, p_rsh = get_pt(5), get_pt(2)
+            if p_lsh and p_rsh:
+                canvas = np.zeros((height, width, 3), dtype=np.uint8)
+                p_lhip, p_rhip = get_pt(11), get_pt(8)
+                
+                # 1. TORSO
+                if p_lhip and p_rhip:
+                    pts_torso = np.array([p_lsh, p_rsh, p_rhip, p_lhip], np.int32)
+                    cv2.fillPoly(canvas, [pts_torso], (255, 255, 255))
+                else:
+                    p_r_bottom = (p_rsh[0], height)
+                    p_l_bottom = (p_lsh[0], height)
+                    pts_torso = np.array([p_lsh, p_rsh, p_r_bottom, p_l_bottom], np.int32)
+                    cv2.fillPoly(canvas, [pts_torso], (255, 255, 255))
+
+                # 2. KOPF & STIRN (Basis-Polygon)
+                head_pts = []
+                p_nose = get_pt(0)
+                p_lear = get_pt(17) or get_pt(15)
+                p_rear = get_pt(16) or get_pt(14)
+                
+                if p_nose: head_pts.append(p_nose)
+                if p_lear: head_pts.append(p_lear)
+                head_pts.append(p_lsh)
+                head_pts.append(p_rsh)
+                if p_rear: head_pts.append(p_rear)
+
+                if len(head_pts) >= 3:
+                    pts_head = np.array(head_pts, np.int32)
+                    cv2.fillPoly(canvas, [pts_head], (255, 255, 255))
+
+                # Stirn-Rechteck
+                if p_lear and p_rear:
+                    eye_y = (p_lear[1] + p_rear[1]) / 2
+                    shoulder_y = (p_lsh[1] + p_rsh[1]) / 2
+                    dist_head_shoulder = abs(shoulder_y - eye_y)
+                    forehead_height = int(dist_head_shoulder * 0.65)
+
+                    x_min = min(p_lear[0], p_rear[0])
+                    x_max = max(p_lear[0], p_rear[0])
+
+                    y_bottom = int(eye_y)
+                    y_top = int(eye_y - forehead_height)
+
+                    pt1 = (x_min, y_bottom)
+                    pt2 = (x_max, y_bottom)
+                    pt3 = (x_max, y_top)
+                    pt4 = (x_min, y_top)
+                    pts_forehead = np.array([pt1, pt2, pt3, pt4], np.int32)
+                    
+                    cv2.fillPoly(canvas, [pts_forehead], (255, 255, 255))
+
+                # --- 3. KREIS FÜR DEN KOPF (V2 FEATURE) ---
+                if head_circle_px > 0 or head_circle_norm > 0:
+                    center_x, center_y = None, None
+                    if p_lear and p_rear:
+                        center_x = int((p_lear[0] + p_rear[0]) / 2)
+                        center_y = int((p_lear[1] + p_rear[1]) / 2)
+                    elif p_nose:
+                        center_x, center_y = p_nose
+                    
+                    if center_x is not None and center_y is not None:
+                        # Referenzgröße für die Normierung: Schulterbreite
+                        # So skaliert der Kreis wunderbar mit der Größe der Person mit im jeweiligen Frame
+                        shoulder_width = abs(p_lsh[0] - p_rsh[0])
+                        radius = int(head_circle_px + head_circle_norm * shoulder_width)
+                        
+                        if radius > 0:
+                            cv2.circle(canvas, (center_x, center_y), radius, (255, 255, 255), -1)
+
+                canvas_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+                mask_tensor = torch.from_numpy(canvas_gray.astype(np.float32) / 255.0)
+                mask_list.append(mask_tensor)
+                
+                last_valid_mask = canvas_gray.astype(np.float32) / 255.0
+
+            else:
+                mask_tensor = torch.from_numpy(last_valid_mask)
+                mask_list.append(mask_tensor)
+
+        return (torch.stack(mask_list, dim=0),)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -15626,6 +15925,8 @@ NODE_CLASS_MAPPINGS = {
     "MaskPositionalJoinerV20": MaskPositionalJoinerV20,
     "MaskPositionalCutterV21": MaskPositionalCutterV21,
     "MaskPositionalJoinerV21": MaskPositionalJoinerV21,
+    "PoseDataHipHandDebugV3": PoseDataHipHandDebugV3,
+    "PoseDataToMaskV2": PoseDataToMaskV2,
     
 }
 
@@ -15697,6 +15998,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalJoinerV20": "Mask Positional Joiner V20",
     "MaskPositionalCutterV21": "Mask Positional Cutter V21",
     "MaskPositionalJoinerV21": "Mask Positional Joiner V21",
+    "PoseDataHipHandDebugV3": "Pose Data Hip & Hand Debug V3",
+    "PoseDataToMaskV2": "Pose Data To Mask V2",
     
 }
 
