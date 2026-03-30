@@ -5193,7 +5193,7 @@ class SavePoseDataNode:
         return {
             "required": {
                 "pose_data": ("POSEDATA",),
-                "filename_prefix": ("STRING", {"default": "debug_pose_data"}),
+                "filename_prefix": ("STRING", {"default": "minimal_keypoints"}),
             }
         }
 
@@ -5201,12 +5201,13 @@ class SavePoseDataNode:
     RETURN_NAMES = ("pose_data",)
     FUNCTION = "save_json"
     CATEGORY = "WanAnimatePreprocess/Debug"
-    DESCRIPTION = "Speichert die Pose-Daten in einer JSON-Datei, um sie für das Debugging bereitzustellen."
+    DESCRIPTION = "Speichert NUR die reinen Keypoints (X, Y, Scores) und die Bildgröße in einer JSON-Datei."
 
     def save_json(self, pose_data, filename_prefix):
         import json
         import os
         import numpy as np
+        import folder_paths
         
         output_dir = folder_paths.get_output_directory()
         
@@ -5219,50 +5220,50 @@ class SavePoseDataNode:
                 break
             counter += 1
 
-        def convert_to_serializable(obj):
-            if isinstance(obj, np.ndarray):
-                # Große Arrays (z.B. Bilder) nicht speichern, nur Metadaten
-                if obj.ndim >= 3 and obj.size > 10000: 
-                    return f"<Image/Array shape={obj.shape} dtype={str(obj.dtype)}>"
-                return obj.tolist()
-            elif isinstance(obj, AAPoseMeta):
-                # AAPoseMeta Objekt explizit in Dict umwandeln
-                return {
-                    "image_id": getattr(obj, "image_id", ""),
-                    "height": getattr(obj, "height", 0),
-                    "width": getattr(obj, "width", 0),
-                    "kps_body": convert_to_serializable(getattr(obj, "kps_body", None)),
-                    "kps_body_p": convert_to_serializable(getattr(obj, "kps_body_p", None)),
-                    "kps_lhand": convert_to_serializable(getattr(obj, "kps_lhand", None)),
-                    "kps_lhand_p": convert_to_serializable(getattr(obj, "kps_lhand_p", None)),
-                    "kps_rhand": convert_to_serializable(getattr(obj, "kps_rhand", None)),
-                    "kps_rhand_p": convert_to_serializable(getattr(obj, "kps_rhand_p", None)),
-                    "kps_face": convert_to_serializable(getattr(obj, "kps_face", None)),
-                    "kps_face_p": convert_to_serializable(getattr(obj, "kps_face_p", None)),
-                }
-            elif isinstance(obj, dict):
-                return {k: convert_to_serializable(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_to_serializable(x) for x in obj]
-            elif isinstance(obj, (np.float32, np.float64)):
-                return float(obj)
-            elif isinstance(obj, (np.int32, np.int64)):
-                return int(obj)
-            else:
-                return obj
+        # Hier sammeln wir die aufgeräumten Daten
+        minimal_frames = []
+        
+        # Wir holen uns nur die aktuellen Pose-Metadaten (einen Eintrag pro Frame)
+        pose_metas = pose_data.get("pose_metas", [])
+        
+        for meta in pose_metas:
+            if meta is None:
+                continue
+            
+            # Hilfsfunktion, um Numpy-Arrays sauber in JSON-Listen umzuwandeln
+            def to_list(arr):
+                if arr is None: return None
+                if isinstance(arr, np.ndarray): return arr.tolist()
+                if isinstance(arr, list): return arr
+                return None
+
+            # Wir bauen uns ein komplett sauberes Dictionary nur mit dem Nötigsten
+            frame_data = {
+                "width": getattr(meta, "width", 0),
+                "height": getattr(meta, "height", 0),
+                "kps_body": to_list(getattr(meta, "kps_body", None)),
+                "kps_body_p": to_list(getattr(meta, "kps_body_p", None)),
+                "kps_lhand": to_list(getattr(meta, "kps_lhand", None)),
+                "kps_lhand_p": to_list(getattr(meta, "kps_lhand_p", None)),
+                "kps_rhand": to_list(getattr(meta, "kps_rhand", None)),
+                "kps_rhand_p": to_list(getattr(meta, "kps_rhand_p", None)),
+                "kps_face": to_list(getattr(meta, "kps_face", None)),
+                "kps_face_p": to_list(getattr(meta, "kps_face_p", None)),
+            }
+            
+            minimal_frames.append(frame_data)
 
         try:
-            serializable_data = convert_to_serializable(pose_data)
-            
+            # Speichere die saubere Liste als JSON
             with open(full_path, 'w', encoding='utf-8') as f:
-                json.dump(serializable_data, f, indent=4, ensure_ascii=False)
+                json.dump(minimal_frames, f, indent=4, ensure_ascii=False)
                 
-            print(f"✅ PoseData erfolgreich gespeichert: {full_path}")
+            print(f"✅ Keypoints erfolgreich als JSON exportiert: {full_path}")
         except Exception as e:
-            print(f"❌ Fehler beim Speichern der PoseData: {e}")
+            print(f"❌ Fehler beim Speichern der Keypoints: {e}")
 
+        # Gib die Original-PoseData unverändert an die nächste Node weiter
         return (pose_data,)
-        
 
 class PoseDataHandOffsetTimed:
     @classmethod
