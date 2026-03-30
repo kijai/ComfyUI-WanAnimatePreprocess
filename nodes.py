@@ -7745,6 +7745,7 @@ NODE_CLASS_MAPPINGS = {
     "WanSmartImageBatcherV2": WanSmartImageBatcherV2,
     "PoseDataToMaskV2": PoseDataToMaskV2,
     "PoseDataSelectFrameNode": PoseDataSelectFrameNode,
+    "LoadPoseDataFromJsonNode": LoadPoseDataFromJsonNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -7789,6 +7790,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataHipHandDebugV3": "Pose Data Hip & Hand Debug V3",
     "PoseDataToMaskV2": "Pose Data To Mask V2",
     "PoseDataSelectFrameNode": "Pose Data Select Frame",
+    "LoadPoseDataFromJsonNode": "Load Pose Data From JSON",
 }
 
 
