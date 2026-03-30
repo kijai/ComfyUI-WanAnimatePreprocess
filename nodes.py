@@ -15899,7 +15899,90 @@ class PoseDataSelectFrameNode:
             new_pose_data["pose_metas_original"] = [metas_orig[safe_index_orig]]
 
         return (new_pose_data,)
+
+class LoadPoseDataFromJsonNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        import os
+        import folder_paths
         
+        # Hole alle JSON-Dateien aus dem ComfyUI 'input' Ordner
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if f.endswith(".json")]
+        
+        # Falls keine Dateien existieren, packe einen Dummy-Eintrag rein, um Fehler zu vermeiden
+        if not files:
+            files = ["Keine JSON gefunden. Bitte JSON in den 'input' Ordner legen."]
+            
+        return {
+            "required": {
+                "json_file": (files, {"tooltip": "Wähle eine JSON-Datei aus dem ComfyUI 'input'-Ordner"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "load_json"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Lädt Pose-Daten aus einer JSON-Datei, die zuvor gespeichert wurde."
+
+    def load_json(self, json_file):
+        import json
+        import os
+        import numpy as np
+        import folder_paths
+        from .pose_utils.pose2d_utils import AAPoseMeta
+
+        input_dir = folder_paths.get_input_directory()
+        file_path = os.path.join(input_dir, json_file)
+
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Die Datei {file_path} existiert nicht.")
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        # Unterstützt verschiedene Speicherformate (Liste von Metas oder Dict mit 'pose_metas' Key)
+        meta_list = data.get("pose_metas", data) if isinstance(data, dict) else data
+
+        restored_metas = []
+        for item in meta_list:
+            if not isinstance(item, dict): 
+                continue
+            
+            # Ein leeres Meta-Objekt erstellen
+            meta = AAPoseMeta(None)
+            
+            meta.image_id = item.get("image_id", "")
+            meta.height = item.get("height", 0)
+            meta.width = item.get("width", 0)
+            
+            # Hilfsfunktion, um Numpy-Arrays wiederherzustellen
+            def restore_array(val):
+                if val is None: return None
+                if isinstance(val, str) and "<Image" in val: return None
+                return np.array(val, dtype=np.float32)
+
+            meta.kps_body = restore_array(item.get("kps_body"))
+            meta.kps_body_p = restore_array(item.get("kps_body_p"))
+            meta.kps_lhand = restore_array(item.get("kps_lhand"))
+            meta.kps_lhand_p = restore_array(item.get("kps_lhand_p"))
+            meta.kps_rhand = restore_array(item.get("kps_rhand"))
+            meta.kps_rhand_p = restore_array(item.get("kps_rhand_p"))
+            meta.kps_face = restore_array(item.get("kps_face"))
+            meta.kps_face_p = restore_array(item.get("kps_face_p"))
+            
+            restored_metas.append(meta)
+
+        pose_data = {
+            "retarget_image": None,
+            "pose_metas": restored_metas,
+            "refer_pose_meta": None,
+            "pose_metas_original": restored_metas,
+        }
+
+        return (pose_data,)
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -15971,6 +16054,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataHipHandDebugV3": PoseDataHipHandDebugV3,
     "PoseDataToMaskV2": PoseDataToMaskV2,
     "PoseDataSelectFrameNode": PoseDataSelectFrameNode,
+    "LoadPoseDataFromJsonNode": LoadPoseDataFromJsonNode,
     
 }
 
@@ -16045,6 +16129,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataHipHandDebugV3": "Pose Data Hip & Hand Debug V3",
     "PoseDataToMaskV2": "Pose Data To Mask V2",
     "PoseDataSelectFrameNode": "Pose Data Select Frame",
+    "LoadPoseDataFromJsonNode": "Load Pose Data From JSON",
     
 }
 
