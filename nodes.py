@@ -15856,7 +15856,50 @@ class PoseDataToMaskV2:
 
         return (torch.stack(mask_list, dim=0),)
 
+class PoseDataSelectFrameNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "frame_index": ("INT", {
+                    "default": 0, 
+                    "min": 0, 
+                    "max": 99999, 
+                    "step": 1, 
+                    "tooltip": "Gibt den Index des gewünschten Frames an (0 = 1. Frame, 9 = 10. Frame etc.)"
+                }),
+            },
+        }
 
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Wählt einen einzelnen Frame aus einer PoseData-Sequenz anhand des Index aus."
+
+    def process(self, pose_data, frame_index):
+        import copy
+        # Erstelle eine tiefe Kopie, damit das Original nicht verändert wird
+        new_pose_data = copy.deepcopy(pose_data)
+        
+        # Hole die Metadaten der Posen
+        if "pose_metas" in new_pose_data and new_pose_data["pose_metas"]:
+            metas = new_pose_data["pose_metas"]
+            # Stelle sicher, dass der Index nicht außerhalb der Reichweite liegt
+            safe_index = min(frame_index, len(metas) - 1)
+            safe_index = max(0, safe_index)
+            # Behalte nur den einen ausgewählten Frame
+            new_pose_data["pose_metas"] = [metas[safe_index]]
+            
+        if "pose_metas_original" in new_pose_data and new_pose_data["pose_metas_original"]:
+            metas_orig = new_pose_data["pose_metas_original"]
+            safe_index_orig = min(frame_index, len(metas_orig) - 1)
+            safe_index_orig = max(0, safe_index_orig)
+            new_pose_data["pose_metas_original"] = [metas_orig[safe_index_orig]]
+
+        return (new_pose_data,)
+        
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
@@ -15927,6 +15970,7 @@ NODE_CLASS_MAPPINGS = {
     "MaskPositionalJoinerV21": MaskPositionalJoinerV21,
     "PoseDataHipHandDebugV3": PoseDataHipHandDebugV3,
     "PoseDataToMaskV2": PoseDataToMaskV2,
+    "PoseDataSelectFrameNode": PoseDataSelectFrameNode,
     
 }
 
@@ -16000,6 +16044,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskPositionalJoinerV21": "Mask Positional Joiner V21",
     "PoseDataHipHandDebugV3": "Pose Data Hip & Hand Debug V3",
     "PoseDataToMaskV2": "Pose Data To Mask V2",
+    "PoseDataSelectFrameNode": "Pose Data Select Frame",
     
 }
 
