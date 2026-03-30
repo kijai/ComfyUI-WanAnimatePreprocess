@@ -7704,6 +7704,247 @@ class LoadPoseDataFromJsonNode:
 
         return (pose_data,)
 
+
+
+import copy
+import numpy as np
+
+class PoseDataAutoReferenceScaler:
+    # Keypoint-Indizes für OpenPose/DWPose
+    HEAD_INDICES = [0, 1, 2, 3, 4]  # Nase, Augen, Ohren
+    NECK_INDEX = 1  # Oft als Halsansatz in DWPose/OpenPose Body genutzt (je nach Format, hier nehmen wir KPS 1 als Brust/Hals)
+    SHOULDER_INDICES = [2, 5] 
+    HIP_INDICES = [8, 11]
+    FOOT_INDICES = [10, 13, 15, 16, 18, 19, 20, 21, 22, 23, 24] # Knie, Knöchel, Füße
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "reference_pose": ("POSEDATA", {"tooltip": "Das 1-Frame JSON als Referenz für die Proportionen"}),
+                "analysis_duration": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1, "tooltip": "Dauer der Analyse des Input-Videos in Sekunden"}),
+                "fps": ("INT", {"default": 30, "min": 1, "max": 240, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Skaliert die Pose automatisch basierend auf einem Referenz-Frame. Passt sich an Full-Body, Half-Body oder Porträts an."
+
+    def process(self, pose_data, reference_pose, analysis_duration, fps):
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        
+        ref_metas = reference_pose.get("pose_metas", [])
+
+        if not pose_metas or not ref_metas:
+            print("[AutoScaler] Warnung: Leere PoseData empfangen. Überspringe...")
+            return (pose_data_copy,)
+
+        ref_meta = ref_metas[0]
+
+        # 1. Analyse-Phase: Durchschnittliche Metriken aus dem Source-Video sammeln
+        fps_val = max(1, int(fps))
+        limit_frames = min(len(pose_metas), max(1, int(analysis_duration * fps_val)))
+        
+        # 2. Smarte Ratio berechnen
+        scale_ratio = self._calculate_smart_scale_ratio(ref_meta, pose_metas[:limit_frames])
+        print(f"[AutoScaler] Berechneter Skalierungsfaktor (Ratio): {scale_ratio:.4f}")
+
+        if scale_ratio <= 0.001 or scale_ratio == 1.0:
+            print("[AutoScaler] Warnung: Konnte keine sinnvolle Ratio berechnen oder Ratio ist 1.0")
+            return (pose_data_copy,)
+
+        # 3. Skalierung auf jeden Frame anwenden
+        for meta in pose_metas:
+            height = getattr(meta, "height", 1.0) or 1.0
+            
+            # Ankerpunkt für DIESEN Frame finden (Füße > Hüfte > Schulter)
+            anchor_y = self._find_best_anchor_y(meta)
+            if anchor_y is None:
+                continue # Nichts zu skalieren in diesem Frame
+
+            # Alten Kopfpunkt finden
+            top_y = self._find_pose_top(meta)
+            if top_y is None:
+                continue
+
+            # Aktuelle sichtbare Höhe berechnen
+            current_visual_height = anchor_y - top_y
+            
+            if current_visual_height <= 0:
+                continue
+
+            # Ziel-Höhe anhand der Ratio berechnen
+            target_visual_height = current_visual_height * scale_ratio
+            
+            # Wie weit muss alles nach oben (oder unten) geschoben werden?
+            target_top_y = anchor_y - target_visual_height
+            offset_y_norm = target_top_y - top_y
+            offset_px = offset_y_norm * height
+
+            # Hüft-Koordinaten sichern für Beine
+            hip_coords_before = self._get_hip_coords(meta)
+
+            # Oberkörper anpassen
+            self._apply_offset_to_upper_body(meta, offset_px)
+            
+            # Beine anpassen (falls vorhanden, wieder mit den Füßen verbinden)
+            if hip_coords_before:
+                self._reconnect_legs(meta, hip_coords_before, offset_px)
+
+        return (pose_data_copy,)
+
+    def _calculate_smart_scale_ratio(self, ref_meta, source_metas_sample):
+        """Findet die beste Methode zur Berechnung der Größenverhältnisse"""
+        
+        def get_median_dist(metas, pt1_idx, pt2_idx):
+            dists = []
+            for m in metas:
+                kps = getattr(m, "kps_body", [])
+                if len(kps) > max(pt1_idx, pt2_idx):
+                    p1 = kps[pt1_idx]
+                    p2 = kps[pt2_idx]
+                    if len(p1) == 2 and len(p2) == 2 and p1[1] > 0 and p2[1] > 0:
+                        dists.append(abs(p2[1] - p1[1]))
+            return float(np.median(dists)) if dists else None
+
+        # Versuch 1: Kopf bis Fuß (Ganzkörper)
+        ref_top = self._find_pose_top(ref_meta)
+        ref_bot = self._find_pose_bottom(ref_meta)
+        
+        src_top_samples = [self._find_pose_top(m) for m in source_metas_sample if self._find_pose_top(m) is not None]
+        src_bot_samples = [self._find_pose_bottom(m) for m in source_metas_sample if self._find_pose_bottom(m) is not None]
+        
+        if ref_top is not None and ref_bot is not None and src_top_samples and src_bot_samples:
+            ref_dist = ref_bot - ref_top
+            src_dist = float(np.median(src_bot_samples)) - float(np.median(src_top_samples))
+            if src_dist > 0.01:
+                print("[AutoScaler] Nutze Methode: Ganzkörper (Kopf bis Fuß)")
+                return ref_dist / src_dist
+
+        # Versuch 2: Torso (Hals/Brustmitte (1) bis mittlere Hüfte (8))
+        ref_torso = get_median_dist([ref_meta], 1, 8)
+        src_torso = get_median_dist(source_metas_sample, 1, 8)
+        if ref_torso and src_torso and src_torso > 0.01:
+            print("[AutoScaler] Nutze Methode: Torso (Hals zu Hüfte)")
+            return ref_torso / src_torso
+
+        # Versuch 3: Nur Kopf/Nacken (Nase (0) bis Hals (1))
+        ref_head = get_median_dist([ref_meta], 0, 1)
+        src_head = get_median_dist(source_metas_sample, 0, 1)
+        if ref_head and src_head and src_head > 0.01:
+            print("[AutoScaler] Nutze Methode: Porträt (Nase zu Hals)")
+            return ref_head / src_head
+
+        return 1.0
+
+    def _find_best_anchor_y(self, meta):
+        """Sucht den tiefsten verlässlichen Punkt im aktuellen Frame"""
+        kps = getattr(meta, "kps_body", [])
+        if not kps: return None
+        height = getattr(meta, "height", 1.0) or 1.0
+
+        # 1. Füße/Beine checken
+        bottom_y = self._find_pose_bottom(meta)
+        if bottom_y is not None: return bottom_y
+        
+        # 2. Hüfte checken
+        hips_y = []
+        for idx in self.HIP_INDICES:
+            if idx < len(kps) and len(kps[idx]) == 2:
+                y = kps[idx][1]
+                if y > 0: hips_y.append(y / height)
+        if hips_y: return max(hips_y)
+
+        # 3. Schultern checken
+        shoulders_y = []
+        for idx in self.SHOULDER_INDICES:
+            if idx < len(kps) and len(kps[idx]) == 2:
+                y = kps[idx][1]
+                if y > 0: shoulders_y.append(y / height)
+        if shoulders_y: return max(shoulders_y)
+
+        return None
+
+    def _find_pose_top(self, meta):
+        kps = getattr(meta, "kps_body", [])
+        if not kps: return None
+        height = getattr(meta, "height", 1.0) or 1.0
+        head_y_coords = []
+        for idx in self.HEAD_INDICES:
+            if idx < len(kps) and len(kps[idx]) == 2:
+                y = kps[idx][1]
+                if y > 0:
+                    head_y_coords.append(y / height)
+        return min(head_y_coords) if head_y_coords else None
+
+    def _find_pose_bottom(self, meta):
+        kps = getattr(meta, "kps_body", [])
+        if not kps: return None
+        height = getattr(meta, "height", 1.0) or 1.0
+        foot_y_coords = []
+        for idx in self.FOOT_INDICES:
+            if idx < len(kps) and len(kps[idx]) == 2:
+                y = kps[idx][1]
+                if y > 0:
+                    foot_y_coords.append(y / height)
+        return max(foot_y_coords) if foot_y_coords else None
+
+    def _get_hip_coords(self, meta):
+        kps = getattr(meta, "kps_body", [])
+        if not kps: return {}
+        hips = {}
+        for idx in self.HIP_INDICES:
+            if idx < len(kps) and len(kps[idx]) == 2:
+                y = kps[idx][1]
+                if y > 0:
+                    hips[idx] = kps[idx][:]
+        return hips
+
+    def _apply_offset_to_upper_body(self, meta, offset_px):
+        kps = getattr(meta, "kps_body", [])
+        for i in range(len(kps)):
+            if i not in self.FOOT_INDICES and len(kps[i]) == 2:
+                if kps[i][1] > 0:
+                    kps[i][1] += offset_px
+
+    def _reconnect_legs(self, meta, hip_coords_before, offset_px):
+        kps = getattr(meta, "kps_body", [])
+        
+        def safe_get_y(idx):
+            if idx < len(kps) and len(kps[idx]) == 2 and kps[idx][1] > 0:
+                return kps[idx][1]
+            return None
+
+        # Links (Hüfte 11 -> Knie 13 -> Knöchel 15)
+        if 11 in hip_coords_before and safe_get_y(13) is not None and safe_get_y(15) is not None:
+            old_hip_y = hip_coords_before[11][1]
+            new_hip_y = old_hip_y + offset_px
+            ankle_y = safe_get_y(15)
+            
+            if ankle_y > old_hip_y:
+                ratio = (safe_get_y(13) - old_hip_y) / (ankle_y - old_hip_y)
+                new_knee_y = new_hip_y + ratio * (ankle_y - new_hip_y)
+                kps[13][1] = new_knee_y
+
+        # Rechts (Hüfte 8 -> Knie 10 -> Knöchel 12/14 je nach Modell)
+        # Hinweis: Im DWPose ist rechts oft 8->9->10. Bitte Indizes prüfen!
+        # Hier generisch für 8 (Hüfte) und 10 (Fuß) als Beispiel:
+        if 8 in hip_coords_before and safe_get_y(9) is not None and safe_get_y(10) is not None:
+            old_hip_y = hip_coords_before[8][1]
+            new_hip_y = old_hip_y + offset_px
+            ankle_y = safe_get_y(10)
+            
+            if ankle_y > old_hip_y:
+                ratio = (safe_get_y(9) - old_hip_y) / (ankle_y - old_hip_y)
+                new_knee_y = new_hip_y + ratio * (ankle_y - new_hip_y)
+                kps[9][1] = new_knee_y
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -7747,6 +7988,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataToMaskV2": PoseDataToMaskV2,
     "PoseDataSelectFrameNode": PoseDataSelectFrameNode,
     "LoadPoseDataFromJsonNode": LoadPoseDataFromJsonNode,
+    "PoseDataAutoReferenceScaler": PoseDataAutoReferenceScaler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -7792,6 +8034,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataToMaskV2": "Pose Data To Mask V2",
     "PoseDataSelectFrameNode": "Pose Data Select Frame",
     "LoadPoseDataFromJsonNode": "Load Pose Data From JSON",
+    "PoseDataAutoReferenceScaler": "Pose Data Auto Reference Scaler (Smart)",
 }
 
 
