@@ -8314,14 +8314,65 @@ class PoseDataToDWPoses:
         out_dict = {'poses': results, 'swap_hands': True}
         return (out_dict,)
 
+import logging
+
+# --- HIER IST DEIN HILFSSKRIPT ---
+def scale_faces(poses, pose_2d_ref):
+    ref = pose_2d_ref[0]
+    pose_0 = poses[0]
+
+    face_0 = pose_0['faces']  # shape: (1, 68, 2)
+    face_ref = ref['faces']
+
+    face_0 = np.array(face_0[0])      # (68, 2)
+    face_ref = np.array(face_ref[0])
+
+    center_idx = 30
+    center_0 = face_0[center_idx]
+    center_ref = face_ref[center_idx]
+
+    dist = np.linalg.norm(face_0 - center_0, axis=1)
+    dist_ref = np.linalg.norm(face_ref - center_ref, axis=1)
+
+    dist = np.delete(dist, center_idx)
+    dist_ref = np.delete(dist_ref, center_idx)
+
+    mean_dist = np.mean(dist)
+    mean_dist_ref = np.mean(dist_ref)
+
+    if mean_dist < 1e-6:
+        scale_n = 1.0
+    else:
+        scale_n = mean_dist_ref / mean_dist
+
+    scale_n = np.clip(scale_n, 0.8, 1.5)
+
+    for i, pose in enumerate(poses):
+        face = pose['faces']
+        face = np.array(face[0])
+        center = face[center_idx]
+        scaled_face = (face - center) * scale_n + center
+        poses[i]['faces'][0] = scaled_face
+
+        body = pose['bodies']
+        candidate = body['candidate']
+        candidate_np = np.array(candidate[0])
+        body_center = candidate_np[0]
+        scaled_candidate = (candidate_np - body_center) * scale_n + body_center
+        poses[i]['bodies']['candidate'][0] = scaled_candidate
+
+    return scale_n
+# ---------------------------------
+
+
 class RenderNLFPosesWithData:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "nlf_poses": ("NLFPRED", {"tooltip": "Der 3D Output aus SCAIL"}),
-                "width": ("INT", {"default": 512}),
-                "height": ("INT", {"default": 512})
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096})
             },
             "optional": {
                 "dw_poses": ("DWPOSES",),
@@ -8329,26 +8380,115 @@ class RenderNLFPosesWithData:
                 "draw_face": ("BOOLEAN", {"default": True}),
                 "draw_hand": ("BOOLEAN", {"default": True}),
                 "draw_body": ("BOOLEAN", {"default": True}),
+                # Diese Settings braucht das Rendern intern:
+                "render_device": (["gpu", "cpu", "opengl", "cuda", "vulkan", "metal"], {"default": "gpu"}),
+                "scale_hands": ("BOOLEAN", {"default": True}),
+                "render_backend": (["taichi", "torch"], {"default": "taichi"}),
             }
         }
     
-    # NEU: Drei Outputs! Image, Maske UND die NLF Daten für den Scaler!
     RETURN_TYPES = ("IMAGE", "MASK", "NLFPRED")
     RETURN_NAMES = ("image", "mask", "nlf_poses_data")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Rendert die NLF Poses und reicht die Daten an den Scaler weiter."
+    DESCRIPTION = "Rendert die NLF Poses komplett eigenständig und reicht die Daten an den Scaler weiter."
 
-    def process(self, nlf_poses, width, height, dw_poses=None, ref_dw_pose=None, draw_face=True, draw_hand=True, draw_body=True):
-        # Wir rufen einfach die Original-Logik von Kijai's SCAIL Render Node auf
-        from .nodes import RenderNLFPoses 
+    def process(self, nlf_poses, width, height, dw_poses=None, ref_dw_pose=None, draw_face=True, draw_hand=True, draw_body=True, render_device="gpu", scale_hands=True, render_backend="taichi"):
         
-        # Original Render Node initialisieren und ausführen
-        original_renderer = RenderNLFPoses()
-        image, mask = original_renderer.process(nlf_poses, width, height, dw_poses, ref_dw_pose, draw_face, draw_hand, draw_body)
+        # Imports aus dem NLF-Ordner
+        from .NLFPoseExtract.nlf_render import render_nlf_as_images, render_multi_nlf_as_images, shift_dwpose_according_to_nlf, process_data_to_COCO_format, intrinsic_matrix_from_field_of_view
+        from .NLFPoseExtract.align3d import solve_new_camera_params_central, solve_new_camera_params_down
         
-        # Wir geben Image, Mask UND die nlf_poses wieder zurück
-        return (image, mask, nlf_poses)
+        if render_backend == "taichi":
+            try:
+                import taichi as ti
+                device_map = {
+                    "cpu": ti.cpu, "gpu": ti.gpu, "opengl": ti.opengl,
+                    "cuda": ti.cuda, "vulkan": ti.vulkan, "metal": ti.metal,
+                }
+                ti.init(arch=device_map.get(render_device.lower()))
+            except:
+                logging.warning("Taichi selected but not installed. Falling back to torch rendering.")
+                render_backend = "torch"
+
+        if isinstance(nlf_poses, dict):
+            pose_input = nlf_poses['joints3d_nonparam'][0] if 'joints3d_nonparam' in nlf_poses else nlf_poses
+        else:
+            pose_input = nlf_poses
+
+        dw_pose_input = copy.deepcopy(dw_poses["poses"]) if dw_poses is not None else None
+        swap_hands = dw_poses.get("swap_hands", False) if dw_poses is not None else False
+
+        ori_camera_pose = intrinsic_matrix_from_field_of_view([height, width])
+        ori_focal = ori_camera_pose[0, 0]
+
+        num_people = dw_pose_input[0]['bodies']['candidate'].shape[0] if dw_poses is not None else 0
+
+        # Alignment
+        if dw_poses is not None and ref_dw_pose is not None and num_people == 1:
+            ref_dw_pose_input = copy.deepcopy(ref_dw_pose["poses"])
+
+            pose_3d_first_driving_frame = None
+            for pose in pose_input:
+                if pose.shape[0] == 0:
+                    continue
+                candidate = pose[0].cpu().numpy()
+                if np.any(candidate):
+                    pose_3d_first_driving_frame = candidate
+                    break
+            if pose_3d_first_driving_frame is None:
+                raise ValueError("No valid pose found in pose_input.")
+
+            pose_3d_coco_first_driving_frame = process_data_to_COCO_format(pose_3d_first_driving_frame)
+            poses_2d_ref = ref_dw_pose_input[0]['bodies']['candidate'][0][:14]
+            poses_2d_ref[:, 0] = poses_2d_ref[:, 0] * width
+            poses_2d_ref[:, 1] = poses_2d_ref[:, 1] * height
+
+            poses_2d_subset = ref_dw_pose_input[0]['bodies']['subset'][0][:14]
+            pose_3d_coco_first_driving_frame = pose_3d_coco_first_driving_frame[:14]
+
+            valid_indices, valid_upper_indices, valid_lower_indices = [], [], []
+            upper_body_indices = [0, 2, 3, 5, 6]
+            lower_body_indices = [9, 10, 12, 13]
+
+            for i in range(len(poses_2d_subset)):
+                if poses_2d_subset[i] != -1.0 and np.sum(pose_3d_coco_first_driving_frame[i]) != 0:
+                    if i in upper_body_indices:
+                        valid_upper_indices.append(i)
+                    if i in lower_body_indices:
+                        valid_lower_indices.append(i)
+
+            valid_indices = [1] + valid_lower_indices if len(valid_upper_indices) < 4 else [1] + valid_lower_indices + valid_upper_indices 
+
+            pose_2d_ref = poses_2d_ref[valid_indices]
+            pose_3d_coco_first_driving_frame = pose_3d_coco_first_driving_frame[valid_indices]
+
+            if len(valid_lower_indices) >= 4:
+                new_camera_intrinsics, scale_m, scale_s = solve_new_camera_params_down(pose_3d_coco_first_driving_frame, ori_focal, [height, width], pose_2d_ref)
+            else:
+                new_camera_intrinsics, scale_m, scale_s = solve_new_camera_params_central(pose_3d_coco_first_driving_frame, ori_focal, [height, width], pose_2d_ref)
+
+            # HIER WIRD DIE HILFSFUNKTION AUFGERUFEN
+            scale_face = scale_faces(list(dw_pose_input), list(ref_dw_pose_input))   
+
+            logging.info(f"Scale - m: {scale_m}, face: {scale_face}")
+            shift_dwpose_according_to_nlf(pose_input, dw_pose_input, ori_camera_pose, new_camera_intrinsics, height, width, swap_hands=swap_hands, scale_hands=scale_hands, scale_x=scale_m, scale_y=scale_m*scale_s)
+
+            intrinsic_matrix = new_camera_intrinsics
+        else:
+            intrinsic_matrix = ori_camera_pose
+
+        # Rendern
+        if pose_input[0].shape[0] > 1:
+            frames_np = render_multi_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=draw_face, draw_hands=draw_hand, render_backend=render_backend)
+        else:
+            frames_np = render_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=draw_face, draw_hands=draw_hand, render_backend=render_backend)
+
+        # Tensor generieren
+        frames_tensor = torch.from_numpy(np.stack(frames_np, axis=0)).contiguous() / 255.0
+        frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
+
+        return (frames_tensor.cpu().float(), mask.cpu().float(), nlf_poses)
 
 class RetargetPoseCalibrator2:
     @classmethod
