@@ -8903,8 +8903,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataDynamicScalerContinuous": "Pose Data Dynamic Scaler (Ultimate)",
     "PoseDataToDWPoses": "PoseDataToDWPoses",
     "RenderNLFPosesWithData": "Render NLF Poses & Data (SCAIL)",
-    "RetargetPoseCalibrator2": "Retarget Pose Calibrator (Ultimate)",
-    "PoseDataDynamicScalerContinuous2": "Pose Data Dynamic Scaler (Ultimate)",
+    "RetargetPoseCalibrator2": "Retarget Pose Calibrator 2 (Ultimate)",
+    "PoseDataDynamicScalerContinuous2": "Pose Data Dynamic Scaler 2 (Ultimate)",
     "PoseDataAutoScalerAnalysis": "Pose Data Auto Scaler (Smart Analysis)",
     "PoseDataGlobalScaler": "Pose Data Global Scaler (No Jumps)",
 }
