@@ -8050,7 +8050,7 @@ class PoseDataDynamicScalerContinuous:
         for frame_idx, meta in enumerate(pose_metas):
             kps_body_all = getattr(meta, "kps_body", [])
             
-            if not kps_body_all:
+            if kps_body_all is None or len(kps_body_all) == 0:
                 raw_ratios.append(raw_ratios[-1] if raw_ratios else 1.0)
                 continue
 
@@ -8597,7 +8597,7 @@ class PoseDataDynamicScalerContinuous2:
 
         for frame_idx, meta in enumerate(pose_metas):
             kps_body_all = getattr(meta, "kps_body", [])
-            if not kps_body_all:
+            if kps_body_all is None or len(kps_body_all) == 0:
                 raw_ratios.append(raw_ratios[-1] if raw_ratios else 1.0)
                 continue
 
@@ -8742,7 +8742,7 @@ class PoseDataAutoScalerAnalysis:
         for frame_idx in range(limit_frames):
             meta = pose_metas[frame_idx]
             kps_body_all = getattr(meta, "kps_body", [])
-            if not kps_body_all: continue
+            if kps_body_all is None or len(kps_body_all) == 0: continue
 
             # Qualität des Frames prüfen
             frame_quality = self._check_frame_quality(kps_body_all)
