@@ -8490,6 +8490,321 @@ class PoseDataDynamicScalerContinuous:
         foot_y = [meta.kps_body[idx][1] / getattr(meta, "height", 1.0) for idx in self.FOOT_INDICES if idx < len(meta.kps_body) and len(meta.kps_body[idx]) >= 2 and meta.kps_body[idx][1] > 0]
         return max(foot_y) if foot_y else None
 
+
+import copy
+import numpy as np
+import math
+import torch
+
+class PoseDataAutoScalerAnalysis:
+    HEAD_INDICES = [0, 1, 2, 3, 4]  
+    TORSO_INDICES = [1, 2, 5, 8, 11] 
+    HIP_INDICES = [8, 11]
+    FOOT_INDICES = [10, 13, 15, 16, 18, 19, 20, 21, 22, 23, 24] 
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "target_person_index": ("INT", {"default": 0, "min": 0, "max": 10, "tooltip": "Welche Person? 0 = Erste"}),
+                "scaling_mode": (["Auto (Combo)", "SCAIL 3D Only", "Depth Map Only"],),
+                "analysis_duration": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1, "tooltip": "Scan-Dauer in Sekunden, um auf die beste Pose (z.B. Beine) zu warten"}),
+                "fps": ("INT", {"default": 30, "min": 1, "max": 240}),
+            },
+            "optional": {
+                "nlf_poses_data": ("NLFPRED",),
+                "video_depth_map": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("scaled_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "Statischer Scaler mit intelligenter Analyse-Phase (wartet auf Beine/Hüfte im Bild)."
+
+    def process(self, video_pose_data, calibration_data, target_person_index, scaling_mode, analysis_duration, fps, nlf_poses_data=None, video_depth_map=None):
+        if not calibration_data: return (video_pose_data,)
+        
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        if not pose_metas: return (pose_data_copy,)
+
+        limit_frames = min(len(pose_metas), max(1, int(analysis_duration * fps)))
+        
+        # Qualitäts-Speicher: Wir sortieren die Ratios nach der "Güte" des Frames
+        quality_ratios = {3: [], 2: [], 1: [], 0: []}
+
+        # --- 1. ANALYSE-PHASE (SMART SCAN) ---
+        for frame_idx in range(limit_frames):
+            meta = pose_metas[frame_idx]
+            kps_body_all = getattr(meta, "kps_body", [])
+            if not kps_body_all: continue
+
+            # Qualität des Frames prüfen
+            frame_quality = self._check_frame_quality(kps_body_all)
+            if frame_quality == 0: continue
+
+            current_frame_ratios = []
+
+            # A) DEPTH MAP BERECHNUNG
+            if calibration_data.get("ref_depth_val") and video_depth_map is not None and scaling_mode in ["Auto (Combo)", "Depth Map Only"]:
+                valid_depths = []
+                for pt_idx in self.TORSO_INDICES:
+                    if pt_idx < len(kps_body_all) and len(kps_body_all[pt_idx]) >= 2:
+                        score = kps_body_all[pt_idx][2] if len(kps_body_all[pt_idx]) > 2 else 1.0
+                        if score > 0.1: 
+                            x, y = kps_body_all[pt_idx][0], kps_body_all[pt_idx][1]
+                            if x > 0 and y > 0:
+                                H, W = video_depth_map.shape[1], video_depth_map.shape[2]
+                                px, py = max(0, min(int(x), W - 1)), max(0, min(int(y), H - 1))
+                                v_idx = min(frame_idx, video_depth_map.shape[0] - 1)
+                                val = float(video_depth_map[v_idx, py, px, 0].item() if isinstance(video_depth_map, torch.Tensor) else video_depth_map[v_idx, py, px, 0])
+                                if val > 0.001: valid_depths.append(val)
+                
+                if valid_depths:
+                    current_frame_ratios.append(calibration_data["ref_depth_val"] / max(valid_depths))
+
+            # B) SCAIL 3D BERECHNUNG
+            if nlf_poses_data is not None and frame_idx < len(nlf_poses_data) and scaling_mode in ["Auto (Combo)", "SCAIL 3D Only"]:
+                frame_3d = nlf_poses_data[frame_idx]
+                if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
+                    person_3d = frame_3d[target_person_index]
+                    if len(person_3d) > 8:
+                        p1, p8 = person_3d[1], person_3d[8]
+                        dist_3d = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2 + (p1[2]-p8[2])**2)
+                        
+                        ref_dist = calibration_data.get("ref_torso_dist_3d") or calibration_data.get("ref_torso_dist_2d")
+                        if ref_dist and dist_3d > 0.01:
+                            current_frame_ratios.append(ref_dist / dist_3d)
+
+            # Wenn wir eine Ratio gefunden haben, speichern wir sie im passenden Qualitäts-Fach
+            if current_frame_ratios:
+                ratio_avg = sum(current_frame_ratios) / len(current_frame_ratios)
+                quality_ratios[frame_quality].append(ratio_avg)
+
+        # --- 2. DIE BESTE RATIO AUSWÄHLEN ---
+        final_scale_ratio = 1.0
+        
+        # Wir nehmen immer die höchste Qualität, die in der Zeit gefunden wurde!
+        if quality_ratios[3]:
+            final_scale_ratio = float(np.median(quality_ratios[3]))
+            print(f"[AnalysisScaler] Level 3 (Füße) gefunden! Fester Faktor: {final_scale_ratio:.4f}")
+        elif quality_ratios[2]:
+            final_scale_ratio = float(np.median(quality_ratios[2]))
+            print(f"[AnalysisScaler] Level 2 (Hüfte) gefunden! Fester Faktor: {final_scale_ratio:.4f}")
+        elif quality_ratios[1]:
+            final_scale_ratio = float(np.median(quality_ratios[1]))
+            print(f"[AnalysisScaler] Nur Level 1 (Kopf/Torso) gefunden. Fester Faktor: {final_scale_ratio:.4f}")
+
+        if final_scale_ratio <= 0.001 or final_scale_ratio == 1.0:
+            print("[AnalysisScaler] Warnung: Konnte keine verlässliche Ratio berechnen.")
+            return (pose_data_copy,)
+
+        # --- 3. FESTE SKALIERUNG AUF DAS GANZE VIDEO ANWENDEN ---
+        for meta in pose_metas:
+            height = getattr(meta, "height", 1.0) or 1.0
+            
+            # Anker finden (dynamisch für jeden Frame, damit Bücken funktioniert)
+            bottom_y = self._find_pose_bottom(meta)
+            anchor_y = bottom_y if bottom_y is not None else (max([meta.kps_body[idx][1] / height for idx in self.HIP_INDICES if idx < len(meta.kps_body) and len(meta.kps_body[idx]) >= 2 and meta.kps_body[idx][1] > 0]) if any([len(meta.kps_body[idx]) >= 2 for idx in self.HIP_INDICES if idx < len(meta.kps_body)]) else None)
+            
+            head_y = [meta.kps_body[idx][1] / height for idx in self.HEAD_INDICES if idx < len(meta.kps_body) and len(meta.kps_body[idx]) >= 2 and meta.kps_body[idx][1] > 0]
+            top_y = min(head_y) if head_y else None
+            
+            if anchor_y is None or top_y is None: continue
+
+            current_visual_height = anchor_y - top_y
+            if current_visual_height <= 0: continue
+
+            # Feste Ratio anwenden
+            target_top_y = anchor_y - (current_visual_height * final_scale_ratio)
+            offset_px = (target_top_y - top_y) * height
+
+            hip_coords_before = {idx: meta.kps_body[idx][:] for idx in self.HIP_INDICES if idx < len(meta.kps_body) and len(meta.kps_body[idx]) >= 2 and meta.kps_body[idx][1] > 0}
+            
+            # Oberkörper anpassen
+            for i in range(len(meta.kps_body)):
+                if i not in self.FOOT_INDICES and len(meta.kps_body[i]) >= 2 and meta.kps_body[i][1] > 0:
+                    meta.kps_body[i][1] += offset_px
+            
+            # Beine interpolieren
+            def safe_get_y(idx): return meta.kps_body[idx][1] if idx < len(meta.kps_body) and len(meta.kps_body[idx]) >= 2 and meta.kps_body[idx][1] > 0 else None
+            if 11 in hip_coords_before and safe_get_y(13) is not None and safe_get_y(15) is not None:
+                old_hip_y, ankle_y = hip_coords_before[11][1], safe_get_y(15)
+                if ankle_y > old_hip_y: meta.kps_body[13][1] = (old_hip_y + offset_px) + ((safe_get_y(13) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
+            if 8 in hip_coords_before and safe_get_y(9) is not None and safe_get_y(10) is not None:
+                old_hip_y, ankle_y = hip_coords_before[8][1], safe_get_y(10)
+                if ankle_y > old_hip_y: meta.kps_body[9][1] = (old_hip_y + offset_px) + ((safe_get_y(9) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
+
+        return (pose_data_copy,)
+
+    # --- HELPER FUNKTIONEN ---
+    def _check_frame_quality(self, kps_body):
+        """Bewertet den Frame: 3 (Füße da), 2 (Hüfte da), 1 (Kopf da), 0 (Ungültig)"""
+        def valid(idx):
+            return idx < len(kps_body) and len(kps_body[idx]) >= 2 and kps_body[idx][1] > 0 and (kps_body[idx][2] > 0.1 if len(kps_body[idx]) > 2 else True)
+        
+        if any(valid(idx) for idx in self.FOOT_INDICES): return 3
+        if any(valid(idx) for idx in self.HIP_INDICES): return 2
+        if any(valid(idx) for idx in self.HEAD_INDICES): return 1
+        return 0
+
+    def _find_pose_bottom(self, meta):
+        foot_y = [meta.kps_body[idx][1] / getattr(meta, "height", 1.0) for idx in self.FOOT_INDICES if idx < len(meta.kps_body) and len(meta.kps_body[idx]) >= 2 and meta.kps_body[idx][1] > 0]
+        return max(foot_y) if foot_y else None
+
+import copy
+import numpy as np
+import math
+import torch
+
+class PoseDataGlobalScaler:
+    HEAD_INDICES = [0, 1, 2, 3, 4]  
+    TORSO_INDICES = [1, 2, 5, 8, 11] 
+    HIP_INDICES = [8, 9, 11, 12] # Breitere Abdeckung je nach OpenPose-Format
+    KNEE_INDICES = [10, 13]
+    FOOT_INDICES = [11, 14, 15, 16, 19, 20, 21, 22, 23, 24] 
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "target_person_index": ("INT", {"default": 0, "min": 0, "max": 10}),
+                "scaling_mode": (["Auto (Combo)", "SCAIL 3D Only", "Depth Map Only"],),
+            },
+            "optional": {
+                "nlf_poses_data": ("NLFPRED",),
+                "video_depth_map": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("scaled_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "Scannt das ganze Video, lernt Proportionen und nutzt Phantom-Anker, um Ruckeln zu verhindern."
+
+    def process(self, video_pose_data, calibration_data, target_person_index, scaling_mode, nlf_poses_data=None, video_depth_map=None):
+        if not calibration_data: return (video_pose_data,)
+        
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        if not pose_metas: return (pose_data_copy,)
+
+        # --- PHASE 1: GLOBALER SCAN (Proportionen & Skalierungsfaktor lernen) ---
+        global_leg_to_torso_ratios = []
+        global_scale_ratios = []
+
+        for frame_idx, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            if not kps: continue
+
+            head_y = self._get_median_y(kps, self.HEAD_INDICES)
+            hip_y = self._get_median_y(kps, self.HIP_INDICES)
+            foot_y = self._get_median_y(kps, self.FOOT_INDICES)
+            
+            # A) Proportionen lernen (Wenn Füße, Hüfte und Kopf da sind)
+            if head_y and hip_y and foot_y:
+                torso_len = hip_y - head_y
+                leg_len = foot_y - hip_y
+                if torso_len > 10 and leg_len > 10:
+                    global_leg_to_torso_ratios.append(leg_len / torso_len)
+
+            # B) Skalierungs-Faktor aus den BESTEN Frames berechnen
+            current_frame_ratios = []
+            if calibration_data.get("ref_depth_val") and video_depth_map is not None and scaling_mode in ["Auto (Combo)", "Depth Map Only"]:
+                valid_depths = [
+                    float(video_depth_map[min(frame_idx, video_depth_map.shape[0]-1), int(max(0, min(kps[pt][1], video_depth_map.shape[1]-1))), int(max(0, min(kps[pt][0], video_depth_map.shape[2]-1))), 0].item() if isinstance(video_depth_map, torch.Tensor) else video_depth_map[min(frame_idx, video_depth_map.shape[0]-1), int(max(0, min(kps[pt][1], video_depth_map.shape[1]-1))), int(max(0, min(kps[pt][0], video_depth_map.shape[2]-1))), 0])
+                    for pt in self.TORSO_INDICES if pt < len(kps) and len(kps[pt]) >= 2 and (kps[pt][2] > 0.1 if len(kps[pt])>2 else True) and kps[pt][0] > 0
+                ]
+                if valid_depths and max(valid_depths) > 0.001:
+                    current_frame_ratios.append(calibration_data["ref_depth_val"] / max(valid_depths))
+
+            if nlf_poses_data is not None and frame_idx < len(nlf_poses_data) and scaling_mode in ["Auto (Combo)", "SCAIL 3D Only"]:
+                frame_3d = nlf_poses_data[frame_idx]
+                if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
+                    p3d = frame_3d[target_person_index]
+                    if len(p3d) > 8:
+                        dist_3d = math.sqrt((p3d[1][0]-p3d[8][0])**2 + (p3d[1][1]-p3d[8][1])**2 + (p3d[1][2]-p3d[8][2])**2)
+                        ref_dist = calibration_data.get("ref_torso_dist_3d") or calibration_data.get("ref_torso_dist_2d")
+                        if ref_dist and dist_3d > 0.01:
+                            current_frame_ratios.append(ref_dist / dist_3d)
+
+            if current_frame_ratios:
+                global_scale_ratios.append(sum(current_frame_ratios) / len(current_frame_ratios))
+
+        # Finale Globale Werte berechnen
+        final_scale_ratio = float(np.median(global_scale_ratios)) if global_scale_ratios else 1.0
+        # Standard-Mensch: Beine sind ca. 1.2x bis 1.4x so lang wie der Torso. Wir nehmen den Video-Schnitt oder 1.3 als Fallback.
+        learned_leg_ratio = float(np.median(global_leg_to_torso_ratios)) if global_leg_to_torso_ratios else 1.3
+
+        print(f"[GlobalScaler] Scan Beendet! Scale Factor: {final_scale_ratio:.4f} | Learned Leg Ratio: {learned_leg_ratio:.2f}")
+
+        if final_scale_ratio <= 0.001 or final_scale_ratio == 1.0: return (pose_data_copy,)
+
+        # --- PHASE 2: PHANTOM-SKALIERUNG AUF DAS VIDEO ANWENDEN ---
+        for meta in pose_metas:
+            kps = getattr(meta, "kps_body", [])
+            height = getattr(meta, "height", 1.0) or 1.0
+            
+            head_y = self._get_median_y(kps, self.HEAD_INDICES, height)
+            hip_y = self._get_median_y(kps, self.HIP_INDICES, height)
+            foot_y = self._get_median_y(kps, self.FOOT_INDICES, height)
+
+            if not head_y or not hip_y: continue
+
+            torso_height = hip_y - head_y
+            if torso_height <= 0: continue
+
+            # DIE MAGIE: Der Phantom-Anker!
+            if foot_y is not None:
+                # Echte Füße sind da!
+                anchor_y = foot_y
+            else:
+                # Füße fehlen! Wir berechnen, wo sie im 2D-Raum wären, wenn man sie sehen könnte.
+                phantom_foot_y = hip_y + (torso_height * learned_leg_ratio)
+                anchor_y = phantom_foot_y
+
+            # Skalierung anwenden basierend auf dem echten oder Phantom-Anker
+            current_visual_height = anchor_y - head_y
+            target_visual_height = current_visual_height * final_scale_ratio
+            
+            target_top_y = anchor_y - target_visual_height
+            offset_px = (target_top_y - head_y) * height
+
+            # Alte Hüften speichern für Bein-Verschiebung
+            hip_coords_before = {idx: kps[idx][:] for idx in self.HIP_INDICES if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0}
+            
+            # Oberkörper anpassen
+            for i in range(len(kps)):
+                if i not in self.FOOT_INDICES and len(kps[i]) >= 2 and kps[i][1] > 0:
+                    kps[i][1] += offset_px
+            
+            # Beine interpolieren (falls z.B. nur die Knie da sind)
+            def safe_get_y(idx): return kps[idx][1] if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 else None
+            
+            if 11 in hip_coords_before and safe_get_y(13) is not None and safe_get_y(15) is not None:
+                old_hip_y, ankle_y = hip_coords_before[11][1], safe_get_y(15)
+                if ankle_y > old_hip_y: kps[13][1] = (old_hip_y + offset_px) + ((safe_get_y(13) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
+            
+            # Für die rechte Seite (je nach DWPose Format Index 8->9->10 oder 9->10->11)
+            # Wir nehmen den generischen Check für Index 8, 9, 10
+            if 8 in hip_coords_before and safe_get_y(9) is not None and safe_get_y(10) is not None:
+                old_hip_y, ankle_y = hip_coords_before[8][1], safe_get_y(10)
+                if ankle_y > old_hip_y: kps[9][1] = (old_hip_y + offset_px) + ((safe_get_y(9) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
+
+        return (pose_data_copy,)
+
+    def _get_median_y(self, kps, indices, height_divider=1.0):
+        vals = [kps[idx][1] / height_divider for idx in indices if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 and (kps[idx][2] > 0.1 if len(kps[idx])>2 else True)]
+        return float(np.median(vals)) if vals else None
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -8540,6 +8855,8 @@ NODE_CLASS_MAPPINGS = {
     "RenderNLFPosesWithData": RenderNLFPosesWithData,
     "RetargetPoseCalibrator": RetargetPoseCalibrator,
     "PoseDataDynamicScalerContinuous": PoseDataDynamicScalerContinuous,
+    "PoseDataAutoScalerAnalysis": PoseDataAutoScalerAnalysis,
+    "PoseDataGlobalScaler": PoseDataGlobalScaler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -8592,6 +8909,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RenderNLFPosesWithData": "Render NLF Poses & Data (SCAIL)",
     "RetargetPoseCalibrator": "Retarget Pose Calibrator (Ultimate)",
     "PoseDataDynamicScalerContinuous": "Pose Data Dynamic Scaler (Ultimate)",
+    "PoseDataAutoScalerAnalysis": "Pose Data Auto Scaler (Smart Analysis)",
+    "PoseDataGlobalScaler": "Pose Data Global Scaler (No Jumps)",
 }
 
 
