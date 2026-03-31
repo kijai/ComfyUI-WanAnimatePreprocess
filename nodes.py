@@ -8799,6 +8799,97 @@ class PoseDataGlobalScaler:
     def _get_median_y(self, kps, indices, height_divider=1.0):
         vals = [kps[idx][1] / height_divider for idx in indices if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 and (kps[idx][2] > 0.1 if len(kps[idx])>2 else True)]
         return float(np.median(vals)) if vals else None
+import os
+import json
+import folder_paths
+
+class SavePoseCalibration:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "calibration_data": ("POSE_CALIBRATION", {"tooltip": "Die Daten aus dem Retarget Pose Calibrator"}),
+                "folder_name": ("STRING", {"default": "pose_calibrations", "tooltip": "Unterordner im ComfyUI/output Verzeichnis"}),
+                "filename_prefix": ("STRING", {"default": "my_retarget_profile", "tooltip": "Name der Datei"}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save"
+    OUTPUT_NODE = True 
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "Speichert das Kalibrierungs-Profil im Output-Ordner ab."
+
+    def save(self, calibration_data, folder_name, filename_prefix):
+        # 1. Zielordner im "output" Verzeichnis erstellen
+        output_dir = folder_paths.get_output_directory()
+        save_dir = os.path.join(output_dir, folder_name)
+        
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # 2. Freien Dateinamen finden (z.B. profil_0001.json)
+        counter = 1
+        file_path = os.path.join(save_dir, f"{filename_prefix}_{counter:04d}.json")
+        while os.path.exists(file_path):
+            counter += 1
+            file_path = os.path.join(save_dir, f"{filename_prefix}_{counter:04d}.json")
+
+        # 3. Abspeichern
+        with open(file_path, 'w') as f:
+            json.dump(calibration_data, f, indent=4)
+            
+        print(f"[SavePoseCalibration] Gespeichert in: {file_path}")
+        return ()
+
+class LoadPoseCalibration:
+    @classmethod
+    def INPUT_TYPES(cls):
+        # Wir definieren den Standard-Input-Ordner
+        input_dir = folder_paths.get_input_directory()
+        default_load_dir = os.path.join(input_dir, "pose_calibrations")
+        
+        # Ordner erstellen, falls er noch nicht existiert, damit ComfyUI nicht crasht
+        if not os.path.exists(default_load_dir):
+            os.makedirs(default_load_dir)
+            
+        # Dateien für das Dropdown-Menü sammeln
+        files = [f for f in os.listdir(default_load_dir) if f.endswith('.json')]
+        if not files:
+            files = ["Keine_Dateien_gefunden.json"]
+
+        return {
+            "required": {
+                "folder_name": ("STRING", {"default": "pose_calibrations", "tooltip": "Unterordner im ComfyUI/input Verzeichnis"}),
+                "filename": (files, {"tooltip": "Wähle dein Profil (Muss im Input-Ordner liegen!)"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION",)
+    RETURN_NAMES = ("calibration_data",)
+    FUNCTION = "load"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "Lädt ein Profil aus dem Input-Ordner."
+
+    def load(self, folder_name, filename):
+        if filename == "Keine_Dateien_gefunden.json":
+            print("[LoadPoseCalibration] Warnung: Keine Datei ausgewählt!")
+            return ({},)
+            
+        # Pfad zusammenbauen
+        input_dir = folder_paths.get_input_directory()
+        file_path = os.path.join(input_dir, folder_name, filename)
+        
+        if not os.path.exists(file_path):
+            print(f"[LoadPoseCalibration] Fehler: Datei nicht gefunden: {file_path}")
+            return ({},)
+
+        # JSON Laden
+        with open(file_path, 'r') as f:
+            calibration_data = json.load(f)
+            
+        print(f"[LoadPoseCalibration] Profil '{filename}' geladen!")
+        return (calibration_data,)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -8853,6 +8944,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataDynamicScalerContinuous2": PoseDataDynamicScalerContinuous2,
     "PoseDataAutoScalerAnalysis": PoseDataAutoScalerAnalysis,
     "PoseDataGlobalScaler": PoseDataGlobalScaler,
+    "SavePoseCalibration": SavePoseCalibration,
+    "LoadPoseCalibration": LoadPoseCalibration,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -8907,6 +9000,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataDynamicScalerContinuous2": "Pose Data Dynamic Scaler 2 (Ultimate)",
     "PoseDataAutoScalerAnalysis": "Pose Data Auto Scaler (Smart Analysis)",
     "PoseDataGlobalScaler": "Pose Data Global Scaler (No Jumps)",
+    "SavePoseCalibration": "Save Pose Calibration (Ultimate)",
+    "LoadPoseCalibration": "Load Pose Calibration (Ultimate)",
 }
 
 
