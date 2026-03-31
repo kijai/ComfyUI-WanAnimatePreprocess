@@ -8622,18 +8622,29 @@ class PoseDataDynamicScalerContinuous2:
                     current_frame_ratios.append(calibration_data["ref_depth_val"] / max(valid_depths))
 
             # B) NLF SCALE 3D INPUT (Direkt aus SCAIL)
-            if nlf_poses_data is not None and frame_idx < len(nlf_poses_data) and scaling_mode in ["Auto (Combo)", "SCAIL 3D Only"]:
-                frame_3d = nlf_poses_data[frame_idx]
-                # Prüfen ob die Ziel-Person existiert
-                if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
-                    person_3d = frame_3d[target_person_index]
-                    if len(person_3d) > 8:
-                        p1, p8 = person_3d[1], person_3d[8]
-                        dist_3d = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2 + (p1[2]-p8[2])**2)
+            if nlf_poses_data is not None and scaling_mode in ["Auto (Combo)", "SCAIL 3D Only"]:
+                
+                # 1. Zuerst die Posen aus dem Dictionary entpacken (falls es eines ist)
+                if isinstance(nlf_poses_data, dict):
+                    # Wir holen uns die Liste aus 'joints3d_nonparam' (falls vorhanden)
+                    pose_input = nlf_poses_data.get('joints3d_nonparam', [nlf_poses_data])[0]
+                else:
+                    pose_input = nlf_poses_data
+
+                # 2. Jetzt prüfen wir die echte Länge und greifen auf den Frame zu!
+                if frame_idx < len(pose_input):
+                    frame_3d = pose_input[frame_idx]
+                    
+                    # 3. ALLES WAS JETZT KOMMT, MUSS EINGERÜCKT SEIN!
+                    if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
+                        p3d = frame_3d[target_person_index]
                         
-                        ref_dist = calibration_data.get("ref_torso_dist_3d") or calibration_data.get("ref_torso_dist_2d")
-                        if ref_dist and dist_3d > 0.01:
-                            current_frame_ratios.append(ref_dist / dist_3d)
+                        if len(p3d) > 8:
+                            dist_3d = math.sqrt((p3d[1][0]-p3d[8][0])**2 + (p3d[1][1]-p3d[8][1])**2 + (p3d[1][2]-p3d[8][2])**2)
+                            ref_dist = calibration_data.get("ref_torso_dist_3d") or calibration_data.get("ref_torso_dist_2d")
+                            
+                            if ref_dist and dist_3d > 0.01:
+                                current_frame_ratios.append(ref_dist / dist_3d)
 
             # Durchschnitt bilden
             if current_frame_ratios:
@@ -8768,18 +8779,30 @@ class PoseDataAutoScalerAnalysis:
                 if valid_depths:
                     current_frame_ratios.append(calibration_data["ref_depth_val"] / max(valid_depths))
 
-            # B) SCAIL 3D BERECHNUNG
-            if nlf_poses_data is not None and frame_idx < len(nlf_poses_data) and scaling_mode in ["Auto (Combo)", "SCAIL 3D Only"]:
-                frame_3d = nlf_poses_data[frame_idx]
-                if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
-                    person_3d = frame_3d[target_person_index]
-                    if len(person_3d) > 8:
-                        p1, p8 = person_3d[1], person_3d[8]
-                        dist_3d = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2 + (p1[2]-p8[2])**2)
+            # B) NLF SCALE 3D INPUT (Direkt aus SCAIL)
+            if nlf_poses_data is not None and scaling_mode in ["Auto (Combo)", "SCAIL 3D Only"]:
+                
+                # 1. Zuerst die Posen aus dem Dictionary entpacken (falls es eines ist)
+                if isinstance(nlf_poses_data, dict):
+                    # Wir holen uns die Liste aus 'joints3d_nonparam' (falls vorhanden)
+                    pose_input = nlf_poses_data.get('joints3d_nonparam', [nlf_poses_data])[0]
+                else:
+                    pose_input = nlf_poses_data
+
+                # 2. Jetzt prüfen wir die echte Länge und greifen auf den Frame zu!
+                if frame_idx < len(pose_input):
+                    frame_3d = pose_input[frame_idx]
+                    
+                    # 3. ALLES WAS JETZT KOMMT, MUSS EINGERÜCKT SEIN!
+                    if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
+                        p3d = frame_3d[target_person_index]
                         
-                        ref_dist = calibration_data.get("ref_torso_dist_3d") or calibration_data.get("ref_torso_dist_2d")
-                        if ref_dist and dist_3d > 0.01:
-                            current_frame_ratios.append(ref_dist / dist_3d)
+                        if len(p3d) > 8:
+                            dist_3d = math.sqrt((p3d[1][0]-p3d[8][0])**2 + (p3d[1][1]-p3d[8][1])**2 + (p3d[1][2]-p3d[8][2])**2)
+                            ref_dist = calibration_data.get("ref_torso_dist_3d") or calibration_data.get("ref_torso_dist_2d")
+                            
+                            if ref_dist and dist_3d > 0.01:
+                                current_frame_ratios.append(ref_dist / dist_3d)
 
             # Wenn wir eine Ratio gefunden haben, speichern wir sie im passenden Qualitäts-Fach
             if current_frame_ratios:
@@ -8922,15 +8945,30 @@ class PoseDataGlobalScaler:
                 if valid_depths and max(valid_depths) > 0.001:
                     current_frame_ratios.append(calibration_data["ref_depth_val"] / max(valid_depths))
 
-            if nlf_poses_data is not None and frame_idx < len(nlf_poses_data) and scaling_mode in ["Auto (Combo)", "SCAIL 3D Only"]:
-                frame_3d = nlf_poses_data[frame_idx]
-                if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
-                    p3d = frame_3d[target_person_index]
-                    if len(p3d) > 8:
-                        dist_3d = math.sqrt((p3d[1][0]-p3d[8][0])**2 + (p3d[1][1]-p3d[8][1])**2 + (p3d[1][2]-p3d[8][2])**2)
-                        ref_dist = calibration_data.get("ref_torso_dist_3d") or calibration_data.get("ref_torso_dist_2d")
-                        if ref_dist and dist_3d > 0.01:
-                            current_frame_ratios.append(ref_dist / dist_3d)
+            # B) NLF SCALE 3D INPUT (Direkt aus SCAIL)
+            if nlf_poses_data is not None and scaling_mode in ["Auto (Combo)", "SCAIL 3D Only"]:
+                
+                # 1. Zuerst die Posen aus dem Dictionary entpacken (falls es eines ist)
+                if isinstance(nlf_poses_data, dict):
+                    # Wir holen uns die Liste aus 'joints3d_nonparam' (falls vorhanden)
+                    pose_input = nlf_poses_data.get('joints3d_nonparam', [nlf_poses_data])[0]
+                else:
+                    pose_input = nlf_poses_data
+
+                # 2. Jetzt prüfen wir die echte Länge und greifen auf den Frame zu!
+                if frame_idx < len(pose_input):
+                    frame_3d = pose_input[frame_idx]
+                    
+                    # 3. ALLES WAS JETZT KOMMT, MUSS EINGERÜCKT SEIN!
+                    if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
+                        p3d = frame_3d[target_person_index]
+                        
+                        if len(p3d) > 8:
+                            dist_3d = math.sqrt((p3d[1][0]-p3d[8][0])**2 + (p3d[1][1]-p3d[8][1])**2 + (p3d[1][2]-p3d[8][2])**2)
+                            ref_dist = calibration_data.get("ref_torso_dist_3d") or calibration_data.get("ref_torso_dist_2d")
+                            
+                            if ref_dist and dist_3d > 0.01:
+                                current_frame_ratios.append(ref_dist / dist_3d)
 
             if current_frame_ratios:
                 global_scale_ratios.append(sum(current_frame_ratios) / len(current_frame_ratios))
