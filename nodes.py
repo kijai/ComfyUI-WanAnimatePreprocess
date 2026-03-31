@@ -8196,7 +8196,6 @@ class PoseDataDynamicScalerContinuous:
             if ankle_y > old_hip_y:
                 kps[9][1] = (old_hip_y + offset_px) + ((safe_get_y(9) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
 
-import numpy as np
 
 class PoseDataToDWPoses:
     @classmethod
@@ -8218,50 +8217,102 @@ class PoseDataToDWPoses:
         results = []
         
         for meta in pose_metas:
-            # Dimensionen für die Normalisierung (SCAIL erwartet Werte von 0.0 bis 1.0)
+            # Dimensionen für die Normalisierung holen (SCAIL erwartet 0.0 - 1.0)
             width = getattr(meta, "width", 512) or 512
             height = getattr(meta, "height", 512) or 512
-            kps_body = getattr(meta, "kps_body", [])
-            
-            bodies = []
-            body_scores = []
-            
-            # OpenPose/DWPose Standard nutzt 18 Keypoints
-            NUM_BODY = 18
-            if kps_body:
-                pose_xy = []
-                scores = []
-                for i in range(NUM_BODY):
-                    if i < len(kps_body) and len(kps_body[i]) >= 2:
-                        x, y = kps_body[i][0], kps_body[i][1]
-                        pose_xy.append([x / width, y / height])
-                        
-                        # Score übernehmen oder auf 1.0 setzen
-                        score = kps_body[i][2] if len(kps_body[i]) > 2 else 1.0
-                        scores.append(score)
-                    else:
-                        pose_xy.append([0.0, 0.0])
-                        scores.append(0.0)
-                
-                bodies.append(pose_xy)
-                body_scores.append(scores)
-            
-            result = {
-                'bodies': {
-                    'candidate': np.array(bodies, dtype=np.float32),
-                    'subset': np.array([np.arange(NUM_BODY) for _ in bodies], dtype=np.float32) if bodies else np.array([])
-                },
-                'hands': np.array([], dtype=np.float32), 
-                'faces': np.array([], dtype=np.float32), 
-                'body_score': np.array(body_scores, dtype=np.float32),
-                'hand_score': np.array([], dtype=np.float32),
-                'face_score': np.array([], dtype=np.float32)
-            }
-            results.append(result)
-            
-        out_dict = {'poses': results, 'swap_hands': False}
-        return (out_dict,)
 
+            # Überprüfen, ob meta ein Dictionary oder eine AAPoseMeta Instanz ist
+            is_dict = isinstance(meta, dict)
+
+            if is_dict:
+                kps_body = np.array(meta.get("keypoints_body", []))
+                kps_lhand = np.array(meta.get("keypoints_left_hand", []))
+                kps_rhand = np.array(meta.get("keypoints_right_hand", []))
+                kps_face = np.array(meta.get("keypoints_face", []))
+
+                # Die letzten 2 Punkte beim Körper weglassen (20 -> 18)
+                candidate_body = kps_body[:-2, :2] if len(kps_body) > 2 else np.zeros((18, 2))
+                score_body = kps_body[:-2, 2] if len(kps_body) > 2 else np.zeros((18,))
+                
+                lhand_coords = kps_lhand[:, :2] if len(kps_lhand) > 0 else np.zeros((21, 2))
+                lhand_score = kps_lhand[:, 2] if len(kps_lhand) > 0 else np.zeros((21,))
+                
+                rhand_coords = kps_rhand[:, :2] if len(kps_rhand) > 0 else np.zeros((21, 2))
+                rhand_score = kps_rhand[:, 2] if len(kps_rhand) > 0 else np.zeros((21,))
+
+                # Bei Gesicht den ersten Punkt auslassen (69 -> 68)
+                face_coords = kps_face[1:, :2] if len(kps_face) > 1 else np.zeros((68, 2))
+                face_score = kps_face[1:, 2] if len(kps_face) > 1 else np.zeros((68,))
+
+            else:
+                # Meta ist eine AAPoseMeta Instanz (Koordinaten sind meist noch in Pixeln)
+                b_coords = getattr(meta, "kps_body", None)
+                if b_coords is not None and len(b_coords) > 2:
+                    candidate_body = b_coords[:-2].copy()
+                    candidate_body[:, 0] /= width
+                    candidate_body[:, 1] /= height
+                    score_body = getattr(meta, "kps_body_p")[:-2]
+                else:
+                    candidate_body = np.zeros((18, 2))
+                    score_body = np.zeros((18,))
+
+                # Linke Hand
+                lh_coords = getattr(meta, "kps_lhand", None)
+                if lh_coords is not None and len(lh_coords) > 0:
+                    lhand_coords = lh_coords.copy()
+                    lhand_coords[:, 0] /= width
+                    lhand_coords[:, 1] /= height
+                    lhand_score = getattr(meta, "kps_lhand_p", np.zeros((21,)))
+                else:
+                    lhand_coords = np.zeros((21, 2))
+                    lhand_score = np.zeros((21,))
+
+                # Rechte Hand
+                rh_coords = getattr(meta, "kps_rhand", None)
+                if rh_coords is not None and len(rh_coords) > 0:
+                    rhand_coords = rh_coords.copy()
+                    rhand_coords[:, 0] /= width
+                    rhand_coords[:, 1] /= height
+                    rhand_score = getattr(meta, "kps_rhand_p", np.zeros((21,)))
+                else:
+                    rhand_coords = np.zeros((21, 2))
+                    rhand_score = np.zeros((21,))
+
+                # Gesicht
+                f_coords = getattr(meta, "kps_face", None)
+                if f_coords is not None and len(f_coords) > 1:
+                    face_coords = f_coords[1:].copy()
+                    face_coords[:, 0] /= width
+                    face_coords[:, 1] /= height
+                    face_score = getattr(meta, "kps_face_p", np.zeros((69,)))[1:]
+                else:
+                    face_coords = np.zeros((68, 2))
+                    face_score = np.zeros((68,))
+
+            # Subset Matrix aufbauen: -1 wenn Score unter Threshold von 0.3 ist
+            subset_body = np.arange(len(candidate_body), dtype=float)
+            subset_body[score_body <= 0.3] = -1
+
+            # Hände wie in DWPose/SCAIL stacken (Rechts, dann Links!)
+            hands_coords = np.stack([rhand_coords, lhand_coords], axis=0)
+            hands_score = np.stack([rhand_score, lhand_score], axis=0)
+
+            # Dictionary im Zielformat für DWPose / SCAIL bauen
+            dwpose_format = {
+                "bodies": {
+                    "candidate": np.expand_dims(candidate_body, axis=0).astype(np.float32),
+                    "subset": np.expand_dims(subset_body, axis=0).astype(np.float32)
+                },
+                "hands": hands_coords.astype(np.float32),
+                "faces": np.expand_dims(face_coords, axis=0).astype(np.float32),
+                "body_score": np.expand_dims(score_body, axis=0).astype(np.float32),
+                "hand_score": hands_score.astype(np.float32),
+                "face_score": np.expand_dims(face_score, axis=0).astype(np.float32)
+            }
+            results.append(dwpose_format)
+
+        out_dict = {'poses': results, 'swap_hands': True}
+        return (out_dict,)
 
 class RenderNLFPosesWithData:
     @classmethod
