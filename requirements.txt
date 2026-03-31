@@ -1,3 +1,4 @@
 onnx
 onnxruntime-gpu
 opencv-python
+taichi
