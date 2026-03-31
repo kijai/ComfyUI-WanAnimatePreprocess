@@ -8299,7 +8299,7 @@ class RenderNLFPosesWithData:
         # Wir geben Image, Mask UND die nlf_poses wieder zurück
         return (image, mask, nlf_poses)
 
-class RetargetPoseCalibrator:
+class RetargetPoseCalibrator2:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -8359,7 +8359,7 @@ class RetargetPoseCalibrator:
         return (calibration_data,)
 
 
-class PoseDataDynamicScalerContinuous:
+class PoseDataDynamicScalerContinuous2:
     HEAD_INDICES = [0, 1, 2, 3, 4]  
     TORSO_INDICES = [1, 2, 5, 8, 11] 
     HIP_INDICES = [8, 11]
@@ -8656,10 +8656,6 @@ class PoseDataAutoScalerAnalysis:
         foot_y = [meta.kps_body[idx][1] / getattr(meta, "height", 1.0) for idx in self.FOOT_INDICES if idx < len(meta.kps_body) and len(meta.kps_body[idx]) >= 2 and meta.kps_body[idx][1] > 0]
         return max(foot_y) if foot_y else None
 
-import copy
-import numpy as np
-import math
-import torch
 
 class PoseDataGlobalScaler:
     HEAD_INDICES = [0, 1, 2, 3, 4]  
@@ -8853,8 +8849,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataDynamicScalerContinuous": PoseDataDynamicScalerContinuous,
     "PoseDataToDWPoses": PoseDataToDWPoses,
     "RenderNLFPosesWithData": RenderNLFPosesWithData,
-    "RetargetPoseCalibrator": RetargetPoseCalibrator,
-    "PoseDataDynamicScalerContinuous": PoseDataDynamicScalerContinuous,
+    "RetargetPoseCalibrator": RetargetPoseCalibrator2,
+    "PoseDataDynamicScalerContinuous": PoseDataDynamicScalerContinuous2,
     "PoseDataAutoScalerAnalysis": PoseDataAutoScalerAnalysis,
     "PoseDataGlobalScaler": PoseDataGlobalScaler,
 }
@@ -8907,8 +8903,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataDynamicScalerContinuous": "Pose Data Dynamic Scaler (Ultimate)",
     "PoseDataToDWPoses": "PoseDataToDWPoses",
     "RenderNLFPosesWithData": "Render NLF Poses & Data (SCAIL)",
-    "RetargetPoseCalibrator": "Retarget Pose Calibrator (Ultimate)",
-    "PoseDataDynamicScalerContinuous": "Pose Data Dynamic Scaler (Ultimate)",
+    "RetargetPoseCalibrator2": "Retarget Pose Calibrator (Ultimate)",
+    "PoseDataDynamicScalerContinuous2": "Pose Data Dynamic Scaler (Ultimate)",
     "PoseDataAutoScalerAnalysis": "Pose Data Auto Scaler (Smart Analysis)",
     "PoseDataGlobalScaler": "Pose Data Global Scaler (No Jumps)",
 }
