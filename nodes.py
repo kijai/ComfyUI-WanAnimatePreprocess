@@ -8850,8 +8850,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataToDWPoses": PoseDataToDWPoses,
     "RenderNLFPosesWithData": RenderNLFPosesWithData,
     "RetargetPoseCalibrator": RetargetPoseCalibrator2,
-    "PoseDataDynamicScalerContinuous": PoseDataDynamicScalerContinuous2,
-    "PoseDataAutoScalerAnalysis": PoseDataAutoScalerAnalysis,
+    "PoseDataDynamicScalerContinuous2": PoseDataDynamicScalerContinuous2,
+    "PoseDataAutoScalerAnalysis2": PoseDataAutoScalerAnalysis,
     "PoseDataGlobalScaler": PoseDataGlobalScaler,
 }
 
