@@ -7944,6 +7944,258 @@ class PoseDataAutoReferenceScaler:
                 new_knee_y = new_hip_y + ratio * (ankle_y - new_hip_y)
                 kps[9][1] = new_knee_y
 
+# ==============================================================================
+# 1. KALIBRIERUNGS-NODE (Retarget Pose Calibrator)
+# ==============================================================================
+class RetargetPoseCalibrator:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "retarget_pose": ("POSEDATA", {"tooltip": "Das manuell skalierte 1-Frame Skelett"}),
+            },
+            "optional": {
+                "retarget_depth_map": ("IMAGE", {"tooltip": "Die DepthMap (DepthAnything) für dieses eine Retarget-Bild"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION",)
+    RETURN_NAMES = ("calibration_data",)
+    FUNCTION = "calibrate"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "Analysiert die Retarget-Pose und erstellt ein Kalibrierungs-Profil für die Skalierung."
+
+    def calibrate(self, retarget_pose, retarget_depth_map=None):
+        ref_metas = retarget_pose.get("pose_metas", [])
+        if not ref_metas:
+            print("[Calibrator] Fehler: Keine Pose-Daten gefunden.")
+            return ({},)
+
+        ref_meta = ref_metas[0]
+        kps = getattr(ref_meta, "kps_body", [])
+        kps_3d = getattr(ref_meta, "kps_body_3d", kps)
+
+        calibration_data = {
+            "has_depth_map": retarget_depth_map is not None,
+            "ref_depth_val": None,
+            "ref_torso_dist_3d": None,
+            "ref_torso_dist_2d": None,
+        }
+
+        # 1. Depth-Map Wert am Hals (Index 1) auslesen
+        if retarget_depth_map is not None and len(kps) > 1 and len(kps[1]) >= 2:
+            x, y = kps[1][0], kps[1][1]
+            if x > 0 and y > 0:
+                if len(retarget_depth_map.shape) == 4:
+                    H, W = retarget_depth_map.shape[1], retarget_depth_map.shape[2]
+                    px, py = max(0, min(int(x), W - 1)), max(0, min(int(y), H - 1))
+                    val = float(retarget_depth_map[0, py, px, 0].item() if isinstance(retarget_depth_map, torch.Tensor) else retarget_depth_map[0, py, px, 0])
+                    calibration_data["ref_depth_val"] = val
+                    print(f"[Calibrator] DepthMap-Wert am Hals: {val:.4f}")
+
+        # 2. SCAIL 3D / 2D Torso-Distanz (Hals 1 zu Hüfte 8)
+        if len(kps_3d) > 8:
+            p1, p8 = kps_3d[1], kps_3d[8]
+            if len(p1) >= 2 and len(p8) >= 2 and p1[1] > 0 and p8[1] > 0:
+                calibration_data["ref_torso_dist_2d"] = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2)
+                if len(p1) >= 4 or (len(p1) == 3 and not (0.0 <= p1[2] <= 1.0)):
+                    calibration_data["ref_torso_dist_3d"] = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2 + (p1[2]-p8[2])**2)
+                    print(f"[Calibrator] 3D-Torso Volumen erkannt: {calibration_data['ref_torso_dist_3d']:.2f}")
+
+        return (calibration_data,)
+
+
+# ==============================================================================
+# 2. DYNAMISCHE SKALIERUNGS-NODE FÜR DAS VIDEO
+# ==============================================================================
+class PoseDataDynamicScalerContinuous:
+    HEAD_INDICES = [0, 1, 2, 3, 4]  
+    TORSO_INDICES = [1, 2, 5, 8, 11] # Hals, Schultern, Hüften (für den Anti-Verdeckungs-Check)
+    HIP_INDICES = [8, 11]
+    FOOT_INDICES = [10, 13, 15, 16, 18, 19, 20, 21, 22, 23, 24] 
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "target_person_index": ("INT", {"default": 0, "min": 0, "max": 10, "step": 1, "tooltip": "Welche Person? 0 = Erste Person"}),
+                "scaling_mode": (["Auto (Combo)", "SCAIL 3D Only", "Depth Map Only"],),
+                "smoothing_frames": ("INT", {"default": 5, "min": 1, "max": 30, "step": 1, "tooltip": "Glättet die Skalierung (Anti-Zittern)"}),
+            },
+            "optional": {
+                "video_depth_map": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("scaled_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "Frame-genaue Skalierung mit Anti-Verdeckungs-Filter (Occlusion) und Smoothing."
+
+    def process(self, video_pose_data, calibration_data, target_person_index, scaling_mode, smoothing_frames, video_depth_map=None):
+        if not calibration_data:
+            return (video_pose_data,)
+
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        if not pose_metas: 
+            return (pose_data_copy,)
+
+        raw_ratios = []
+
+        # --- 1. FRAME-BY-FRAME ANALYSE ---
+        for frame_idx, meta in enumerate(pose_metas):
+            kps_body_all = getattr(meta, "kps_body", [])
+            
+            if not kps_body_all:
+                raw_ratios.append(raw_ratios[-1] if raw_ratios else 1.0)
+                continue
+
+            current_frame_ratios = []
+
+            # A) DEPTH MAP BERECHNUNG (Anti-Verdeckung)
+            if calibration_data.get("ref_depth_val") and video_depth_map is not None and scaling_mode in ["Auto (Combo)", "Depth Map Only"]:
+                valid_depths = []
+                for pt_idx in self.TORSO_INDICES:
+                    if pt_idx < len(kps_body_all) and len(kps_body_all[pt_idx]) >= 2:
+                        score = kps_body_all[pt_idx][2] if len(kps_body_all[pt_idx]) > 2 else 1.0
+                        if score < 0.1: 
+                            continue 
+                            
+                        x, y = kps_body_all[pt_idx][0], kps_body_all[pt_idx][1]
+                        if x > 0 and y > 0:
+                            H, W = video_depth_map.shape[1], video_depth_map.shape[2]
+                            px, py = max(0, min(int(x), W - 1)), max(0, min(int(y), H - 1))
+                            
+                            v_idx = min(frame_idx, video_depth_map.shape[0] - 1)
+                            val = float(video_depth_map[v_idx, py, px, 0].item() if isinstance(video_depth_map, torch.Tensor) else video_depth_map[v_idx, py, px, 0])
+                            
+                            if val > 0.001: 
+                                valid_depths.append(val)
+                
+                if valid_depths:
+                    deepest_val = max(valid_depths) 
+                    current_frame_ratios.append(calibration_data["ref_depth_val"] / deepest_val)
+
+            # B) SCAIL 3D BERECHNUNG
+            if scaling_mode in ["Auto (Combo)", "SCAIL 3D Only"]:
+                kps_3d = getattr(meta, "kps_body_3d", kps_body_all)
+                if len(kps_3d) > 8:
+                    p1, p8 = kps_3d[1], kps_3d[8] 
+                    score_p1 = p1[2] if len(p1) > 2 and self._is_score(p1[2]) else 1.0
+                    score_p8 = p8[2] if len(p8) > 2 and self._is_score(p8[2]) else 1.0
+                    
+                    if len(p1) >= 2 and len(p8) >= 2 and p1[1] > 0 and p8[1] > 0 and score_p1 > 0.1 and score_p8 > 0.1:
+                        if len(p1) >= 4 or (len(p1) == 3 and not self._is_score(p1[2])):
+                            dist_3d = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2 + (p1[2]-p8[2])**2)
+                        else:
+                            dist_3d = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2)
+                            
+                        ref_dist = calibration_data.get("ref_torso_dist_3d") or calibration_data.get("ref_torso_dist_2d")
+                        if ref_dist and dist_3d > 0.01: 
+                            current_frame_ratios.append(ref_dist / dist_3d)
+
+            if current_frame_ratios:
+                raw_ratios.append(sum(current_frame_ratios) / len(current_frame_ratios))
+            else:
+                raw_ratios.append(raw_ratios[-1] if raw_ratios else 1.0)
+
+        # --- 2. SMOOTHING (Zittern verhindern) ---
+        smoothed_ratios = []
+        for i in range(len(raw_ratios)):
+            start = max(0, i - smoothing_frames // 2)
+            end = min(len(raw_ratios), i + smoothing_frames // 2 + 1)
+            smoothed_ratios.append(np.mean(raw_ratios[start:end]))
+
+        # --- 3. SKALIERUNG ANWENDEN ---
+        for frame_idx, meta in enumerate(pose_metas):
+            scale_ratio = smoothed_ratios[frame_idx]
+            if scale_ratio <= 0.001 or scale_ratio == 1.0:
+                continue
+
+            height = getattr(meta, "height", 1.0) or 1.0
+            
+            anchor_y = self._find_best_anchor_y(meta)
+            top_y = self._find_pose_top(meta)
+            
+            if anchor_y is None or top_y is None: continue
+
+            current_visual_height = anchor_y - top_y
+            if current_visual_height <= 0: continue
+
+            target_visual_height = current_visual_height * scale_ratio
+            
+            target_top_y = anchor_y - target_visual_height
+            offset_y_norm = target_top_y - top_y
+            offset_px = offset_y_norm * height
+
+            hip_coords_before = self._get_hip_coords(meta)
+            self._apply_offset_to_upper_body(meta, offset_px)
+            
+            if hip_coords_before:
+                self._reconnect_legs(meta, hip_coords_before, offset_px)
+
+        return (pose_data_copy,)
+
+    # --- HELPER FUNKTIONEN ---
+    def _is_score(self, val):
+        return 0.0 <= val <= 1.0
+
+    def _find_best_anchor_y(self, meta):
+        kps = getattr(meta, "kps_body", [])
+        if not kps: return None
+        height = getattr(meta, "height", 1.0) or 1.0
+        
+        bottom_y = self._find_pose_bottom(meta)
+        if bottom_y is not None: return bottom_y
+        
+        hips_y = [kps[idx][1] / height for idx in self.HIP_INDICES if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0]
+        if hips_y: return max(hips_y)
+        return None
+
+    def _find_pose_top(self, meta):
+        kps = getattr(meta, "kps_body", [])
+        if not kps: return None
+        height = getattr(meta, "height", 1.0) or 1.0
+        head_y = [kps[idx][1] / height for idx in self.HEAD_INDICES if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0]
+        return min(head_y) if head_y else None
+
+    def _find_pose_bottom(self, meta):
+        kps = getattr(meta, "kps_body", [])
+        if not kps: return None
+        height = getattr(meta, "height", 1.0) or 1.0
+        foot_y = [kps[idx][1] / height for idx in self.FOOT_INDICES if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0]
+        return max(foot_y) if foot_y else None
+
+    def _get_hip_coords(self, meta):
+        kps = getattr(meta, "kps_body", [])
+        if not kps: return {}
+        return {idx: kps[idx][:] for idx in self.HIP_INDICES if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0}
+
+    def _apply_offset_to_upper_body(self, meta, offset_px):
+        kps = getattr(meta, "kps_body", [])
+        for i in range(len(kps)):
+            if i not in self.FOOT_INDICES and len(kps[i]) >= 2 and kps[i][1] > 0:
+                kps[i][1] += offset_px
+
+    def _reconnect_legs(self, meta, hip_coords_before, offset_px):
+        kps = getattr(meta, "kps_body", [])
+        def safe_get_y(idx):
+            return kps[idx][1] if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 else None
+
+        if 11 in hip_coords_before and safe_get_y(13) is not None and safe_get_y(15) is not None:
+            old_hip_y, ankle_y = hip_coords_before[11][1], safe_get_y(15)
+            if ankle_y > old_hip_y:
+                kps[13][1] = (old_hip_y + offset_px) + ((safe_get_y(13) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
+
+        if 8 in hip_coords_before and safe_get_y(9) is not None and safe_get_y(10) is not None:
+            old_hip_y, ankle_y = hip_coords_before[8][1], safe_get_y(10)
+            if ankle_y > old_hip_y:
+                kps[9][1] = (old_hip_y + offset_px) + ((safe_get_y(9) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
+
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -7989,6 +8241,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataSelectFrameNode": PoseDataSelectFrameNode,
     "LoadPoseDataFromJsonNode": LoadPoseDataFromJsonNode,
     "PoseDataAutoReferenceScaler": PoseDataAutoReferenceScaler,
+    "RetargetPoseCalibrator": RetargetPoseCalibrator,
+    "PoseDataDynamicScalerContinuous": PoseDataDynamicScalerContinuous,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -8035,6 +8289,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataSelectFrameNode": "Pose Data Select Frame",
     "LoadPoseDataFromJsonNode": "Load Pose Data From JSON",
     "PoseDataAutoReferenceScaler": "Pose Data Auto Reference Scaler (Smart)",
+    "RetargetPoseCalibrator": "Retarget Pose Calibrator (Ultimate)",
+    "PoseDataDynamicScalerContinuous": "Pose Data Dynamic Scaler (Ultimate)",
 }
 
 
