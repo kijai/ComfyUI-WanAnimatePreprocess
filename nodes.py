@@ -8880,7 +8880,6 @@ class PoseDataAutoScalerAnalysis:
         foot_y = [meta.kps_body[idx][1] / getattr(meta, "height", 1.0) for idx in self.FOOT_INDICES if idx < len(meta.kps_body) and len(meta.kps_body[idx]) >= 2 and meta.kps_body[idx][1] > 0]
         return max(foot_y) if foot_y else None
 
-
 class PoseDataGlobalScaler:
     HEAD_INDICES = [0, 1, 2, 3, 4]  
     TORSO_INDICES = [1, 2, 5, 8, 11] 
@@ -8922,7 +8921,9 @@ class PoseDataGlobalScaler:
 
         for frame_idx, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
-            if not kps: continue
+            
+            # FIX: Sichere Abfrage für NumPy-Arrays!
+            if kps is None or len(kps) == 0: continue
 
             head_y = self._get_median_y(kps, self.HEAD_INDICES)
             hip_y = self._get_median_y(kps, self.HIP_INDICES)
@@ -8950,7 +8951,6 @@ class PoseDataGlobalScaler:
                 
                 # 1. Zuerst die Posen aus dem Dictionary entpacken (falls es eines ist)
                 if isinstance(nlf_poses_data, dict):
-                    # Wir holen uns die Liste aus 'joints3d_nonparam' (falls vorhanden)
                     pose_input = nlf_poses_data.get('joints3d_nonparam', [nlf_poses_data])[0]
                 else:
                     pose_input = nlf_poses_data
@@ -8959,7 +8959,6 @@ class PoseDataGlobalScaler:
                 if frame_idx < len(pose_input):
                     frame_3d = pose_input[frame_idx]
                     
-                    # 3. ALLES WAS JETZT KOMMT, MUSS EINGERÜCKT SEIN!
                     if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
                         p3d = frame_3d[target_person_index]
                         
@@ -8986,6 +8985,9 @@ class PoseDataGlobalScaler:
         for meta in pose_metas:
             kps = getattr(meta, "kps_body", [])
             height = getattr(meta, "height", 1.0) or 1.0
+            
+            # Auch in Phase 2 sicherstellen, dass wir gültige Keypoints haben
+            if kps is None or len(kps) == 0: continue
             
             head_y = self._get_median_y(kps, self.HEAD_INDICES, height)
             hip_y = self._get_median_y(kps, self.HIP_INDICES, height)
@@ -9038,6 +9040,7 @@ class PoseDataGlobalScaler:
     def _get_median_y(self, kps, indices, height_divider=1.0):
         vals = [kps[idx][1] / height_divider for idx in indices if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 and (kps[idx][2] > 0.1 if len(kps[idx])>2 else True)]
         return float(np.median(vals)) if vals else None
+
 import os
 import json
 import folder_paths
