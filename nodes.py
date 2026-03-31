@@ -8490,6 +8490,9 @@ class RenderNLFPosesWithData:
 
         return (frames_tensor.cpu().float(), mask.cpu().float(), nlf_poses)
 
+import math
+import torch
+
 class RetargetPoseCalibrator2:
     @classmethod
     def INPUT_TYPES(cls):
@@ -8532,14 +8535,21 @@ class RetargetPoseCalibrator2:
                     calibration_data["ref_depth_val"] = val
 
         # 2. NLF 3D Scale Daten auslesen (SCAIL)
-        if nlf_poses_data is not None and len(nlf_poses_data) > 0:
-            frame_3d = nlf_poses_data[0] # Frame 0
-            if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3:
-                person_3d = frame_3d[0] # Person 0
-                if len(person_3d) > 8:
-                    p1, p8 = person_3d[1], person_3d[8] # Hals und Hüfte im 3D Raum
-                    calibration_data["ref_torso_dist_3d"] = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2 + (p1[2]-p8[2])**2)
-                    print(f"[Calibrator] NLF 3D-Torso Distanz: {calibration_data['ref_torso_dist_3d']:.2f}")
+        if nlf_poses_data is not None:
+            # FIX: Wir müssen die Posen erst aus dem Dictionary entpacken!
+            if isinstance(nlf_poses_data, dict):
+                pose_input = nlf_poses_data['joints3d_nonparam'][0] if 'joints3d_nonparam' in nlf_poses_data else nlf_poses_data
+            else:
+                pose_input = nlf_poses_data
+            
+            if len(pose_input) > 0:
+                frame_3d = pose_input[0] # Frame 0
+                if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 2:
+                    person_3d = frame_3d[0] # Person 0
+                    if len(person_3d) > 8:
+                        p1, p8 = person_3d[1], person_3d[8] # Hals und Hüfte im 3D Raum
+                        calibration_data["ref_torso_dist_3d"] = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2 + (p1[2]-p8[2])**2)
+                        print(f"[Calibrator] NLF 3D-Torso Distanz: {calibration_data['ref_torso_dist_3d']:.2f}")
 
         # Fallback 2D
         if len(kps) > 8:
