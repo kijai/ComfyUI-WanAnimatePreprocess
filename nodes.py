@@ -10394,6 +10394,101 @@ class PoseLocalBoneRetargeterV10:
         return (pose_data_copy,)
 
 
+class RetargetPoseCalibratorV5:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_close": ("POSEDATA",),
+                "depth_map_close": ("IMAGE",),
+                "pose_far": ("POSEDATA",),
+                "depth_map_far": ("IMAGE",),
+            },
+            "optional": {
+                "nlf_close": ("NLFPRED", {"tooltip": "3D Daten Frame nah (für echte Bone Lengths)"}),
+                "nlf_far": ("NLFPRED", {"tooltip": "3D Daten Frame fern"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION",)
+    RETURN_NAMES = ("calibration_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V5: Löst Verdeckungen (Waden weg). Berechnet Perspektive über GEMEINSAME Knochen."
+
+    def process(self, pose_close, depth_map_close, pose_far, depth_map_far, nlf_close=None, nlf_far=None):
+        # 1. Metadaten und Keypoints auslesen
+        meta_close = pose_close.get("pose_metas", [])[0]
+        meta_far = pose_far.get("pose_metas", [])[0]
+        
+        kps_c = getattr(meta_close, "kps_body", [])
+        kps_f = getattr(meta_far, "kps_body", [])
+        
+        # 2. Finde GEMEINSAME Keypoints (sichtbar in Frame 1 UND Frame 2)
+        shared_indices = []
+        for i in range(min(len(kps_c), len(kps_f))):
+            if len(kps_c[i]) >= 2 and kps_c[i][1] > 0 and len(kps_f[i]) >= 2 and kps_f[i][1] > 0:
+                shared_indices.append(i)
+                
+        if len(shared_indices) < 2:
+            print("[V5 Calibrator] WARNUNG: Nicht genug gemeinsame Punkte in beiden Frames gefunden!")
+            return ({"perspective_slope": 0.0, "perspective_intercept": 1.0, "true_3d_bones": {}},)
+            
+        # 3. Höhe der gemeinsamen Teile berechnen
+        shared_y_c = [kps_c[i][1] for i in shared_indices]
+        shared_y_f = [kps_f[i][1] for i in shared_indices]
+        
+        shared_height_close = max(shared_y_c) - min(shared_y_c)
+        shared_height_far = max(shared_y_f) - min(shared_y_f)
+        
+        # 4. Gesamte Höhe des ersten Frames (wo die Person ganz zu sehen ist)
+        all_y_c = [kp[1] for kp in kps_c if len(kp) >= 2 and kp[1] > 0]
+        full_height_close = max(all_y_c) - min(all_y_c)
+        
+        # 5. Skalierungsfaktor berechnen & theoretische Höhe für Frame 2 errechnen
+        scale_factor = shared_height_far / shared_height_close if shared_height_close > 0 else 1.0
+        theoretical_full_height_far = full_height_close * scale_factor
+        
+        print(f"[V5 Calibrator] Frame 1 Höhe: {full_height_close}px")
+        print(f"[V5 Calibrator] Faktor gemeinsamer Knochen: {scale_factor:.3f}x")
+        print(f"[V5 Calibrator] Theoretische Frame 2 Höhe (trotz fehlender Teile): {theoretical_full_height_far:.1f}px")
+        
+        # 6. Tiefe (Depth) nur an den sichtbaren, gemeinsamen Stellen messen
+        def get_depth(kps, indices, depth_map):
+            valid_x = [kps[i][0] for i in indices]
+            valid_y = [kps[i][1] for i in indices]
+            center_x = int(np.clip(np.mean(valid_x), 0, depth_map.shape[2]-1))
+            center_y = int(np.clip(np.mean(valid_y), 0, depth_map.shape[1]-1))
+            depth_np = depth_map.cpu().numpy() if hasattr(depth_map, 'cpu') else depth_map
+            return float(np.mean(depth_np[0, max(0, center_y-5):center_y+5, max(0, center_x-5):center_x+5]))
+
+        depth_c = get_depth(kps_c, shared_indices, depth_map_close)
+        depth_f = get_depth(kps_f, shared_indices, depth_map_far)
+        
+        # 7. Perspektiven-Kurve berechnen (mit der theoretischen Höhe!)
+        slope, intercept = 0.0, 1.0
+        if abs(depth_f - depth_c) > 0.01:
+            slope = (theoretical_full_height_far - full_height_close) / (depth_f - depth_c)
+            intercept = full_height_close - (slope * depth_c)
+            
+        # 8. ECHTE 3D Knochenlängen messen (für die V10B Node)
+        true_3d_bones = {}
+        if nlf_close is not None:
+            pose_3d = nlf_close.get('joints3d_nonparam', [nlf_close])[0][0][0]
+            def dist_3d(p1, p2):
+                return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)
+            
+            if len(pose_3d) > 13:
+                true_3d_bones = {
+                    "torso": dist_3d(pose_3d[1], pose_3d[8]),
+                    "r_thigh": dist_3d(pose_3d[8], pose_3d[9]),
+                    "r_calf": dist_3d(pose_3d[9], pose_3d[10]),
+                    "l_thigh": dist_3d(pose_3d[11], pose_3d[12]),
+                    "l_calf": dist_3d(pose_3d[12], pose_3d[13])
+                }
+
+        return ({"perspective_slope": slope, "perspective_intercept": intercept, "true_3d_bones": true_3d_bones},)
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -10460,6 +10555,7 @@ NODE_CLASS_MAPPINGS = {
     "RetargetPoseCalibratorV4": RetargetPoseCalibratorV4,
     "PoseGlobalPerspectiveScalerV10": PoseGlobalPerspectiveScalerV10,
     "PoseLocalBoneRetargeterV10": PoseLocalBoneRetargeterV10,
+    "RetargetPoseCalibratorV5": RetargetPoseCalibratorV5,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -10528,6 +10624,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RetargetPoseCalibratorV4": "Retarget Pose Calibrator V4 (3D Aware)",
     "PoseGlobalPerspectiveScalerV10": "Pose Global Perspective Scaler V10A",
     "PoseLocalBoneRetargeterV10": "Pose Local Bone Retargeter V10B",
+    "RetargetPoseCalibratorV5": "Retarget Pose Calibrator V5 (partial body)",
 }
 
 
