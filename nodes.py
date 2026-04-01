@@ -9594,6 +9594,276 @@ class PoseDataGlobalScalerV4:
         print("-------------------------------\n")
         return (pose_data_copy,)
 
+
+class PoseDataGlobalScalerV5:
+    HIP_INDICES = [8, 11]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "target_person_index": ("INT", {"default": 0, "min": 0, "max": 10}),
+                "scaling_mode": (["SCAIL 3D (Rotation Aware)", "2D Visual Size (Fallback)", "Auto Blend (3D+2D)"],),
+            },
+            "optional": {
+                "nlf_poses_data": ("NLFPRED",),
+                "video_depth_map": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("scaled_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V5: Integriert NLF 3D Posen für saubere Rotationen + skaliert Hände/Gesicht perfekt mit."
+
+    def process(self, video_pose_data, calibration_data, target_person_index, scaling_mode, nlf_poses_data=None, video_depth_map=None):
+        if not calibration_data: return (video_pose_data,)
+        
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        if not pose_metas: return (pose_data_copy,)
+
+        ref_2d = calibration_data.get("ref_torso_dist_2d")
+        ref_3d = calibration_data.get("ref_torso_dist_3d")
+
+        print(f"\n--- PoseDataGlobalScaler V5 ---")
+        print(f"Modus: {scaling_mode}")
+        if scaling_mode in ["SCAIL 3D (Rotation Aware)", "Auto Blend (3D+2D)"] and nlf_poses_data is None:
+            print("WARNUNG: 3D Modus gewählt, aber kein NLF-Input angeschlossen! Falle auf 2D zurück.")
+
+        for frame_idx, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            if kps is None or len(kps) == 0: continue
+
+            # --- 1. 2D Torso Messung (wie in V4) ---
+            neck_y = kps[1][1] if len(kps) > 1 and len(kps[1]) >= 2 and kps[1][1] > 0 else None
+            hip_y_vals = [kps[i][1] for i in self.HIP_INDICES if i < len(kps) and len(kps[i]) >= 2 and kps[i][1] > 0]
+            hip_y = np.mean(hip_y_vals) if hip_y_vals else None
+
+            ratio_2d = 1.0
+            if neck_y and hip_y:
+                video_torso_2d = hip_y - neck_y
+                if ref_2d and video_torso_2d > 10:
+                    ratio_2d = ref_2d / video_torso_2d
+
+            # --- 2. 3D Torso Messung (NEU mit echtem NLF 3D-Skelett) ---
+            ratio_3d = None
+            if nlf_poses_data is not None and ref_3d:
+                try:
+                    # Daten auslesen, je nachdem ob es ein Dict oder Array ist
+                    pose_input = nlf_poses_data.get('joints3d_nonparam', [nlf_poses_data])[0] if isinstance(nlf_poses_data, dict) else nlf_poses_data
+                    
+                    if frame_idx < len(pose_input):
+                        frame_3d = pose_input[frame_idx]
+                        if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
+                            p3d = frame_3d[target_person_index]
+                            
+                            # Berechne echten 3D-Abstand zwischen Neck (1) und Mid-Hip (8)
+                            if len(p3d) > 8:
+                                dist_3d = math.sqrt((p3d[1][0]-p3d[8][0])**2 + (p3d[1][1]-p3d[8][1])**2 + (p3d[1][2]-p3d[8][2])**2)
+                                if dist_3d > 0.01:
+                                    ratio_3d = ref_3d / dist_3d
+                except Exception as e:
+                    pass # Überspringe Frame leise, falls Daten fehlen
+
+            # --- 3. Den stabilsten Faktor wählen ---
+            scale_factor = 1.0
+            if scaling_mode == "SCAIL 3D (Rotation Aware)":
+                scale_factor = ratio_3d if ratio_3d is not None else ratio_2d
+            elif scaling_mode == "2D Visual Size (Fallback)":
+                scale_factor = ratio_2d
+            else: # Auto Blend (SCAIL dominiert, 2D hilft minimal)
+                scale_factor = (ratio_3d * 0.7 + ratio_2d * 0.3) if ratio_3d is not None else ratio_2d
+
+            if scale_factor <= 0.01 or scale_factor == 1.0:
+                continue
+
+            # --- 4. Ankerpunkt für die Geometrie finden ---
+            valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
+            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
+            if not valid_y: continue
+            
+            pivot_y = max(valid_y) # Füße auf dem Boden lassen
+            pivot_x = np.mean(valid_x)
+
+            # --- 5. ALLES GEOMETRISCH SKALIEREN (inklusive Hände & Gesicht!) ---
+            # Dieser Loop fixt das Hand-Problem, indem er alle Arrays abläuft
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None:
+                    for i in range(len(arr)):
+                        if len(arr[i]) >= 2 and arr[i][1] > 0:
+                            arr[i][0] = pivot_x + (arr[i][0] - pivot_x) * scale_factor
+                            arr[i][1] = pivot_y + (arr[i][1] - pivot_y) * scale_factor
+
+        print("-> V5 Skalierung (inkl. Hände/Gesicht) erfolgreich angewendet.")
+        print("-------------------------------\n")
+        return (pose_data_copy,)
+
+
+class PoseDataGlobalScalerV6:
+    HIP_INDICES = [8, 11]
+    FOOT_INDICES = [10, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "target_person_index": ("INT", {"default": 0, "min": 0, "max": 10}),
+                "scaling_mode": (["SCAIL 3D (Rotation Aware)", "2D Visual Size (Fallback)", "Auto Blend (3D+2D)"],),
+            },
+            "optional": {
+                "nlf_poses_data": ("NLFPRED",),
+                "video_depth_map": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("scaled_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V6: Nutzer-Logik! Scannt nach Anchor-Frame, berechnet Faktor 1x und skaliert jitter-frei."
+
+    def process(self, video_pose_data, calibration_data, target_person_index, scaling_mode, nlf_poses_data=None, video_depth_map=None):
+        if not calibration_data: return (video_pose_data,)
+        
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        if not pose_metas: return (pose_data_copy,)
+
+        ref_2d = calibration_data.get("ref_torso_dist_2d")
+        ref_3d = calibration_data.get("ref_torso_dist_3d")
+
+        print(f"\n--- PoseDataGlobalScaler V6 (Anti-Jitter) ---")
+        
+        # --- PHASE 1: ANCHOR FRAME FINDEN (Deine Logik!) ---
+        # Wir suchen den Frame mit den meisten und sichersten Keypoints
+        best_frame_idx = 0
+        max_score = -1
+        
+        global_leg_ratios = []
+
+        for idx, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            if kps is None or len(kps) == 0: continue
+            
+            score = 0
+            neck_y = kps[1][1] if len(kps) > 1 and len(kps[1]) >= 2 and kps[1][1] > 0 else None
+            hip_y_vals = [kps[i][1] for i in self.HIP_INDICES if i < len(kps) and len(kps[i]) >= 2 and kps[i][1] > 0]
+            hip_y = np.mean(hip_y_vals) if hip_y_vals else None
+            
+            foot_y_vals = [kps[i][1] for i in self.FOOT_INDICES if i < len(kps) and len(kps[i]) >= 2 and kps[i][1] > 0]
+            foot_y = np.max(foot_y_vals) if foot_y_vals else None
+
+            # Bonuspunkte, wenn Torso und Füße sichtbar sind
+            if neck_y and hip_y: score += 10
+            if foot_y: score += 10
+            
+            # Zähle alle sicher erkannten Körperteile
+            for kp in kps:
+                if len(kp) >= 3 and kp[2] > 0.2 and kp[1] > 0: score += 1
+
+            if score > max_score:
+                max_score = score
+                best_frame_idx = idx
+                
+            # Nebenbei die durchschnittliche Beinlänge lernen (für den Phantom-Anker)
+            if neck_y and hip_y and foot_y:
+                torso_len = hip_y - neck_y
+                leg_len = foot_y - hip_y
+                if torso_len > 10 and leg_len > 10:
+                    global_leg_ratios.append(leg_len / torso_len)
+
+        learned_leg_ratio = float(np.median(global_leg_ratios)) if global_leg_ratios else 1.3
+        print(f"-> Anchor Frame gefunden: Frame {best_frame_idx} (Score: {max_score})")
+
+        # --- PHASE 2: SKALIERUNGSFAKTOR AUS ANCHOR FRAME BERECHNEN ---
+        # Wir rechnen nur noch ein einziges Mal!
+        anchor_meta = pose_metas[best_frame_idx]
+        anchor_kps = getattr(anchor_meta, "kps_body", [])
+        
+        a_neck_y = anchor_kps[1][1] if len(anchor_kps) > 1 and len(anchor_kps[1]) >= 2 and anchor_kps[1][1] > 0 else None
+        a_hip_y_vals = [anchor_kps[i][1] for i in self.HIP_INDICES if i < len(anchor_kps) and len(anchor_kps[i]) >= 2 and anchor_kps[i][1] > 0]
+        a_hip_y = np.mean(a_hip_y_vals) if a_hip_y_vals else None
+
+        ratio_2d = 1.0
+        if a_neck_y and a_hip_y:
+            video_torso_2d = a_hip_y - a_neck_y
+            if ref_2d and video_torso_2d > 10:
+                ratio_2d = ref_2d / video_torso_2d
+
+        ratio_3d = None
+        if nlf_poses_data is not None and ref_3d:
+            try:
+                pose_input = nlf_poses_data.get('joints3d_nonparam', [nlf_poses_data])[0] if isinstance(nlf_poses_data, dict) else nlf_poses_data
+                if best_frame_idx < len(pose_input):
+                    frame_3d = pose_input[best_frame_idx]
+                    if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 3 and frame_3d.shape[0] > target_person_index:
+                        p3d = frame_3d[target_person_index]
+                        if len(p3d) > 8:
+                            dist_3d = math.sqrt((p3d[1][0]-p3d[8][0])**2 + (p3d[1][1]-p3d[8][1])**2 + (p3d[1][2]-p3d[8][2])**2)
+                            if dist_3d > 0.01:
+                                ratio_3d = ref_3d / dist_3d
+            except Exception:
+                pass
+
+        global_scale_factor = 1.0
+        if scaling_mode == "SCAIL 3D (Rotation Aware)":
+            global_scale_factor = ratio_3d if ratio_3d is not None else ratio_2d
+        elif scaling_mode == "2D Visual Size (Fallback)":
+            global_scale_factor = ratio_2d
+        else:
+            global_scale_factor = (ratio_3d * 0.7 + ratio_2d * 0.3) if ratio_3d is not None else ratio_2d
+
+        print(f"-> Fester Globaler Scale-Faktor: {global_scale_factor:.4f}")
+
+        if global_scale_factor <= 0.01 or global_scale_factor == 1.0:
+            return (pose_data_copy,)
+
+        # --- PHASE 3: GLOBALEN FAKTOR AUF ALLE FRAMES ANWENDEN ---
+        for meta in pose_metas:
+            kps = getattr(meta, "kps_body", [])
+            if kps is None or len(kps) == 0: continue
+
+            neck_y = kps[1][1] if len(kps) > 1 and len(kps[1]) >= 2 and kps[1][1] > 0 else None
+            hip_y_vals = [kps[i][1] for i in self.HIP_INDICES if i < len(kps) and len(kps[i]) >= 2 and kps[i][1] > 0]
+            hip_y = np.mean(hip_y_vals) if hip_y_vals else None
+            
+            if not neck_y or not hip_y: continue
+
+            # X-Achsen Anker (Mitte der Person)
+            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
+            pivot_x = np.mean(valid_x) if valid_x else 0
+
+            # Y-Achsen Anker (ANTI-ZAPPEL-LOGIK)
+            # Wenn Füße im Bild sind, sind sie der Anker. 
+            # Wenn sie fehlen, ERRECHNET er den virtuellen Boden (Phantom-Anker) aus der Torsohöhe.
+            foot_y_vals = [kps[i][1] for i in self.FOOT_INDICES if i < len(kps) and len(kps[i]) >= 2 and kps[i][1] > 0]
+            if foot_y_vals:
+                pivot_y = np.max(foot_y_vals)
+            else:
+                torso_len = hip_y - neck_y
+                pivot_y = hip_y + (torso_len * learned_leg_ratio)
+
+            # Wende den festen Skalierungsfaktor geometrisch auf ALLES an (Körper, Hände, Gesicht)
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None:
+                    for i in range(len(arr)):
+                        if len(arr[i]) >= 2 and arr[i][1] > 0:
+                            arr[i][0] = pivot_x + (arr[i][0] - pivot_x) * global_scale_factor
+                            arr[i][1] = pivot_y + (arr[i][1] - pivot_y) * global_scale_factor
+
+        print("-> Geometrische Skalierung jitterfrei auf alle Frames angewendet.")
+        print("-------------------------------\n")
+        return (pose_data_copy,)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -9652,6 +9922,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataGlobalScalerV2": PoseDataGlobalScalerV2,
     "PoseDataGlobalScalerV3": PoseDataGlobalScalerV3,
     "PoseDataGlobalScalerV4": PoseDataGlobalScalerV4,
+    "PoseDataGlobalScalerV5": PoseDataGlobalScalerV5,
+    "PoseDataGlobalScalerV6": PoseDataGlobalScalerV6,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -9711,7 +9983,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadPoseCalibration": "Load Pose Calibration (Ultimate)",
     "PoseDataGlobalScalerV2": "Pose Data Global Scaler V2 (God-Frame)",
     "PoseDataGlobalScalerV3": "Pose Data Global Scaler (V3 Ultimate)",
-    "PoseDataGlobalScalerV4": "Pose Data Global Scaler (V4 Ultimate)"
+    "PoseDataGlobalScalerV4": "Pose Data Global Scaler (V4 Ultimate)",
+    "PoseDataGlobalScalerV5": "Pose Data Global Scaler (V5 NLF 3D)",
+    "PoseDataGlobalScalerV6": "Pose Data Global Scaler (V6 Anti-Jitter)",
 }
 
 
