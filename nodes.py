@@ -8493,6 +8493,72 @@ class RenderNLFPosesWithData:
 import math
 import torch
 
+class RetargetPoseCalibrator2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "retarget_pose": ("POSEDATA",),
+            },
+            "optional": {
+                "nlf_poses_data": ("NLFPRED", {"tooltip": "Der NLF 3D-Scale Input für das Retarget-Bild"}),
+                "retarget_depth_map": ("IMAGE", {"tooltip": "Die DepthMap für das Retarget-Bild"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION",)
+    RETURN_NAMES = ("calibration_data",)
+    FUNCTION = "calibrate"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+
+    def calibrate(self, retarget_pose, nlf_poses_data=None, retarget_depth_map=None):
+        ref_metas = retarget_pose.get("pose_metas", [])
+        if not ref_metas: return ({},)
+
+        ref_meta = ref_metas[0]
+        kps = getattr(ref_meta, "kps_body", [])
+        
+        calibration_data = {
+            "ref_depth_val": None,
+            "ref_torso_dist_3d": None,
+            "ref_torso_dist_2d": None,
+        }
+
+        # 1. Depth-Map auslesen
+        if retarget_depth_map is not None and len(kps) > 1 and len(kps[1]) >= 2:
+            x, y = kps[1][0], kps[1][1]
+            if x > 0 and y > 0:
+                if len(retarget_depth_map.shape) == 4:
+                    H, W = retarget_depth_map.shape[1], retarget_depth_map.shape[2]
+                    px, py = max(0, min(int(x), W - 1)), max(0, min(int(y), H - 1))
+                    val = float(retarget_depth_map[0, py, px, 0].item() if isinstance(retarget_depth_map, torch.Tensor) else retarget_depth_map[0, py, px, 0])
+                    calibration_data["ref_depth_val"] = val
+
+        # 2. NLF 3D Scale Daten auslesen (SCAIL)
+        if nlf_poses_data is not None:
+            # FIX: Wir müssen die Posen erst aus dem Dictionary entpacken!
+            if isinstance(nlf_poses_data, dict):
+                pose_input = nlf_poses_data['joints3d_nonparam'][0] if 'joints3d_nonparam' in nlf_poses_data else nlf_poses_data
+            else:
+                pose_input = nlf_poses_data
+            
+            if len(pose_input) > 0:
+                frame_3d = pose_input[0] # Frame 0
+                if hasattr(frame_3d, 'shape') and len(frame_3d.shape) >= 2:
+                    person_3d = frame_3d[0] # Person 0
+                    if len(person_3d) > 8:
+                        p1, p8 = person_3d[1], person_3d[8] # Hals und Hüfte im 3D Raum
+                        calibration_data["ref_torso_dist_3d"] = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2 + (p1[2]-p8[2])**2)
+                        print(f"[Calibrator] NLF 3D-Torso Distanz: {calibration_data['ref_torso_dist_3d']:.2f}")
+
+        # Fallback 2D
+        if len(kps) > 8:
+            p1, p8 = kps[1], kps[8]
+            if len(p1) >= 2 and len(p8) >= 2 and p1[1] > 0 and p8[1] > 0:
+                calibration_data["ref_torso_dist_2d"] = math.sqrt((p1[0]-p8[0])**2 + (p1[1]-p8[1])**2)
+
+        return (calibration_data,)
+        
 class RetargetPoseCalibratorV2:
     @classmethod
     def INPUT_TYPES(cls):
@@ -9276,7 +9342,153 @@ class PoseDataGlobalScalerV2:
         vals = [kps[idx][1] / height_divider for idx in indices if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 and (kps[idx][2] > 0.1 if len(kps[idx])>2 else True)]
         return float(np.median(vals)) if vals else None
 
+class PoseDataGlobalScalerV3:
+    # Wir nutzen nur die stabilsten Anker (ohne Hände/Füße)
+    HEAD_INDICES = [0, 1, 2, 3, 4]  
+    HIP_INDICES = [8, 9, 11, 12] 
+    FOOT_INDICES = [11, 14, 15, 16, 19, 20, 21, 22, 23, 24] 
 
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "target_person_index": ("INT", {"default": 0, "min": 0, "max": 10}),
+                # Neuer Modus: 2D Visual Anchor ist jetzt der Standard!
+                "scaling_mode": (["2D Visual Size (Best)", "3D Depth Map", "SCAIL 3D", "Auto (2D + 3D Blend)"],),
+            },
+            "optional": {
+                "nlf_poses_data": ("NLFPRED",),
+                "video_depth_map": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("scaled_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V3: Nutzt 2D-Pixelabstände (Torso) als visuellen Anker für absolut exakte Bildschirmgrößen."
+
+    def process(self, video_pose_data, calibration_data, target_person_index, scaling_mode, nlf_poses_data=None, video_depth_map=None):
+        if not calibration_data: 
+            print("[GlobalScaler V3] Abbruch: Keine calibration_data angeschlossen!")
+            return (video_pose_data,)
+        
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        if not pose_metas: return (pose_data_copy,)
+
+        global_leg_to_torso_ratios = []
+        global_scale_ratios = []
+        
+        print(f"\n--- PoseDataGlobalScaler V3 DIAGNOSE LOG ---")
+        print(f"Modus: {scaling_mode}")
+
+        # --- PHASE 1: REFERENZ-DATEN SAMMELN ---
+        for frame_idx, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            height = getattr(meta, "height", 1.0) or 1.0
+            if kps is None or len(kps) == 0: continue
+
+            # Ermittle die Y-Koordinaten der stabilen Anker (in echten Pixeln)
+            head_y = self._get_median_y(kps, self.HEAD_INDICES)
+            hip_y = self._get_median_y(kps, self.HIP_INDICES)
+            foot_y = self._get_median_y(kps, self.FOOT_INDICES)
+            
+            # Leg Ratio für den Fallback lernen
+            if head_y and hip_y and foot_y:
+                torso_len = hip_y - head_y
+                leg_len = foot_y - hip_y
+                if torso_len > 10 and leg_len > 10:
+                    global_leg_to_torso_ratios.append(leg_len / torso_len)
+
+            current_frame_ratios = []
+
+            # ---------------------------------------------------------
+            # LOGIK 1: 2D VISUAL PIXEL SIZE (Der neue, beste Weg)
+            # ---------------------------------------------------------
+            if scaling_mode in ["2D Visual Size (Best)", "Auto (2D + 3D Blend)"]:
+                ref_2d = calibration_data.get("ref_torso_dist_2d")
+                if ref_2d and head_y and hip_y:
+                    video_torso_px = (hip_y - head_y) * height
+                    if video_torso_px > 20: # Nur wenn Torso gut sichtbar
+                        ratio_2d = ref_2d / video_torso_px
+                        current_frame_ratios.append(ratio_2d)
+
+            # ---------------------------------------------------------
+            # LOGIK 2: 3D DEPTH MAP
+            # ---------------------------------------------------------
+            if scaling_mode in ["3D Depth Map", "Auto (2D + 3D Blend)"] and video_depth_map is not None:
+                ref_depth = calibration_data.get("ref_depth_val")
+                if ref_depth:
+                    # Holt Depth-Wert des Torsos (Index 1)
+                    depth_val = float(video_depth_map[min(frame_idx, video_depth_map.shape[0]-1), int(max(0, min(kps[1][1], video_depth_map.shape[1]-1))), int(max(0, min(kps[1][0], video_depth_map.shape[2]-1))), 0])
+                    if depth_val > 0.001:
+                        current_frame_ratios.append(ref_depth / depth_val)
+
+            if current_frame_ratios:
+                # Durchschnitt aller aktiven Methoden für diesen Frame
+                global_scale_ratios.append(sum(current_frame_ratios) / len(current_frame_ratios))
+
+        # Finale Globale Werte berechnen
+        final_scale_ratio = float(np.median(global_scale_ratios)) if global_scale_ratios else 1.0
+        learned_leg_ratio = float(np.median(global_leg_to_torso_ratios)) if global_leg_to_torso_ratios else 1.3
+
+        print(f"Berechnete Leg-Ratio: {learned_leg_ratio:.2f}")
+        print(f"Finaler Scale Faktor: {final_scale_ratio:.4f}")
+        print("----------------------------------------------\n")
+        
+        if final_scale_ratio <= 0.001 or final_scale_ratio == 1.0: 
+            return (pose_data_copy,)
+
+        # --- PHASE 2: SKALIERUNG ANWENDEN ---
+        for meta in pose_metas:
+            kps = getattr(meta, "kps_body", [])
+            height = getattr(meta, "height", 1.0) or 1.0
+            if kps is None or len(kps) == 0: continue
+            
+            head_y = self._get_median_y(kps, self.HEAD_INDICES, height)
+            hip_y = self._get_median_y(kps, self.HIP_INDICES, height)
+            foot_y = self._get_median_y(kps, self.FOOT_INDICES, height)
+
+            if not head_y or not hip_y: continue
+
+            torso_height = hip_y - head_y
+            if torso_height <= 0: continue
+
+            # Phantom-Anker für die Füße
+            anchor_y = foot_y if foot_y is not None else hip_y + (torso_height * learned_leg_ratio)
+
+            current_visual_height = anchor_y - head_y
+            target_visual_height = current_visual_height * final_scale_ratio
+            
+            target_top_y = anchor_y - target_visual_height
+            offset_px = (target_top_y - head_y) * height
+
+            hip_coords_before = {idx: kps[idx][:] for idx in self.HIP_INDICES if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0}
+            
+            for i in range(len(kps)):
+                # Füße bleiben am Boden, der Rest wird nach oben gezogen
+                if i not in self.FOOT_INDICES and len(kps[i]) >= 2 and kps[i][1] > 0:
+                    kps[i][1] += offset_px
+            
+            def safe_get_y(idx): return kps[idx][1] if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 else None
+            
+            # Knie interpolieren (Verbinden Hüfte und Füße)
+            if 11 in hip_coords_before and safe_get_y(13) is not None and safe_get_y(15) is not None:
+                old_hip_y, ankle_y = hip_coords_before[11][1], safe_get_y(15)
+                if ankle_y > old_hip_y: kps[13][1] = (old_hip_y + offset_px) + ((safe_get_y(13) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
+            
+            if 8 in hip_coords_before and safe_get_y(9) is not None and safe_get_y(10) is not None:
+                old_hip_y, ankle_y = hip_coords_before[8][1], safe_get_y(10)
+                if ankle_y > old_hip_y: kps[9][1] = (old_hip_y + offset_px) + ((safe_get_y(9) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
+
+        return (pose_data_copy,)
+
+    def _get_median_y(self, kps, indices, height_divider=1.0):
+        vals = [kps[idx][1] / height_divider for idx in indices if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 and (kps[idx][2] > 0.1 if len(kps[idx])>2 else True)]
+        return float(np.median(vals)) if vals else None
 
 
 NODE_CLASS_MAPPINGS = {
@@ -9334,6 +9546,7 @@ NODE_CLASS_MAPPINGS = {
     "SavePoseCalibration": SavePoseCalibration,
     "LoadPoseCalibration": LoadPoseCalibration,
     "PoseDataGlobalScalerV2": PoseDataGlobalScalerV2,
+    "PoseDataGlobalScalerV3": PoseDataGlobalScalerV3,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -9391,6 +9604,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SavePoseCalibration": "Save Pose Calibration (Ultimate)",
     "LoadPoseCalibration": "Load Pose Calibration (Ultimate)",
     "PoseDataGlobalScalerV2": "Pose Data Global Scaler V2 (God-Frame)",
+    "PoseDataGlobalScalerV3": "Pose Data Global Scaler (V3 Ultimate)",
 }
 
 
