@@ -10606,6 +10606,114 @@ class PoseDataLowerLegRemover:
 
         return (pose_data_copy,)
 
+# ======================================================================
+# 1. KALIBRIERUNG V5 (FIXED: ROBUSTE TIEFENMESSUNG)
+# ======================================================================
+class RetargetPoseCalibratorV6:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_close": ("POSEDATA",),
+                "depth_map_close": ("IMAGE",),
+                "pose_far": ("POSEDATA",),
+                "depth_map_far": ("IMAGE",),
+            },
+            "optional": {
+                "nlf_close": ("NLFPRED", {"tooltip": "3D Daten Frame nah (für echte Bone Lengths)"}),
+                "nlf_far": ("NLFPRED", {"tooltip": "3D Daten Frame fern"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION",)
+    RETURN_NAMES = ("calibration_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V5: Berechnet Perspektive stabil, auch bei rauschenden Depth-Maps."
+
+    def process(self, pose_close, depth_map_close, pose_far, depth_map_far, nlf_close=None, nlf_far=None):
+        meta_close = pose_close.get("pose_metas", [])[0]
+        meta_far = pose_far.get("pose_metas", [])[0]
+        
+        kps_c = getattr(meta_close, "kps_body", [])
+        kps_f = getattr(meta_far, "kps_body", [])
+        
+        shared_indices = []
+        for i in range(min(len(kps_c), len(kps_f))):
+            if len(kps_c[i]) >= 2 and kps_c[i][1] > 0 and len(kps_f[i]) >= 2 and kps_f[i][1] > 0:
+                shared_indices.append(i)
+                
+        if len(shared_indices) < 2:
+            print("[V5 Calibrator] WARNUNG: Nicht genug gemeinsame Punkte!")
+            return ({"perspective_slope": 0.0, "perspective_intercept": 1.0, "true_3d_bones": {}},)
+            
+        shared_y_c = [kps_c[i][1] for i in shared_indices]
+        shared_y_f = [kps_f[i][1] for i in shared_indices]
+        
+        shared_height_close = max(shared_y_c) - min(shared_y_c)
+        shared_height_far = max(shared_y_f) - min(shared_y_f)
+        
+        all_y_c = [kp[1] for kp in kps_c if len(kp) >= 2 and kp[1] > 0]
+        full_height_close = max(all_y_c) - min(all_y_c)
+        
+        scale_factor = shared_height_far / shared_height_close if shared_height_close > 0 else 1.0
+        theoretical_full_height_far = full_height_close * scale_factor
+        
+        # --- FIX: ROBUSTE TIEFENMESSUNG ÜBER DEN GESAMTEN TORSO ---
+        def get_robust_depth(kps, indices, depth_map):
+            valid_x = [kps[i][0] for i in indices]
+            valid_y = [kps[i][1] for i in indices]
+            depth_np = depth_map.cpu().numpy() if hasattr(depth_map, 'cpu') else depth_map
+            
+            H, W = depth_np.shape[1], depth_np.shape[2]
+            min_x, max_x = int(max(0, min(valid_x))), int(min(W-1, max(valid_x)))
+            min_y, max_y = int(max(0, min(valid_y))), int(min(H-1, max(valid_y)))
+            
+            # Wir messen die Tiefe in einem großen Rechteck über den sichtbaren Bereich
+            # (Das glättet Rauschen aus der Depth Map extrem gut)
+            if max_x > min_x and max_y > min_y:
+                area_depth = np.mean(depth_np[0, min_y:max_y, min_x:max_x])
+                return float(area_depth)
+            else:
+                return 0.5 # Fallback
+
+        depth_c = get_robust_depth(kps_c, shared_indices, depth_map_close)
+        depth_f = get_robust_depth(kps_f, shared_indices, depth_map_far)
+        
+        slope, intercept = 0.0, 1.0
+        
+        # --- FIX: SICHERHEITS-CHECK FÜR DIE TIEFE ---
+        depth_diff = abs(depth_f - depth_c)
+        if depth_diff > 0.05: # Die Tiefe MUSS sich mindestens um 5% unterscheiden, sonst explodiert die Kurve!
+            slope = (theoretical_full_height_far - full_height_close) / (depth_f - depth_c)
+            intercept = full_height_close - (slope * depth_c)
+        else:
+            print(f"[V5 Calibrator] WARNUNG: Bilder 'Nah' und 'Fern' sind in der Depth-Map zu ähnlich! (Diff: {depth_diff:.3f}). Nutze Fallback-Kurve.")
+            # Sanfter Fallback, damit nichts explodiert
+            slope = 500.0 if depth_f > depth_c else -500.0
+            intercept = full_height_close - (slope * depth_c)
+            
+        print(f"[V5 Calibrator] Depth Nah: {depth_c:.3f}, Depth Fern: {depth_f:.3f}")
+        print(f"[V5 Calibrator] Berechneter Slope: {slope:.2f}")
+            
+        true_3d_bones = {}
+        if nlf_close is not None:
+            pose_3d = nlf_close.get('joints3d_nonparam', [nlf_close])[0][0][0]
+            def dist_3d(p1, p2):
+                return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)
+            
+            if len(pose_3d) > 13:
+                true_3d_bones = {
+                    "torso": dist_3d(pose_3d[1], pose_3d[8]),
+                    "r_thigh": dist_3d(pose_3d[8], pose_3d[9]),
+                    "r_calf": dist_3d(pose_3d[9], pose_3d[10]),
+                    "l_thigh": dist_3d(pose_3d[11], pose_3d[12]),
+                    "l_calf": dist_3d(pose_3d[12], pose_3d[13])
+                }
+
+        return ({"perspective_slope": slope, "perspective_intercept": intercept, "true_3d_bones": true_3d_bones},)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -10674,6 +10782,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseLocalBoneRetargeterV10": PoseLocalBoneRetargeterV10,
     "RetargetPoseCalibratorV5": RetargetPoseCalibratorV5,
     "PoseDataLowerLegRemover": PoseDataLowerLegRemover,
+    "RetargetPoseCalibratorV6": RetargetPoseCalibratorV6,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -10744,6 +10853,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseLocalBoneRetargeterV10": "Pose Local Bone Retargeter V10B",
     "RetargetPoseCalibratorV5": "Retarget Pose Calibrator V5 (partial body)",
     "PoseDataLowerLegRemover": "Pose Data Lower Leg Remover",
+    "RetargetPoseCalibratorV6": "Retarget Pose Calibrator V (median depth over person)",
 }
 
 
