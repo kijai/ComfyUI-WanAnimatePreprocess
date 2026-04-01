@@ -10242,7 +10242,7 @@ class RetargetPoseCalibratorV4:
 
 
 # ======================================================================
-# 2. V10A: GLOBAL PERSPECTIVE SCALER (FIXED)
+# 2. V10A: GLOBAL PERSPECTIVE SCALER (MIT LOGGING ALS TEXT-FELD)
 # ======================================================================
 class PoseGlobalPerspectiveScalerV10:
     @classmethod
@@ -10255,50 +10255,77 @@ class PoseGlobalPerspectiveScalerV10:
             }
         }
 
-    RETURN_TYPES = ("POSEDATA",)
-    RETURN_NAMES = ("scaled_pose_data",)
+    # HIER: "STRING" als zweiter Output hinzugefügt!
+    RETURN_TYPES = ("POSEDATA", "STRING",)
+    RETURN_NAMES = ("scaled_pose_data", "log_output",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V10A: Skaliert die Gesamte Person basierend auf Depth und Perspektive in die richtige Raumtiefe."
+    DESCRIPTION = "V10A: Skaliert die Gesamte Person. Hat jetzt einen Log-Ausgang für Fehlersuche im Textfeld."
 
     def process(self, video_pose_data, calibration_data, video_depth_map):
         pose_data_copy = copy.deepcopy(video_pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
         
+        # Hier sammeln wir alle Zeilen für unser Textfeld
+        log_messages = []
+        
         slope = calibration_data.get("perspective_slope", 0.0)
         intercept = calibration_data.get("perspective_intercept", 1.0)
         depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
         
+        log_messages.append("=== V10A GLOBAL SCALER LOG ===")
+        log_messages.append(f"Kalibrierung - Slope (Steigung): {slope:.4f}")
+        log_messages.append(f"Kalibrierung - Intercept (Startwert): {intercept:.2f}")
+        log_messages.append("-" * 50)
+        
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", None)
-            if kps is None or len(kps) == 0: continue # FIX: NumPy Array Safe Check
+            if kps is None or len(kps) == 0: 
+                log_messages.append(f"Frame {i}: Keine Keypoints gefunden -> Übersprungen")
+                continue
                 
             valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
             valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
-            if len(valid_y) == 0: continue # FIX: NumPy Array Safe Check
+            if len(valid_y) == 0: 
+                log_messages.append(f"Frame {i}: Keine gültigen Y-Koordinaten -> Übersprungen")
+                continue
                 
+            # Tiefe am Körperzentrum messen
             center_x = int(np.clip(np.mean(valid_x), 0, depth_np.shape[2]-1))
             center_y = int(np.clip(np.mean(valid_y), 0, depth_np.shape[1]-1))
             v_idx = min(i, depth_np.shape[0] - 1)
             current_depth = np.mean(depth_np[v_idx, max(0, center_y-5):center_y+5, max(0, center_x-5):center_x+5])
             
+            # Formel anwenden
             expected_size = current_depth * slope + intercept
             current_size = max(valid_y) - min(valid_y)
-            global_scale = expected_size / current_size if current_size > 0 else 1.0
             
-            pivot_y = max(valid_y)
+            # Faktor berechnen
+            raw_scale = expected_size / current_size if current_size > 0 else 1.0
+            
+            # --- SICHERHEITS-LIMIT (Clamp) ---
+            global_scale = max(0.5, min(2.5, raw_scale)) 
+            
+            # Log-Eintrag für diesen Frame
+            clamped_warning = " (GEBREMST!)" if global_scale != raw_scale else ""
+            log_messages.append(f"Frame {i}: Tiefe={current_depth:.3f} | Ist={current_size:.1f}px | Soll={expected_size:.1f}px | Faktor={global_scale:.2f}x{clamped_warning}")
+            
+            pivot_y = max(valid_y) # Tiefster Punkt (meistens Füße)
             pivot_x = np.mean(valid_x)
             
             for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
                 arr = getattr(meta, attr_name, None)
-                if arr is not None and len(arr) > 0: # FIX: NumPy Array Safe Check
+                if arr is not None and len(arr) > 0:
                     for j in range(len(arr)):
                         if len(arr[j]) >= 2 and arr[j][1] > 0:
                             arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * global_scale
                             arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * global_scale
 
-        return (pose_data_copy,)
-
+        # Wandelt die Liste in einen großen Textblock um
+        final_log = "\n".join(log_messages)
+        
+        # Gibt Posen-Daten UND den Text zurück
+        return (pose_data_copy, final_log)
 
 # ======================================================================
 # 3. V10B: LOCAL BONE RETARGETER (MIT LOG-AUSGANG)
