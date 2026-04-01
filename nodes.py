@@ -9863,6 +9863,168 @@ class PoseDataGlobalScalerV6:
         print("-------------------------------\n")
         return (pose_data_copy,)
 
+class RetargetPoseCalibratorV3:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_close": ("POSEDATA",),
+                "depth_map_close": ("IMAGE",),
+                "pose_far": ("POSEDATA",),
+                "depth_map_far": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION",)
+    RETURN_NAMES = ("calibration_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "Erstellt ein 3D-Linsenprofil aus zwei Posen (Nah und Fern) für perfekte perspektivische Skalierung."
+
+    def process(self, pose_close, depth_map_close, pose_far, depth_map_far):
+        def extract_data(pose_data, depth_map):
+            meta = pose_data.get("pose_metas", [])[0]
+            kps = getattr(meta, "kps_body", [])
+            neck_y = kps[1][1] if len(kps) > 1 and len(kps[1]) >= 2 else None
+            hip_y = kps[8][1] if len(kps) > 8 and len(kps[8]) >= 2 else None
+            
+            torso_2d = None
+            if neck_y and hip_y:
+                torso_2d = hip_y - neck_y
+                if torso_2d < 1.0: # Normalisiert auf Pixel umrechnen
+                    torso_2d *= getattr(meta, "height", 1024)
+            
+            depth_val = float(depth_map[0, int(kps[1][1]), int(kps[1][0]), 0]) if depth_map is not None else None
+            return torso_2d, depth_val
+
+        size_close, depth_close = extract_data(pose_close, depth_map_close)
+        size_far, depth_far = extract_data(pose_far, depth_map_far)
+
+        print("\n--- 2-FRAME CALIBRATOR V2 LOG ---")
+        print(f"Close Frame -> Size: {size_close:.2f}px | Depth: {depth_close:.4f}")
+        print(f"Far Frame   -> Size: {size_far:.2f}px | Depth: {depth_far:.4f}")
+
+        if size_close and depth_close and size_far and depth_far:
+            # Steigung (Slope) der Perspektive berechnen
+            slope = (size_far - size_close) / (depth_far - depth_close) if (depth_far - depth_close) != 0 else 0
+            print(f"-> Perspektiven-Faktor (Slope): {slope:.2f} Pixel pro Depth-Einheit")
+        else:
+            print("-> FEHLER: Konnte nicht alle Daten aus den 2 Frames lesen!")
+            slope = 0
+
+        calibration_data = {
+            "size_close": size_close,
+            "depth_close": depth_close,
+            "size_far": size_far,
+            "depth_far": depth_far,
+            "perspective_slope": slope,
+            # Fallback für alte Nodes
+            "ref_torso_dist_2d": size_close,
+            "ref_depth_val": depth_close 
+        }
+        return (calibration_data,)
+
+
+class PoseDataGlobalScalerV8:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_depth_map": ("IMAGE",),
+                "smoothing_window": ("INT", {"default": 5, "min": 1, "max": 30, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("scaled_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V8: Berechnet die exakte Pixelgröße in jeder Entfernung (Dynamic Perspective) + Anti-Jitter Smoothing."
+
+    def process(self, video_pose_data, calibration_data, video_depth_map, smoothing_window):
+        if not calibration_data or "perspective_slope" not in calibration_data: 
+            print("[V8] Fehler: Braucht den neuen 2-Frame Calibrator!")
+            return (video_pose_data,)
+        
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        if not pose_metas: return (pose_data_copy,)
+
+        slope = calibration_data["perspective_slope"]
+        base_size = calibration_data["size_close"]
+        base_depth = calibration_data["depth_close"]
+
+        print(f"\n--- PoseDataGlobalScaler V8 (Dynamic Perspective) ---")
+        
+        raw_scale_factors = []
+        
+        # 1. Berechne für JEDEN Frame den perfekten Skalierungsfaktor
+        for frame_idx, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            if kps is None or len(kps) < 12: 
+                raw_scale_factors.append(1.0)
+                continue
+
+            neck_y = kps[1][1] if kps[1][1] > 0 else None
+            hip_y = kps[8][1] if kps[8][1] > 0 else None
+            
+            if not neck_y or not hip_y:
+                raw_scale_factors.append(1.0)
+                continue
+
+            video_torso_2d = hip_y - neck_y
+            if video_torso_2d < 1.0: video_torso_2d *= getattr(meta, "height", 1024)
+
+            try:
+                # Wie tief steht die Person in DIESEM Frame?
+                current_depth = float(video_depth_map[min(frame_idx, video_depth_map.shape[0]-1), int(max(0, min(kps[1][1], video_depth_map.shape[1]-1))), int(max(0, min(kps[1][0], video_depth_map.shape[2]-1))), 0])
+                
+                # DIE MAGISCHE FORMEL (Dein ausgedachtes Prinzip in Mathe gegossen):
+                # Erwartete Größe = Basis-Größe + (Unterschied in Tiefe * Perspektiven-Faktor)
+                expected_target_size = base_size + ((current_depth - base_depth) * slope)
+                
+                # Wieviel müssen wir das Video-Skelett anpassen, um die erwartete Größe zu erreichen?
+                frame_scale_factor = expected_target_size / video_torso_2d if video_torso_2d > 10 else 1.0
+                raw_scale_factors.append(frame_scale_factor)
+            except Exception:
+                raw_scale_factors.append(1.0)
+
+        # 2. ANTI-JITTER SMOOTHING (Gleitender Durchschnitt)
+        # Verhindert, dass das Bild wackelt, indem Faktoren über mehrere Frames geglättet werden
+        smoothed_factors = []
+        for i in range(len(raw_scale_factors)):
+            start = max(0, i - smoothing_window // 2)
+            end = min(len(raw_scale_factors), i + smoothing_window // 2 + 1)
+            smoothed_factors.append(np.mean(raw_scale_factors[start:end]))
+
+        # 3. GEOMETRISCH SKALIEREN
+        for frame_idx, meta in enumerate(pose_metas):
+            scale_factor = smoothed_factors[frame_idx]
+            if scale_factor <= 0.01 or scale_factor == 1.0: continue
+
+            kps = getattr(meta, "kps_body", [])
+            if kps is None or len(kps) == 0: continue
+
+            valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
+            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
+            if not valid_y: continue
+            
+            pivot_y = max(valid_y) 
+            pivot_x = np.mean(valid_x) 
+
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None:
+                    for i in range(len(arr)):
+                        if len(arr[i]) >= 2 and arr[i][1] > 0:
+                            arr[i][0] = pivot_x + (arr[i][0] - pivot_x) * scale_factor
+                            arr[i][1] = pivot_y + (arr[i][1] - pivot_y) * scale_factor
+
+        print("-> Dynamische Perspektiven-Skalierung + Anti-Jitter angewendet!")
+        print("------------------------------------------------------\n")
+        return (pose_data_copy,)
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -9924,6 +10086,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataGlobalScalerV4": PoseDataGlobalScalerV4,
     "PoseDataGlobalScalerV5": PoseDataGlobalScalerV5,
     "PoseDataGlobalScalerV6": PoseDataGlobalScalerV6,
+    "RetargetPoseCalibratorV3": RetargetPoseCalibratorV3,
+    "PoseDataGlobalScalerV8": PoseDataGlobalScalerV8,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -9986,6 +10150,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataGlobalScalerV4": "Pose Data Global Scaler (V4 Ultimate)",
     "PoseDataGlobalScalerV5": "Pose Data Global Scaler (V5 NLF 3D)",
     "PoseDataGlobalScalerV6": "Pose Data Global Scaler (V6 Anti-Jitter)",
+    "RetargetPoseCalibratorV3": "Retarget Pose Calibrator v3 (2-Frame Profiler)",
+    "PoseDataGlobalScalerV8": "Pose Data Global Scaler (V8 Dynamic Perspective)",
 }
 
 
