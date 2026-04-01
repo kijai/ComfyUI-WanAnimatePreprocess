@@ -10497,7 +10497,7 @@ class PoseDataLowerLegRemover:
                 "pose_data": ("POSEDATA",),
                 "remove_knees": ("BOOLEAN", {
                     "default": True, 
-                    "tooltip": "Wenn True, werden auch die Knie gelöscht. Wenn False, nur Knöchel und Füße."
+                    "tooltip": "Wenn True, werden auch die Knie (9, 12) gelöscht. Wenn False, nur ab den Knöcheln."
                 }),
             }
         }
@@ -10506,18 +10506,17 @@ class PoseDataLowerLegRemover:
     RETURN_NAMES = ("pose_data",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Editor"
-    DESCRIPTION = "Entfernt die Unterschenkel und Füße aus den Pose-Daten (setzt sie auf 0.0)."
+    DESCRIPTION = "Entfernt die Unterschenkel und Füße extrem aggressiv aus den Pose-Daten."
 
     def process(self, pose_data, remove_knees):
         import copy
         import numpy as np
-        from .pose_utils.pose2d_utils import AAPoseMeta
 
+        # Deepcopy, um sicherzustellen, dass wir nicht im Cache rumpfuschen
         pose_data_copy = copy.deepcopy(pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
         pose_metas_original = pose_data_copy.get("pose_metas_original", [])
         
-        # OpenPose/SCAIL Indizes für Beine/Füße:
         # 9: Rechtes Knie, 12: Linkes Knie
         # 10: Rechter Knöchel, 13: Linker Knöchel
         # 18-24: Diverse Fuß/Zehen-Punkte
@@ -10526,40 +10525,43 @@ class PoseDataLowerLegRemover:
         else:
             indices_to_remove = [10, 13, 18, 19, 20, 21, 22, 23, 24]
 
-        # 1. Pose Metas verarbeiten (für das spätere Zeichnen und Verarbeiten)
+        removed_count = 0
+
+        # 1. Haupt-Metas verarbeiten (Das ist das, was DrawViTPose zeichnet!)
         for meta in pose_metas:
-            if not isinstance(meta, AAPoseMeta):
-                continue
-            
             coords = getattr(meta, "kps_body", None)
             scores = getattr(meta, "kps_body_p", None)
             
             if coords is not None and scores is not None:
                 for idx in indices_to_remove:
                     if idx < len(coords) and idx < len(scores):
-                        scores[idx] = 0.0         # Sichtbarkeit (Score) auf 0
-                        coords[idx][0] = 0.0      # X auf 0
-                        coords[idx][1] = 0.0      # Y auf 0
+                        # Extrem wichtig: Direkt ins Numpy-Array schreiben
+                        scores[idx] = 0.0
+                        coords[idx][0] = 0.0
+                        coords[idx][1] = 0.0
+                        removed_count += 1
 
-        # 2. Original Metas verarbeiten (für Retargeting oder SCAIL Export)
+        # 2. Original-Metas verarbeiten (Das ist das, was an Retargeting/SCAIL geht)
         for entry in pose_metas_original:
             if not isinstance(entry, dict):
                 continue
                 
             keypoints_body = entry.get("keypoints_body")
             if keypoints_body is not None:
-                points_np = np.asarray(keypoints_body, dtype=np.float32)
-                # Stellen sicher, dass X, Y und Score (dim >= 3) vorhanden sind
+                points_np = np.array(keypoints_body, dtype=np.float32)
                 if points_np.ndim == 2 and points_np.shape[1] >= 3:
                     for idx in indices_to_remove:
                         if idx < points_np.shape[0]:
-                            points_np[idx, 0] = 0.0 # X
-                            points_np[idx, 1] = 0.0 # Y
-                            points_np[idx, 2] = 0.0 # Score
+                            points_np[idx, 0] = 0.0
+                            points_np[idx, 1] = 0.0
+                            points_np[idx, 2] = 0.0
+                    # Zwingend als Liste zurückschreiben!
                     entry["keypoints_body"] = points_np.tolist()
 
-        return (pose_data_copy,)
+        # Logge in die Server-Konsole, damit wir sehen, ob er getriggert wird
+        print(f"\n[Lower Leg Remover] Erfolgreich ausgeführt! Es wurden {removed_count} Keypoints auf 0.0 gesetzt (Knie gelöscht: {remove_knees}).\n")
 
+        return (pose_data_copy,)
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
