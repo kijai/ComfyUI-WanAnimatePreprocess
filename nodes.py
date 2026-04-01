@@ -10853,7 +10853,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseLocalBoneRetargeterV10": "Pose Local Bone Retargeter V10B",
     "RetargetPoseCalibratorV5": "Retarget Pose Calibrator V5 (partial body)",
     "PoseDataLowerLegRemover": "Pose Data Lower Leg Remover",
-    "RetargetPoseCalibratorV6": "Retarget Pose Calibrator V (median depth over person)",
+    "RetargetPoseCalibratorV6": "Retarget Pose Calibrator V6 (median depth over person)",
 }
 
 
