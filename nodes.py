@@ -10242,7 +10242,7 @@ class RetargetPoseCalibratorV4:
 
 
 # ======================================================================
-# 2. V10A: GLOBAL PERSPECTIVE SCALER
+# 2. V10A: GLOBAL PERSPECTIVE SCALER (FIXED)
 # ======================================================================
 class PoseGlobalPerspectiveScalerV10:
     @classmethod
@@ -10259,7 +10259,7 @@ class PoseGlobalPerspectiveScalerV10:
     RETURN_NAMES = ("scaled_pose_data",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V10A: Skaliert die GEsamte Person basierend auf Depth und Perspektive in die richtige Raumtiefe."
+    DESCRIPTION = "V10A: Skaliert die Gesamte Person basierend auf Depth und Perspektive in die richtige Raumtiefe."
 
     def process(self, video_pose_data, calibration_data, video_depth_map):
         pose_data_copy = copy.deepcopy(video_pose_data)
@@ -10271,11 +10271,11 @@ class PoseGlobalPerspectiveScalerV10:
         
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", None)
-            if not kps: continue
+            if kps is None or len(kps) == 0: continue # FIX: NumPy Array Safe Check
                 
             valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
             valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
-            if not valid_y: continue
+            if len(valid_y) == 0: continue # FIX: NumPy Array Safe Check
                 
             center_x = int(np.clip(np.mean(valid_x), 0, depth_np.shape[2]-1))
             center_y = int(np.clip(np.mean(valid_y), 0, depth_np.shape[1]-1))
@@ -10286,12 +10286,12 @@ class PoseGlobalPerspectiveScalerV10:
             current_size = max(valid_y) - min(valid_y)
             global_scale = expected_size / current_size if current_size > 0 else 1.0
             
-            pivot_y = max(valid_y) # Füße am Boden lassen
+            pivot_y = max(valid_y)
             pivot_x = np.mean(valid_x)
             
             for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
                 arr = getattr(meta, attr_name, None)
-                if arr is not None:
+                if arr is not None and len(arr) > 0: # FIX: NumPy Array Safe Check
                     for j in range(len(arr)):
                         if len(arr[j]) >= 2 and arr[j][1] > 0:
                             arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * global_scale
@@ -10301,7 +10301,7 @@ class PoseGlobalPerspectiveScalerV10:
 
 
 # ======================================================================
-# 3. V10B: LOCAL BONE RETARGETER (3D Aware)
+# 3. V10B: LOCAL BONE RETARGETER (FIXED)
 # ======================================================================
 class PoseLocalBoneRetargeterV10:
     @classmethod
@@ -10337,11 +10337,10 @@ class PoseLocalBoneRetargeterV10:
         for i, meta in enumerate(pose_metas):
             if i >= len(pose_input_3d): break
             kps_2d = getattr(meta, "kps_body", None)
-            pose_3d = pose_input_3d[i][0] # Erster Charakter
+            pose_3d = pose_input_3d[i][0]
             
-            if kps_2d is None or len(pose_3d) < 14: continue
+            if kps_2d is None or len(kps_2d) == 0 or len(pose_3d) < 14: continue # FIX: NumPy Array Safe Check
             
-            # 1. 3D Längen der Person IM VIDEO messen
             src_3d_bones = {
                 "torso": dist_3d(pose_3d[1], pose_3d[8]),
                 "r_thigh": dist_3d(pose_3d[8], pose_3d[9]),
@@ -10350,11 +10349,8 @@ class PoseLocalBoneRetargeterV10:
                 "l_calf": dist_3d(pose_3d[12], pose_3d[13])
             }
             
-            # 2. Skalierungsfaktoren berechnen (Ignoriert 2D Foreshortening komplett!)
             scales = {k: (target_3d_bones[k] / src_3d_bones[k] if src_3d_bones[k] > 0 else 1.0) for k in src_3d_bones}
             
-            # --- 3. LOKALES 2D SCALING ANWENDEN ---
-            # A) Torso (Hüfte als Anker, nach oben skalieren)
             hip_center = [(kps_2d[8][0]+kps_2d[11][0])/2, (kps_2d[8][1]+kps_2d[11][1])/2] if kps_2d[8][1] > 0 and kps_2d[11][1] > 0 else None
             
             if hip_center and "torso" in scales:
@@ -10365,16 +10361,14 @@ class PoseLocalBoneRetargeterV10:
                         kps_2d[idx][0] = hip_center[0] + (kps_2d[idx][0] - hip_center[0]) * s_torso
                         kps_2d[idx][1] = hip_center[1] + (kps_2d[idx][1] - hip_center[1]) * s_torso
                         
-                # Hände/Gesicht mitziehen
                 for attr_name in ["kps_lhand", "kps_rhand", "kps_face"]:
                     arr = getattr(meta, attr_name, None)
-                    if arr is not None:
+                    if arr is not None and len(arr) > 0: # FIX: NumPy Array Safe Check
                         for j in range(len(arr)):
                             if len(arr[j]) >= 2 and arr[j][1] > 0:
                                 arr[j][0] = hip_center[0] + (arr[j][0] - hip_center[0]) * s_torso
                                 arr[j][1] = hip_center[1] + (arr[j][1] - hip_center[1]) * s_torso
 
-            # B) Beine (Gelenk für Gelenk nach unten skalieren)
             def scale_bone(start_idx, end_idx, scale_factor):
                 if kps_2d[start_idx][1] > 0 and kps_2d[end_idx][1] > 0:
                     vec_x = kps_2d[end_idx][0] - kps_2d[start_idx][0]
@@ -10382,17 +10376,12 @@ class PoseLocalBoneRetargeterV10:
                     kps_2d[end_idx][0] = kps_2d[start_idx][0] + (vec_x * scale_factor)
                     kps_2d[end_idx][1] = kps_2d[start_idx][1] + (vec_y * scale_factor)
 
-            # Rechter Oberschenkel -> Wade -> Fuß (Fuß wird durch Wade mitverschoben)
             scale_bone(8, 9, scales["r_thigh"])
             scale_bone(9, 10, scales["r_calf"])
-            # Fußpunkte (19, 20, 21) folgen dem Knöchel (10) - Optional, falls Body25 Format
-            
-            # Linker Oberschenkel -> Wade
             scale_bone(11, 12, scales["l_thigh"])
             scale_bone(12, 13, scales["l_calf"])
 
         return (pose_data_copy,)
-
 
 class RetargetPoseCalibratorV5:
     @classmethod
