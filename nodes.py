@@ -10301,7 +10301,7 @@ class PoseGlobalPerspectiveScalerV10:
 
 
 # ======================================================================
-# 3. V10B: LOCAL BONE RETARGETER (FIXED)
+# 3. V10B: LOCAL BONE RETARGETER (MIT LOG-AUSGANG)
 # ======================================================================
 class PoseLocalBoneRetargeterV10:
     @classmethod
@@ -10314,20 +10314,24 @@ class PoseLocalBoneRetargeterV10:
             }
         }
 
-    RETURN_TYPES = ("POSEDATA",)
-    RETURN_NAMES = ("final_pose_data",)
+    # HIER NEU: Wir fügen "STRING" als zweiten Output hinzu!
+    RETURN_TYPES = ("POSEDATA", "STRING",)
+    RETURN_NAMES = ("final_pose_data", "log_output",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V10B: Nutzt 3D-Längen, um Knochen lokal zu skalieren, ohne von 2D-Perspektive getäuscht zu werden."
+    DESCRIPTION = "V10B: Nutzt 3D-Längen zum Skalieren und gibt ein Log aus, wenn NLF fehlt."
 
     def process(self, scaled_pose_data, calibration_data, video_nlf_data):
         pose_data_copy = copy.deepcopy(scaled_pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
         
+        log_messages = [] # Hier sammeln wir alle Fehlermeldungen für die Anzeige
+        
         target_3d_bones = calibration_data.get("true_3d_bones", {})
         if not target_3d_bones:
-            print("[V10B] Keine 3D Bone Längen in Calibration Data gefunden. Überspringe lokales Scaling.")
-            return (pose_data_copy,)
+            msg = "[V10B] FEHLER: Keine 3D Bone Längen in Calibration Data. Überspringe lokales Scaling."
+            print(msg)
+            return (pose_data_copy, msg) # Text über den zweiten Output ausgeben
             
         pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0] if isinstance(video_nlf_data, dict) else video_nlf_data
 
@@ -10335,12 +10339,28 @@ class PoseLocalBoneRetargeterV10:
             return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)
 
         for i, meta in enumerate(pose_metas):
-            if i >= len(pose_input_3d): break
+            if i >= len(pose_input_3d): 
+                log_messages.append(f"Frame {i}: NLF-Daten enden hier (Video länger als 3D-Daten).")
+                break
+                
             kps_2d = getattr(meta, "kps_body", None)
+            
+            # --- LOGGING: Prüfen ob NLF existiert ---
+            if pose_input_3d[i] is None or len(pose_input_3d[i]) == 0: 
+                log_messages.append(f"Frame {i}: NLF hat keine Person erkannt (Leeres Array).")
+                continue
+                
             pose_3d = pose_input_3d[i][0]
             
-            if kps_2d is None or len(kps_2d) == 0 or len(pose_3d) < 14: continue # FIX: NumPy Array Safe Check
+            # --- LOGGING: Prüfen ob genug Keypoints da sind ---
+            if kps_2d is None or len(kps_2d) == 0:
+                log_messages.append(f"Frame {i}: Keine 2D-Keypoints im Originalvideo gefunden.")
+                continue
+            if len(pose_3d) < 14:
+                log_messages.append(f"Frame {i}: NLF 3D-Skelett ist unvollständig (< 14 Keypoints).")
+                continue 
             
+            # (Die eigentliche Skalierungs-Mathematik bleibt komplett gleich)
             src_3d_bones = {
                 "torso": dist_3d(pose_3d[1], pose_3d[8]),
                 "r_thigh": dist_3d(pose_3d[8], pose_3d[9]),
@@ -10363,7 +10383,7 @@ class PoseLocalBoneRetargeterV10:
                         
                 for attr_name in ["kps_lhand", "kps_rhand", "kps_face"]:
                     arr = getattr(meta, attr_name, None)
-                    if arr is not None and len(arr) > 0: # FIX: NumPy Array Safe Check
+                    if arr is not None and len(arr) > 0: 
                         for j in range(len(arr)):
                             if len(arr[j]) >= 2 and arr[j][1] > 0:
                                 arr[j][0] = hip_center[0] + (arr[j][0] - hip_center[0]) * s_torso
@@ -10381,7 +10401,14 @@ class PoseLocalBoneRetargeterV10:
             scale_bone(11, 12, scales["l_thigh"])
             scale_bone(12, 13, scales["l_calf"])
 
-        return (pose_data_copy,)
+        # --- LOGGING: Abschluss-Bericht erstellen ---
+        if len(log_messages) == 0:
+            final_log = "ERFOLG: Alle Frames wurden fehlerfrei mit 3D-NLF-Daten skaliert."
+        else:
+            final_log = f"WARNUNGEN ({len(log_messages)} Fehler gefunden):\n" + "\n".join(log_messages)
+
+        # Gibt jetzt ZWEI Sachen zurück: Die Posen-Daten und den Text!
+        return (pose_data_copy, final_log)
 
 class RetargetPoseCalibratorV5:
     @classmethod
