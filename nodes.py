@@ -9355,8 +9355,7 @@ class PoseDataGlobalScalerV3:
                 "video_pose_data": ("POSEDATA",),
                 "calibration_data": ("POSE_CALIBRATION",),
                 "target_person_index": ("INT", {"default": 0, "min": 0, "max": 10}),
-                # Neuer Modus: 2D Visual Anchor ist jetzt der Standard!
-                "scaling_mode": (["2D Visual Size (Best)", "3D Depth Map", "SCAIL 3D", "Auto (2D + 3D Blend)"],),
+                "scaling_mode": (["2D Visual Size (Best)", "Auto (2D + 3D Blend)", "3D Depth Map"],),
             },
             "optional": {
                 "nlf_poses_data": ("NLFPRED",),
@@ -9368,11 +9367,11 @@ class PoseDataGlobalScalerV3:
     RETURN_NAMES = ("scaled_pose_data",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V3: Nutzt 2D-Pixelabstände (Torso) als visuellen Anker für absolut exakte Bildschirmgrößen."
+    DESCRIPTION = "V3.2: Nutzt reine 2D-Pixelabstände mit repariertem und stabilisiertem Combo-Modus."
 
     def process(self, video_pose_data, calibration_data, target_person_index, scaling_mode, nlf_poses_data=None, video_depth_map=None):
         if not calibration_data: 
-            print("[GlobalScaler V3] Abbruch: Keine calibration_data angeschlossen!")
+            print("[GlobalScaler V3.2] Abbruch: Keine calibration_data angeschlossen!")
             return (video_pose_data,)
         
         pose_data_copy = copy.deepcopy(video_pose_data)
@@ -9382,16 +9381,15 @@ class PoseDataGlobalScalerV3:
         global_leg_to_torso_ratios = []
         global_scale_ratios = []
         
-        print(f"\n--- PoseDataGlobalScaler V3 DIAGNOSE LOG ---")
+        print(f"\n--- PoseDataGlobalScaler V3.2 DIAGNOSE LOG ---")
         print(f"Modus: {scaling_mode}")
 
         # --- PHASE 1: REFERENZ-DATEN SAMMELN ---
         for frame_idx, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
-            height = getattr(meta, "height", 1.0) or 1.0
             if kps is None or len(kps) == 0: continue
 
-            # Ermittle die Y-Koordinaten der stabilen Anker (in echten Pixeln)
+            # Koordinaten absolut in echten Pixeln auslesen
             head_y = self._get_median_y(kps, self.HEAD_INDICES)
             hip_y = self._get_median_y(kps, self.HIP_INDICES)
             foot_y = self._get_median_y(kps, self.FOOT_INDICES)
@@ -9403,33 +9401,44 @@ class PoseDataGlobalScalerV3:
                 if torso_len > 10 and leg_len > 10:
                     global_leg_to_torso_ratios.append(leg_len / torso_len)
 
-            current_frame_ratios = []
+            ratio_2d = None
+            ratio_3d = None
 
-            # ---------------------------------------------------------
-            # LOGIK 1: 2D VISUAL PIXEL SIZE (Der neue, beste Weg)
-            # ---------------------------------------------------------
+            # 1. 2D PIXEL BERECHNUNG
             if scaling_mode in ["2D Visual Size (Best)", "Auto (2D + 3D Blend)"]:
                 ref_2d = calibration_data.get("ref_torso_dist_2d")
                 if ref_2d and head_y and hip_y:
-                    video_torso_px = (hip_y - head_y) * height
-                    if video_torso_px > 20: # Nur wenn Torso gut sichtbar
+                    video_torso_px = hip_y - head_y 
+                    if video_torso_px > 20: 
                         ratio_2d = ref_2d / video_torso_px
-                        current_frame_ratios.append(ratio_2d)
 
-            # ---------------------------------------------------------
-            # LOGIK 2: 3D DEPTH MAP
-            # ---------------------------------------------------------
+            # 2. 3D DEPTH MAP BERECHNUNG
             if scaling_mode in ["3D Depth Map", "Auto (2D + 3D Blend)"] and video_depth_map is not None:
                 ref_depth = calibration_data.get("ref_depth_val")
                 if ref_depth:
-                    # Holt Depth-Wert des Torsos (Index 1)
-                    depth_val = float(video_depth_map[min(frame_idx, video_depth_map.shape[0]-1), int(max(0, min(kps[1][1], video_depth_map.shape[1]-1))), int(max(0, min(kps[1][0], video_depth_map.shape[2]-1))), 0])
-                    if depth_val > 0.001:
-                        current_frame_ratios.append(ref_depth / depth_val)
+                    try:
+                        depth_val = float(video_depth_map[min(frame_idx, video_depth_map.shape[0]-1), int(max(0, min(kps[1][1], video_depth_map.shape[1]-1))), int(max(0, min(kps[1][0], video_depth_map.shape[2]-1))), 0])
+                        if depth_val > 0.001:
+                            ratio_3d = ref_depth / depth_val
+                    except Exception:
+                        pass
 
-            if current_frame_ratios:
-                # Durchschnitt aller aktiven Methoden für diesen Frame
-                global_scale_ratios.append(sum(current_frame_ratios) / len(current_frame_ratios))
+            # 3. WERTE ZUSAMMENFÜHREN (COMBO LOGIK REPARIERT)
+            if scaling_mode == "2D Visual Size (Best)" and ratio_2d is not None:
+                global_scale_ratios.append(ratio_2d)
+                
+            elif scaling_mode == "3D Depth Map" and ratio_3d is not None:
+                global_scale_ratios.append(ratio_3d)
+                
+            elif scaling_mode == "Auto (2D + 3D Blend)":
+                if ratio_2d is not None and ratio_3d is not None:
+                    # Sicherer Blend: 2D gibt die Hauptgröße vor (70%), Depth fängt Wackler ab (30%)
+                    blended_ratio = (ratio_2d * 0.7) + (ratio_3d * 0.3)
+                    global_scale_ratios.append(blended_ratio)
+                elif ratio_2d is not None:
+                    global_scale_ratios.append(ratio_2d) # Fallback auf 2D, falls Depth fehlt
+                elif ratio_3d is not None:
+                    global_scale_ratios.append(ratio_3d) # Fallback auf 3D, falls 2D fehlt
 
         # Finale Globale Werte berechnen
         final_scale_ratio = float(np.median(global_scale_ratios)) if global_scale_ratios else 1.0
@@ -9439,32 +9448,33 @@ class PoseDataGlobalScalerV3:
         print(f"Finaler Scale Faktor: {final_scale_ratio:.4f}")
         print("----------------------------------------------\n")
         
+        # Sicherheitsabbruch verhindern (Faktor muss über 0.001 sein)
         if final_scale_ratio <= 0.001 or final_scale_ratio == 1.0: 
             return (pose_data_copy,)
 
         # --- PHASE 2: SKALIERUNG ANWENDEN ---
         for meta in pose_metas:
             kps = getattr(meta, "kps_body", [])
-            height = getattr(meta, "height", 1.0) or 1.0
             if kps is None or len(kps) == 0: continue
             
-            head_y = self._get_median_y(kps, self.HEAD_INDICES, height)
-            hip_y = self._get_median_y(kps, self.HIP_INDICES, height)
-            foot_y = self._get_median_y(kps, self.FOOT_INDICES, height)
+            # Alles in reinen Pixeln
+            head_y = self._get_median_y(kps, self.HEAD_INDICES)
+            hip_y = self._get_median_y(kps, self.HIP_INDICES)
+            foot_y = self._get_median_y(kps, self.FOOT_INDICES)
 
             if not head_y or not hip_y: continue
 
-            torso_height = hip_y - head_y
-            if torso_height <= 0: continue
+            torso_px = hip_y - head_y
+            if torso_px <= 0: continue
 
             # Phantom-Anker für die Füße
-            anchor_y = foot_y if foot_y is not None else hip_y + (torso_height * learned_leg_ratio)
+            anchor_y = foot_y if foot_y is not None else hip_y + (torso_px * learned_leg_ratio)
 
-            current_visual_height = anchor_y - head_y
-            target_visual_height = current_visual_height * final_scale_ratio
+            current_visual_height_px = anchor_y - head_y
+            target_visual_height_px = current_visual_height_px * final_scale_ratio
             
-            target_top_y = anchor_y - target_visual_height
-            offset_px = (target_top_y - head_y) * height
+            target_top_y = anchor_y - target_visual_height_px
+            offset_px = target_top_y - head_y
 
             hip_coords_before = {idx: kps[idx][:] for idx in self.HIP_INDICES if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0}
             
@@ -9486,8 +9496,8 @@ class PoseDataGlobalScalerV3:
 
         return (pose_data_copy,)
 
-    def _get_median_y(self, kps, indices, height_divider=1.0):
-        vals = [kps[idx][1] / height_divider for idx in indices if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 and (kps[idx][2] > 0.1 if len(kps[idx])>2 else True)]
+    def _get_median_y(self, kps, indices):
+        vals = [kps[idx][1] for idx in indices if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 and (kps[idx][2] > 0.1 if len(kps[idx])>2 else True)]
         return float(np.median(vals)) if vals else None
 
 
