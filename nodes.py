@@ -9500,6 +9500,99 @@ class PoseDataGlobalScalerV3:
         vals = [kps[idx][1] for idx in indices if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 and (kps[idx][2] > 0.1 if len(kps[idx])>2 else True)]
         return float(np.median(vals)) if vals else None
 
+class PoseDataGlobalScalerV4:
+    # Indizes für Hüfte zur Messung
+    HIP_INDICES = [8, 11]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "target_person_index": ("INT", {"default": 0, "min": 0, "max": 10}),
+                "scaling_mode": (["2D Visual Size (Best)", "3D Depth Map (Dynamic Distance)", "Auto Blend"],),
+            },
+            "optional": {
+                "video_depth_map": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("scaled_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V4: Exakte proportionale Skalierung nach Nutzer-Logik. Verhindert gestauchte Köpfe/Skelette."
+
+    def process(self, video_pose_data, calibration_data, target_person_index, scaling_mode, video_depth_map=None):
+        if not calibration_data: return (video_pose_data,)
+        
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        if not pose_metas: return (pose_data_copy,)
+
+        ref_2d = calibration_data.get("ref_torso_dist_2d")
+        ref_depth = calibration_data.get("ref_depth_val")
+
+        print(f"\n--- PoseDataGlobalScaler V4 ---")
+        
+        for frame_idx, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            if kps is None or len(kps) == 0: continue
+
+            # 1. Torso im Video messen (Hals [1] bis Mitte Hüfte [8, 11])
+            neck_y = kps[1][1] if len(kps) > 1 and len(kps[1]) >= 2 and kps[1][1] > 0 else None
+            hip_y_vals = [kps[i][1] for i in self.HIP_INDICES if i < len(kps) and len(kps[i]) >= 2 and kps[i][1] > 0]
+            hip_y = np.mean(hip_y_vals) if hip_y_vals else None
+
+            if not neck_y or not hip_y: continue
+            video_torso_2d = hip_y - neck_y
+
+            scale_factor = 1.0
+
+            # 2. Skalierungsfaktor berechnen (Genau deine Logik!)
+            ratio_2d = (ref_2d / video_torso_2d) if (ref_2d and video_torso_2d > 10) else 1.0
+            
+            ratio_depth = 1.0
+            if video_depth_map is not None and ref_depth:
+                try:
+                    # Tiefe am Torso (Hals) messen
+                    depth_val = float(video_depth_map[min(frame_idx, video_depth_map.shape[0]-1), int(max(0, min(kps[1][1], video_depth_map.shape[1]-1))), int(max(0, min(kps[1][0], video_depth_map.shape[2]-1))), 0])
+                    if depth_val > 0.001:
+                        ratio_depth = ref_depth / depth_val
+                except Exception:
+                    pass
+
+            if scaling_mode == "2D Visual Size (Best)":
+                scale_factor = ratio_2d
+            elif scaling_mode == "3D Depth Map (Dynamic Distance)":
+                scale_factor = ratio_depth
+            else: # Auto Blend
+                scale_factor = (ratio_2d + ratio_depth) / 2.0
+
+            if scale_factor <= 0.01 or scale_factor == 1.0:
+                continue # Nichts zu tun
+
+            # 3. Ankerpunkt (Pivot) finden, von dem aus skaliert wird
+            # Wir nehmen den tiefsten sichtbaren Punkt (Füße), damit die Person auf dem Boden stehen bleibt
+            valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
+            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
+            if not valid_y: continue
+            
+            pivot_y = max(valid_y) # Tiefster Punkt (Y-Achse geht nach unten)
+            pivot_x = np.mean(valid_x) # Mitte der Person
+
+            # 4. ALLES PROPORTIONAL SKALIEREN (Geometrisch, kein Zerquetschen!)
+            for i in range(len(kps)):
+                if len(kps[i]) >= 2 and kps[i][1] > 0:
+                    # Der Abstand des Gelenks zum Fuß-Ankerpunkt wird mit dem Skalierungsfaktor multipliziert.
+                    # Das vergrößert X und Y exakt im gleichen Verhältnis!
+                    kps[i][0] = pivot_x + (kps[i][0] - pivot_x) * scale_factor
+                    kps[i][1] = pivot_y + (kps[i][1] - pivot_y) * scale_factor
+
+        print("-> Proportionale Skalierung erfolgreich angewendet.")
+        print("-------------------------------\n")
+        return (pose_data_copy,)
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -9558,6 +9651,7 @@ NODE_CLASS_MAPPINGS = {
     "LoadPoseCalibration": LoadPoseCalibration,
     "PoseDataGlobalScalerV2": PoseDataGlobalScalerV2,
     "PoseDataGlobalScalerV3": PoseDataGlobalScalerV3,
+    "PoseDataGlobalScalerV4": PoseDataGlobalScalerV4,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -9617,6 +9711,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadPoseCalibration": "Load Pose Calibration (Ultimate)",
     "PoseDataGlobalScalerV2": "Pose Data Global Scaler V2 (God-Frame)",
     "PoseDataGlobalScalerV3": "Pose Data Global Scaler (V3 Ultimate)",
+    "PoseDataGlobalScalerV4": "Pose Data Global Scaler (V4 Ultimate)"
 }
 
 
