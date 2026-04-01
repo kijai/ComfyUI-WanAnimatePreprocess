@@ -10489,6 +10489,78 @@ class RetargetPoseCalibratorV5:
 
         return ({"perspective_slope": slope, "perspective_intercept": intercept, "true_3d_bones": true_3d_bones},)
 
+class PoseDataLowerLegRemover:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "remove_knees": ("BOOLEAN", {
+                    "default": True, 
+                    "tooltip": "Wenn True, werden auch die Knie gelöscht. Wenn False, nur Knöchel und Füße."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Editor"
+    DESCRIPTION = "Entfernt die Unterschenkel und Füße aus den Pose-Daten (setzt sie auf 0.0)."
+
+    def process(self, pose_data, remove_knees):
+        import copy
+        import numpy as np
+        from .pose_utils.pose2d_utils import AAPoseMeta
+
+        pose_data_copy = copy.deepcopy(pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        pose_metas_original = pose_data_copy.get("pose_metas_original", [])
+        
+        # OpenPose/SCAIL Indizes für Beine/Füße:
+        # 9: Rechtes Knie, 12: Linkes Knie
+        # 10: Rechter Knöchel, 13: Linker Knöchel
+        # 18-24: Diverse Fuß/Zehen-Punkte
+        if remove_knees:
+            indices_to_remove = [9, 12, 10, 13, 18, 19, 20, 21, 22, 23, 24]
+        else:
+            indices_to_remove = [10, 13, 18, 19, 20, 21, 22, 23, 24]
+
+        # 1. Pose Metas verarbeiten (für das spätere Zeichnen und Verarbeiten)
+        for meta in pose_metas:
+            if not isinstance(meta, AAPoseMeta):
+                continue
+            
+            coords = getattr(meta, "kps_body", None)
+            scores = getattr(meta, "kps_body_p", None)
+            
+            if coords is not None and scores is not None:
+                for idx in indices_to_remove:
+                    if idx < len(coords) and idx < len(scores):
+                        scores[idx] = 0.0         # Sichtbarkeit (Score) auf 0
+                        coords[idx][0] = 0.0      # X auf 0
+                        coords[idx][1] = 0.0      # Y auf 0
+
+        # 2. Original Metas verarbeiten (für Retargeting oder SCAIL Export)
+        for entry in pose_metas_original:
+            if not isinstance(entry, dict):
+                continue
+                
+            keypoints_body = entry.get("keypoints_body")
+            if keypoints_body is not None:
+                points_np = np.asarray(keypoints_body, dtype=np.float32)
+                # Stellen sicher, dass X, Y und Score (dim >= 3) vorhanden sind
+                if points_np.ndim == 2 and points_np.shape[1] >= 3:
+                    for idx in indices_to_remove:
+                        if idx < points_np.shape[0]:
+                            points_np[idx, 0] = 0.0 # X
+                            points_np[idx, 1] = 0.0 # Y
+                            points_np[idx, 2] = 0.0 # Score
+                    entry["keypoints_body"] = points_np.tolist()
+
+        return (pose_data_copy,)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -10625,6 +10697,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV10": "Pose Global Perspective Scaler V10A",
     "PoseLocalBoneRetargeterV10": "Pose Local Bone Retargeter V10B",
     "RetargetPoseCalibratorV5": "Retarget Pose Calibrator V5 (partial body)",
+    "PoseDataLowerLegRemover": "Pose Data Lower Leg Remover",
 }
 
 
