@@ -8909,20 +8909,29 @@ class PoseDataGlobalScaler:
     DESCRIPTION = "Scannt das ganze Video, lernt Proportionen und nutzt Phantom-Anker, um Ruckeln zu verhindern."
 
     def process(self, video_pose_data, calibration_data, target_person_index, scaling_mode, nlf_poses_data=None, video_depth_map=None):
-        if not calibration_data: return (video_pose_data,)
+        if not calibration_data: 
+            print("[GlobalScaler Log] Abbruch: Keine calibration_data angeschlossen!")
+            return (video_pose_data,)
         
         pose_data_copy = copy.deepcopy(video_pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
-        if not pose_metas: return (pose_data_copy,)
+        if not pose_metas: 
+            print("[GlobalScaler Log] Abbruch: Keine pose_metas vorhanden!")
+            return (pose_data_copy,)
 
         # --- PHASE 1: GLOBALER SCAN (Proportionen & Skalierungsfaktor lernen) ---
         global_leg_to_torso_ratios = []
         global_scale_ratios = []
+        
+        # Diagnose-Zähler
+        diag_full_body_frames = 0
+        diag_depth_frames = 0
+        diag_3d_frames = 0
 
         for frame_idx, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
             
-            # FIX: Sichere Abfrage für NumPy-Arrays!
+            # Sichere Abfrage für NumPy-Arrays!
             if kps is None or len(kps) == 0: continue
 
             head_y = self._get_median_y(kps, self.HEAD_INDICES)
@@ -8935,6 +8944,7 @@ class PoseDataGlobalScaler:
                 leg_len = foot_y - hip_y
                 if torso_len > 10 and leg_len > 10:
                     global_leg_to_torso_ratios.append(leg_len / torso_len)
+                    diag_full_body_frames += 1
 
             # B) Skalierungs-Faktor aus den BESTEN Frames berechnen
             current_frame_ratios = []
@@ -8945,17 +8955,15 @@ class PoseDataGlobalScaler:
                 ]
                 if valid_depths and max(valid_depths) > 0.001:
                     current_frame_ratios.append(calibration_data["ref_depth_val"] / max(valid_depths))
+                    diag_depth_frames += 1
 
-            # B) NLF SCALE 3D INPUT (Direkt aus SCAIL)
+            # C) NLF SCALE 3D INPUT (Direkt aus SCAIL)
             if nlf_poses_data is not None and scaling_mode in ["Auto (Combo)", "SCAIL 3D Only"]:
-                
-                # 1. Zuerst die Posen aus dem Dictionary entpacken (falls es eines ist)
                 if isinstance(nlf_poses_data, dict):
                     pose_input = nlf_poses_data.get('joints3d_nonparam', [nlf_poses_data])[0]
                 else:
                     pose_input = nlf_poses_data
 
-                # 2. Jetzt prüfen wir die echte Länge und greifen auf den Frame zu!
                 if frame_idx < len(pose_input):
                     frame_3d = pose_input[frame_idx]
                     
@@ -8968,25 +8976,44 @@ class PoseDataGlobalScaler:
                             
                             if ref_dist and dist_3d > 0.01:
                                 current_frame_ratios.append(ref_dist / dist_3d)
+                                diag_3d_frames += 1
 
             if current_frame_ratios:
                 global_scale_ratios.append(sum(current_frame_ratios) / len(current_frame_ratios))
 
         # Finale Globale Werte berechnen
         final_scale_ratio = float(np.median(global_scale_ratios)) if global_scale_ratios else 1.0
-        # Standard-Mensch: Beine sind ca. 1.2x bis 1.4x so lang wie der Torso. Wir nehmen den Video-Schnitt oder 1.3 als Fallback.
         learned_leg_ratio = float(np.median(global_leg_to_torso_ratios)) if global_leg_to_torso_ratios else 1.3
 
-        print(f"[GlobalScaler] Scan Beendet! Scale Factor: {final_scale_ratio:.4f} | Learned Leg Ratio: {learned_leg_ratio:.2f}")
-
-        if final_scale_ratio <= 0.001 or final_scale_ratio == 1.0: return (pose_data_copy,)
+        # --- DIAGNOSE LOG AUSGABE ---
+        print(f"\n--- PoseDataGlobalScaler DIAGNOSE LOG ---")
+        print(f"-> Verarbeite {len(pose_metas)} Frames.")
+        print(f"-> Gewählter Modus: {scaling_mode}")
+        print(f"-> Calibration Data:")
+        print(f"   - Depth Map Wert vorhanden: {bool(calibration_data.get('ref_depth_val'))}")
+        print(f"   - 3D Distanz vorhanden:     {bool(calibration_data.get('ref_torso_dist_3d') or calibration_data.get('ref_torso_dist_2d'))}")
+        print(f"-> Scan-Ergebnisse im Video:")
+        print(f"   - Frames für Leg-Ratio (Beine sichtbar): {diag_full_body_frames}")
+        print(f"   - Frames mit gültiger Depth Map (Torso): {diag_depth_frames}")
+        print(f"   - Frames mit gültigen 3D SCAIL Daten:    {diag_3d_frames}")
+        print(f"-> Berechnungen:")
+        print(f"   - Berechnete Leg-Ratio:  {learned_leg_ratio:.2f} (Fallback ist 1.3)")
+        print(f"   - Gesammelte Scale-Werte: {len(global_scale_ratios)}")
+        print(f"   - Finaler Scale Faktor:   {final_scale_ratio:.4f}")
+        
+        if final_scale_ratio <= 0.001 or final_scale_ratio == 1.0: 
+            print("-> ERGEBNIS: ABBRUCH! Node macht nichts, da Faktor 1.0 ist.")
+            print("------------------------------------------\n")
+            return (pose_data_copy,)
+        else:
+            print("-> ERGEBNIS: ERFOLG! Wende Skalierung an...")
+            print("------------------------------------------\n")
 
         # --- PHASE 2: PHANTOM-SKALIERUNG AUF DAS VIDEO ANWENDEN ---
         for meta in pose_metas:
             kps = getattr(meta, "kps_body", [])
             height = getattr(meta, "height", 1.0) or 1.0
             
-            # Auch in Phase 2 sicherstellen, dass wir gültige Keypoints haben
             if kps is None or len(kps) == 0: continue
             
             head_y = self._get_median_y(kps, self.HEAD_INDICES, height)
@@ -8998,39 +9025,31 @@ class PoseDataGlobalScaler:
             torso_height = hip_y - head_y
             if torso_height <= 0: continue
 
-            # DIE MAGIE: Der Phantom-Anker!
+            # Phantom-Anker!
             if foot_y is not None:
-                # Echte Füße sind da!
                 anchor_y = foot_y
             else:
-                # Füße fehlen! Wir berechnen, wo sie im 2D-Raum wären, wenn man sie sehen könnte.
                 phantom_foot_y = hip_y + (torso_height * learned_leg_ratio)
                 anchor_y = phantom_foot_y
 
-            # Skalierung anwenden basierend auf dem echten oder Phantom-Anker
             current_visual_height = anchor_y - head_y
             target_visual_height = current_visual_height * final_scale_ratio
             
             target_top_y = anchor_y - target_visual_height
             offset_px = (target_top_y - head_y) * height
 
-            # Alte Hüften speichern für Bein-Verschiebung
             hip_coords_before = {idx: kps[idx][:] for idx in self.HIP_INDICES if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0}
             
-            # Oberkörper anpassen
             for i in range(len(kps)):
                 if i not in self.FOOT_INDICES and len(kps[i]) >= 2 and kps[i][1] > 0:
                     kps[i][1] += offset_px
             
-            # Beine interpolieren (falls z.B. nur die Knie da sind)
             def safe_get_y(idx): return kps[idx][1] if idx < len(kps) and len(kps[idx]) >= 2 and kps[idx][1] > 0 else None
             
             if 11 in hip_coords_before and safe_get_y(13) is not None and safe_get_y(15) is not None:
                 old_hip_y, ankle_y = hip_coords_before[11][1], safe_get_y(15)
                 if ankle_y > old_hip_y: kps[13][1] = (old_hip_y + offset_px) + ((safe_get_y(13) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
             
-            # Für die rechte Seite (je nach DWPose Format Index 8->9->10 oder 9->10->11)
-            # Wir nehmen den generischen Check für Index 8, 9, 10
             if 8 in hip_coords_before and safe_get_y(9) is not None and safe_get_y(10) is not None:
                 old_hip_y, ankle_y = hip_coords_before[8][1], safe_get_y(10)
                 if ankle_y > old_hip_y: kps[9][1] = (old_hip_y + offset_px) + ((safe_get_y(9) - old_hip_y) / (ankle_y - old_hip_y)) * (ankle_y - (old_hip_y + offset_px))
