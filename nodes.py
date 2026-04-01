@@ -10628,6 +10628,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV10": PoseGlobalPerspectiveScalerV10,
     "PoseLocalBoneRetargeterV10": PoseLocalBoneRetargeterV10,
     "RetargetPoseCalibratorV5": RetargetPoseCalibratorV5,
+    "PoseDataLowerLegRemover": PoseDataLowerLegRemover,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
