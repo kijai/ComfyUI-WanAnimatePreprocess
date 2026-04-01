@@ -10026,6 +10026,374 @@ class PoseDataGlobalScalerV8:
         print("------------------------------------------------------\n")
         return (pose_data_copy,)
 
+class PoseDataGlobalScalerV9:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_depth_map": ("IMAGE",),
+                "apply_bone_scaling": ("BOOLEAN", {"default": True, "tooltip": "Fixiert Torso- und Bein-Proportionen lokal (Step 2)."}),
+                "smoothing_window": ("INT", {"default": 5, "min": 1, "max": 30, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("scaled_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V9: Berechnet Perspektive (Tiefe/Z-Achse) UND korrigiert lokale Knochen-Proportionen (Torso, Beine) in einem."
+
+    def process(self, video_pose_data, calibration_data, video_depth_map, apply_bone_scaling, smoothing_window):
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        refer_pose = pose_data_copy.get("refer_pose_meta", None)
+
+        if not pose_metas:
+            return (pose_data_copy,)
+
+        # ---------------------------------------------------------
+        # STEP 1: ZIEL-PROPORTIONEN AUS DEM REFERENZBILD LESEN
+        # ---------------------------------------------------------
+        target_torso_len = None
+        target_leg_len = None
+        
+        def get_dist(p1, p2):
+            return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+        def get_hip_center(kps):
+            # 8 = Rechte Hüfte, 11 = Linke Hüfte
+            if len(kps) > 11 and kps[8][2] > 0.1 and kps[11][2] > 0.1: 
+                return [(kps[8][0] + kps[11][0])/2, (kps[8][1] + kps[11][1])/2]
+            return None
+
+        # Wir messen an der Target-Person, wie lang Torso und Beine eigentlich sein MÜSSEN
+        if apply_bone_scaling and refer_pose and hasattr(refer_pose, "kps_body"):
+            ref_kps = refer_pose.kps_body
+            hip_c = get_hip_center(ref_kps)
+            
+            # Torso (Hüfte bis Hals/Nacken [Index 1])
+            if hip_c and len(ref_kps) > 1 and ref_kps[1][2] > 0.1:
+                target_torso_len = get_dist(hip_c, ref_kps[1][:2])
+                
+            # Beine (Hüfte bis Mitte der Knöchel [Index 10 und 13])
+            if hip_c and len(ref_kps) > 13 and ref_kps[10][2] > 0.1 and ref_kps[13][2] > 0.1:
+                ankles_center = [(ref_kps[10][0] + ref_kps[13][0])/2, (ref_kps[10][1] + ref_kps[13][1])/2]
+                target_leg_len = get_dist(hip_c, ankles_center)
+
+        # ---------------------------------------------------------
+        # STEP 2 & 3: GLOBALE + LOKALE SKALIERUNG PRO FRAME
+        # ---------------------------------------------------------
+        slope = calibration_data.get("perspective_slope", 0.0)
+        intercept = calibration_data.get("perspective_intercept", 1.0)
+        depth_np = video_depth_map.cpu().numpy()
+        
+        for i, meta in enumerate(pose_metas):
+            if getattr(meta, "kps_body", None) is None:
+                continue
+                
+            kps = meta.kps_body
+            valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
+            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
+            if not valid_y:
+                continue
+                
+            # --- 2. GLOBALE SKALIERUNG (Depth -> Pixelgröße) ---
+            # Tiefe am Standpunkt der Person auslesen
+            center_x = int(np.clip(np.mean(valid_x), 0, depth_np.shape[2]-1))
+            center_y = int(np.clip(np.mean(valid_y), 0, depth_np.shape[1]-1))
+            current_depth = np.mean(depth_np[i, max(0, center_y-5):center_y+5, max(0, center_x-5):center_x+5])
+            
+            # Ausrechnen wie groß die Gesamtpose sein muss
+            expected_size = current_depth * slope + intercept
+            current_size = max(valid_y) - min(valid_y)
+            global_scale = expected_size / current_size if current_size > 0 else 1.0
+            
+            pivot_y = max(valid_y) # Pivotpunkt ist der Boden (Füße)
+            pivot_x = np.mean(valid_x)
+            
+            # Alles erstmal global auf die richtige Raumgröße setzen
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None:
+                    for j in range(len(arr)):
+                        if len(arr[j]) >= 2 and arr[j][1] > 0:
+                            arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * global_scale
+                            arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * global_scale
+
+            # --- 3. LOKALES BONE-SCALING (Torso / Beine anpassen) ---
+            if apply_bone_scaling and target_torso_len and target_leg_len:
+                hip_c = get_hip_center(kps)
+                if not hip_c:
+                    continue
+                    
+                # A. Torso-Check (Hals bis Hüfte)
+                if kps[1][1] > 0:
+                    current_torso = get_dist(hip_c, kps[1][:2])
+                    if current_torso > 0:
+                        # Skalierungsfaktor für Torso ausrechnen (z.B. 2.0)
+                        torso_scale = target_torso_len / current_torso
+                        
+                        # Alles oberhalb der Hüfte skalieren (Pivotpunkt = Hüfte)
+                        upper_body_indices = [0, 1, 2, 3, 4, 5, 6, 7, 14, 15, 16, 17]
+                        for idx in upper_body_indices:
+                            if idx < len(kps) and kps[idx][1] > 0:
+                                kps[idx][0] = hip_c[0] + (kps[idx][0] - hip_c[0]) * torso_scale
+                                kps[idx][1] = hip_c[1] + (kps[idx][1] - hip_c[1]) * torso_scale
+                                
+                        # Hände & Gesicht müssen auch mitrutschen
+                        for attr_name in ["kps_lhand", "kps_rhand", "kps_face"]:
+                            arr = getattr(meta, attr_name, None)
+                            if arr is not None:
+                                for j in range(len(arr)):
+                                    if len(arr[j]) >= 2 and arr[j][1] > 0:
+                                        arr[j][0] = hip_c[0] + (arr[j][0] - hip_c[0]) * torso_scale
+                                        arr[j][1] = hip_c[1] + (arr[j][1] - hip_c[1]) * torso_scale
+
+                # B. Bein-Check (Hüfte bis Knöchel)
+                if len(kps) > 13 and kps[10][1] > 0 and kps[13][1] > 0:
+                    ankles_c = [(kps[10][0] + kps[13][0])/2, (kps[10][1] + kps[13][1])/2]
+                    current_legs = get_dist(hip_c, ankles_c)
+                    if current_legs > 0:
+                        # Skalierungsfaktor für Beine ausrechnen (z.B. 0.75)
+                        leg_scale = target_leg_len / current_legs
+                        
+                        # Alles unterhalb der Hüfte skalieren (Pivotpunkt = Hüfte)
+                        lower_body_indices = [9, 10, 12, 13, 18, 19, 20, 21, 22, 23, 24]
+                        for idx in lower_body_indices:
+                            if idx < len(kps) and kps[idx][1] > 0:
+                                kps[idx][0] = hip_c[0] + (kps[idx][0] - hip_c[0]) * leg_scale
+                                kps[idx][1] = hip_c[1] + (kps[idx][1] - hip_c[1]) * leg_scale
+
+        return (pose_data_copy,)
+
+
+import copy
+import numpy as np
+import math
+
+# ======================================================================
+# 1. KALIBRIERUNG V4 (Perspektive + 3D Bone Lengths)
+# ======================================================================
+class RetargetPoseCalibratorV4:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_close": ("POSEDATA",),
+                "depth_map_close": ("IMAGE",),
+                "pose_far": ("POSEDATA",),
+                "depth_map_far": ("IMAGE",),
+            },
+            "optional": {
+                "nlf_close": ("NLFPRED", {"tooltip": "3D Daten für Frame nah"}),
+                "nlf_far": ("NLFPRED", {"tooltip": "3D Daten für Frame fern"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION",)
+    RETURN_NAMES = ("calibration_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V4: Berechnet Perspektiven-Kurve UND extrahiert echte 3D-Knochenlängen."
+
+    def process(self, pose_close, depth_map_close, pose_far, depth_map_far, nlf_close=None, nlf_far=None):
+        def extract_2d_data(pose_data, depth_map):
+            meta = pose_data.get("pose_metas", [])[0]
+            kps = getattr(meta, "kps_body", [])
+            valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
+            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
+            if not valid_y or not valid_x: return None, None
+            
+            pixel_size = max(valid_y) - min(valid_y)
+            center_x = int(np.clip(np.mean(valid_x), 0, depth_map.shape[2]-1))
+            center_y = int(np.clip(np.mean(valid_y), 0, depth_map.shape[1]-1))
+            
+            depth_np = depth_map.cpu().numpy() if hasattr(depth_map, 'cpu') else depth_map
+            depth_val = np.mean(depth_np[0, max(0, center_y-5):center_y+5, max(0, center_x-5):center_x+5])
+            return pixel_size, float(depth_val)
+
+        size_c, depth_c = extract_2d_data(pose_close, depth_map_close)
+        size_f, depth_f = extract_2d_data(pose_far, depth_map_far)
+
+        slope, intercept = 0.0, 1.0
+        if size_c and size_f and depth_c and depth_f and abs(depth_c - depth_f) > 0.01:
+            slope = (size_f - size_c) / (depth_f - depth_c)
+            intercept = size_c - (slope * depth_c)
+
+        # 3D Bone Lengths auslesen
+        true_3d_bones = {}
+        if nlf_close is not None:
+            pose_3d = nlf_close.get('joints3d_nonparam', [nlf_close])[0][0][0] # Erster Frame, Erste Person
+            def dist_3d(p1, p2):
+                return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)
+            
+            if len(pose_3d) > 13:
+                true_3d_bones = {
+                    "torso": dist_3d(pose_3d[1], pose_3d[8]),
+                    "r_thigh": dist_3d(pose_3d[8], pose_3d[9]),
+                    "r_calf": dist_3d(pose_3d[9], pose_3d[10]),
+                    "l_thigh": dist_3d(pose_3d[11], pose_3d[12]),
+                    "l_calf": dist_3d(pose_3d[12], pose_3d[13])
+                }
+
+        return ({"perspective_slope": slope, "perspective_intercept": intercept, "true_3d_bones": true_3d_bones},)
+
+
+# ======================================================================
+# 2. V10A: GLOBAL PERSPECTIVE SCALER
+# ======================================================================
+class PoseGlobalPerspectiveScalerV10:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_depth_map": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("scaled_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V10A: Skaliert die GEsamte Person basierend auf Depth und Perspektive in die richtige Raumtiefe."
+
+    def process(self, video_pose_data, calibration_data, video_depth_map):
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        
+        slope = calibration_data.get("perspective_slope", 0.0)
+        intercept = calibration_data.get("perspective_intercept", 1.0)
+        depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
+        
+        for i, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", None)
+            if not kps: continue
+                
+            valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
+            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
+            if not valid_y: continue
+                
+            center_x = int(np.clip(np.mean(valid_x), 0, depth_np.shape[2]-1))
+            center_y = int(np.clip(np.mean(valid_y), 0, depth_np.shape[1]-1))
+            v_idx = min(i, depth_np.shape[0] - 1)
+            current_depth = np.mean(depth_np[v_idx, max(0, center_y-5):center_y+5, max(0, center_x-5):center_x+5])
+            
+            expected_size = current_depth * slope + intercept
+            current_size = max(valid_y) - min(valid_y)
+            global_scale = expected_size / current_size if current_size > 0 else 1.0
+            
+            pivot_y = max(valid_y) # Füße am Boden lassen
+            pivot_x = np.mean(valid_x)
+            
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None:
+                    for j in range(len(arr)):
+                        if len(arr[j]) >= 2 and arr[j][1] > 0:
+                            arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * global_scale
+                            arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * global_scale
+
+        return (pose_data_copy,)
+
+
+# ======================================================================
+# 3. V10B: LOCAL BONE RETARGETER (3D Aware)
+# ======================================================================
+class PoseLocalBoneRetargeterV10:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "scaled_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_nlf_data": ("NLFPRED",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("final_pose_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V10B: Nutzt 3D-Längen, um Knochen lokal zu skalieren, ohne von 2D-Perspektive getäuscht zu werden."
+
+    def process(self, scaled_pose_data, calibration_data, video_nlf_data):
+        pose_data_copy = copy.deepcopy(scaled_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        
+        target_3d_bones = calibration_data.get("true_3d_bones", {})
+        if not target_3d_bones:
+            print("[V10B] Keine 3D Bone Längen in Calibration Data gefunden. Überspringe lokales Scaling.")
+            return (pose_data_copy,)
+            
+        pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0] if isinstance(video_nlf_data, dict) else video_nlf_data
+
+        def dist_3d(p1, p2):
+            return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)
+
+        for i, meta in enumerate(pose_metas):
+            if i >= len(pose_input_3d): break
+            kps_2d = getattr(meta, "kps_body", None)
+            pose_3d = pose_input_3d[i][0] # Erster Charakter
+            
+            if kps_2d is None or len(pose_3d) < 14: continue
+            
+            # 1. 3D Längen der Person IM VIDEO messen
+            src_3d_bones = {
+                "torso": dist_3d(pose_3d[1], pose_3d[8]),
+                "r_thigh": dist_3d(pose_3d[8], pose_3d[9]),
+                "r_calf": dist_3d(pose_3d[9], pose_3d[10]),
+                "l_thigh": dist_3d(pose_3d[11], pose_3d[12]),
+                "l_calf": dist_3d(pose_3d[12], pose_3d[13])
+            }
+            
+            # 2. Skalierungsfaktoren berechnen (Ignoriert 2D Foreshortening komplett!)
+            scales = {k: (target_3d_bones[k] / src_3d_bones[k] if src_3d_bones[k] > 0 else 1.0) for k in src_3d_bones}
+            
+            # --- 3. LOKALES 2D SCALING ANWENDEN ---
+            # A) Torso (Hüfte als Anker, nach oben skalieren)
+            hip_center = [(kps_2d[8][0]+kps_2d[11][0])/2, (kps_2d[8][1]+kps_2d[11][1])/2] if kps_2d[8][1] > 0 and kps_2d[11][1] > 0 else None
+            
+            if hip_center and "torso" in scales:
+                s_torso = scales["torso"]
+                upper_indices = [0, 1, 2, 3, 4, 5, 6, 7, 14, 15, 16, 17]
+                for idx in upper_indices:
+                    if idx < len(kps_2d) and kps_2d[idx][1] > 0:
+                        kps_2d[idx][0] = hip_center[0] + (kps_2d[idx][0] - hip_center[0]) * s_torso
+                        kps_2d[idx][1] = hip_center[1] + (kps_2d[idx][1] - hip_center[1]) * s_torso
+                        
+                # Hände/Gesicht mitziehen
+                for attr_name in ["kps_lhand", "kps_rhand", "kps_face"]:
+                    arr = getattr(meta, attr_name, None)
+                    if arr is not None:
+                        for j in range(len(arr)):
+                            if len(arr[j]) >= 2 and arr[j][1] > 0:
+                                arr[j][0] = hip_center[0] + (arr[j][0] - hip_center[0]) * s_torso
+                                arr[j][1] = hip_center[1] + (arr[j][1] - hip_center[1]) * s_torso
+
+            # B) Beine (Gelenk für Gelenk nach unten skalieren)
+            def scale_bone(start_idx, end_idx, scale_factor):
+                if kps_2d[start_idx][1] > 0 and kps_2d[end_idx][1] > 0:
+                    vec_x = kps_2d[end_idx][0] - kps_2d[start_idx][0]
+                    vec_y = kps_2d[end_idx][1] - kps_2d[start_idx][1]
+                    kps_2d[end_idx][0] = kps_2d[start_idx][0] + (vec_x * scale_factor)
+                    kps_2d[end_idx][1] = kps_2d[start_idx][1] + (vec_y * scale_factor)
+
+            # Rechter Oberschenkel -> Wade -> Fuß (Fuß wird durch Wade mitverschoben)
+            scale_bone(8, 9, scales["r_thigh"])
+            scale_bone(9, 10, scales["r_calf"])
+            # Fußpunkte (19, 20, 21) folgen dem Knöchel (10) - Optional, falls Body25 Format
+            
+            # Linker Oberschenkel -> Wade
+            scale_bone(11, 12, scales["l_thigh"])
+            scale_bone(12, 13, scales["l_calf"])
+
+        return (pose_data_copy,)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -10088,6 +10456,10 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataGlobalScalerV6": PoseDataGlobalScalerV6,
     "RetargetPoseCalibratorV3": RetargetPoseCalibratorV3,
     "PoseDataGlobalScalerV8": PoseDataGlobalScalerV8,
+    "PoseDataGlobalScalerV9": PoseDataGlobalScalerV9,
+    "RetargetPoseCalibratorV4": RetargetPoseCalibratorV4,
+    "PoseGlobalPerspectiveScalerV10": PoseGlobalPerspectiveScalerV10,
+    "PoseLocalBoneRetargeterV10": PoseLocalBoneRetargeterV10,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -10152,6 +10524,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataGlobalScalerV6": "Pose Data Global Scaler (V6 Anti-Jitter)",
     "RetargetPoseCalibratorV3": "Retarget Pose Calibrator v3 (2-Frame Profiler)",
     "PoseDataGlobalScalerV8": "Pose Data Global Scaler (V8 Dynamic Perspective)",
+    "PoseDataGlobalScalerV9": "PoseDataGlobalScalerV9 (bone scaleing)",
+    "RetargetPoseCalibratorV4": "Retarget Pose Calibrator V4 (3D Aware)",
+    "PoseGlobalPerspectiveScalerV10": "Pose Global Perspective Scaler V10A",
+    "PoseLocalBoneRetargeterV10": "Pose Local Bone Retargeter V10B",
 }
 
 
