@@ -11087,6 +11087,252 @@ class PoseGlobalPerspectiveScalerV12:
                             
         return (pose_data_copy, "\n".join(log_messages))
 
+
+# ======================================================================
+# 1. KALIBRIERUNG V9 (L2-NORM TORSO-BASIERT)
+# ======================================================================
+class RetargetPoseCalibratorV9:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_close": ("POSEDATA",),
+                "depth_map_close": ("IMAGE",),
+                "pose_far": ("POSEDATA",),
+                "depth_map_far": ("IMAGE",),
+            },
+            "optional": {
+                "nlf_close": ("NLFPRED", {"tooltip": "3D Daten Frame nah (Fallback)"}),
+                "nlf_far": ("NLFPRED", {"tooltip": "3D Daten Frame fern (Empfohlen)"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION", "STRING",)
+    RETURN_NAMES = ("calibration_data", "log_output",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V9: Nutzt L2-Norm (Torso-Länge) anstatt Bounding Box für extrem stabile Messung."
+
+    def process(self, pose_close, depth_map_close, pose_far, depth_map_far, nlf_close=None, nlf_far=None):
+        import math
+        import numpy as np
+        
+        log_messages = ["=== V9 CALIBRATION LOG (NORM-BASED) ==="]
+        
+        meta_close = pose_close.get("pose_metas", [])[0] if pose_close.get("pose_metas") else None
+        meta_far = pose_far.get("pose_metas", [])[0] if pose_far.get("pose_metas") else None
+
+        if not meta_close or not meta_far:
+            return ({"perspective_slope": 0.0, "perspective_intercept": 1.0}, "FEHLER: Posen fehlen!")
+
+        kps_c = getattr(meta_close, "kps_body", [])
+        kps_f = getattr(meta_far, "kps_body", [])
+
+        # --- DIE NORM-FUNKTION ---
+        def get_torso_norm(kps):
+            if len(kps) < 12: return 0.0
+            neck = kps[1]
+            r_hip = kps[8]
+            l_hip = kps[11]
+            # Prüfen ob Punkte sichtbar sind
+            if len(neck) >= 2 and neck[1] > 0 and len(r_hip) >= 2 and r_hip[1] > 0 and len(l_hip) >= 2 and l_hip[1] > 0:
+                mid_x = (r_hip[0] + l_hip[0]) / 2.0
+                mid_y = (r_hip[1] + l_hip[1]) / 2.0
+                # L2 Norm (Euklidische Distanz)
+                return math.sqrt((neck[0] - mid_x)**2 + (neck[1] - mid_y)**2)
+            return 0.0
+
+        norm_close = get_torso_norm(kps_c)
+        norm_far = get_torso_norm(kps_f)
+
+        log_messages.append(f"Torso-Norm Nah: {norm_close:.1f} px")
+        log_messages.append(f"Torso-Norm Fern: {norm_far:.1f} px")
+
+        if norm_close <= 0 or norm_far <= 0:
+            return ({"perspective_slope": 0.0, "perspective_intercept": 1.0}, "FEHLER: Torso (Hals/Hüfte) nicht sichtbar für Norm-Berechnung!")
+
+        def get_robust_depth(kps, depth_map):
+            # Misst Tiefe nur genau auf dem Torso, filtert Hände weg
+            valid_x = [kps[1][0], kps[8][0], kps[11][0]]
+            valid_y = [kps[1][1], kps[8][1], kps[11][1]]
+            depth_np = depth_map.cpu().numpy() if hasattr(depth_map, 'cpu') else depth_map
+            H, W = depth_np.shape[1], depth_np.shape[2]
+            min_x, max_x = int(max(0, min(valid_x))), int(min(W-1, max(valid_x)))
+            min_y, max_y = int(max(0, min(valid_y))), int(min(H-1, max(valid_y)))
+            if max_x > min_x and max_y > min_y:
+                return float(np.mean(depth_np[0, min_y:max_y, min_x:max_x]))
+            return 0.5
+
+        depth_c = get_robust_depth(kps_c, depth_map_close)
+        depth_f = get_robust_depth(kps_f, depth_map_far)
+
+        log_messages.append(f"KI-Roh-Tiefe Torso Nah: {depth_c:.4f} | Fern: {depth_f:.4f}")
+
+        # --- FIX: AUTO INVERT ---
+        is_inverted = False
+        if depth_c > depth_f and norm_close > norm_far:
+            is_inverted = True
+            log_messages.append("-> KI-Tiefe ist spiegelverkehrt! Wandle in echte Distanz um...")
+            depth_c = 1.0 / max(depth_c, 0.0001)
+            depth_f = 1.0 / max(depth_f, 0.0001)
+            log_messages.append(f"Echte Distanz Nah: {depth_c:.4f} | Fern: {depth_f:.4f}")
+
+        slope, intercept = 0.0, 1.0
+        depth_diff = abs(depth_f - depth_c)
+        if depth_diff > 0.05:
+            slope = (norm_far - norm_close) / (depth_f - depth_c)
+            intercept = norm_close - (slope * depth_c)
+        else:
+            slope = -500.0 if is_inverted else 500.0
+            intercept = norm_close - (slope * depth_c)
+
+        log_messages.append(f"\nPhysikalischer NORM-Slope: {slope:.2f}")
+
+        true_3d_bones = {}
+        target_nlf = nlf_far if nlf_far is not None else nlf_close
+        if target_nlf is not None:
+            try:
+                pose_3d = target_nlf.get('joints3d_nonparam', [target_nlf])[0][0][0]
+                def dist_3d(p1, p2): return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)
+                if len(pose_3d) > 13:
+                    true_3d_bones = {
+                        "torso": dist_3d(pose_3d[1], pose_3d[8]),
+                        "r_thigh": dist_3d(pose_3d[8], pose_3d[9]), "r_calf": dist_3d(pose_3d[9], pose_3d[10]),
+                        "l_thigh": dist_3d(pose_3d[11], pose_3d[12]), "l_calf": dist_3d(pose_3d[12], pose_3d[13])
+                    }
+            except Exception as e:
+                pass
+
+        return ({"perspective_slope": slope, "perspective_intercept": intercept, "true_3d_bones": true_3d_bones, "is_depth_inverted": is_inverted}, "\n".join(log_messages))
+
+# ======================================================================
+# 2. V13: GLOBAL PERSPECTIVE SCALER (NORM-BASIERT)
+# ======================================================================
+class PoseGlobalPerspectiveScalerV13:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_depth_map": ("IMAGE",),
+                "keep_start_size": ("BOOLEAN", {"default": True, "tooltip": "Behält Torso-Norm von Frame 0 bei."}),
+                "depth_smoothing": ("INT", {"default": 5, "min": 1, "max": 31, "step": 2}),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING",)
+    RETURN_NAMES = ("scaled_pose_data", "log_output",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V13: Skaliert basierend auf der L2-Norm (Torso-Distanz) absolut Jitter-frei."
+
+    def process(self, video_pose_data, calibration_data, video_depth_map, keep_start_size, depth_smoothing):
+        import copy
+        import numpy as np
+        import math
+        
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        log_messages = ["=== V13 GLOBAL SCALER LOG (NORM-BASED) ==="]
+        
+        slope = calibration_data.get("perspective_slope", 0.0)
+        intercept = calibration_data.get("perspective_intercept", 1.0)
+        is_inverted = calibration_data.get("is_depth_inverted", False)
+        depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
+        
+        raw_depths, current_norms, valid_frames = [], [], []
+
+        def get_torso_norm(kps):
+            if not kps or len(kps) < 12: return 0.0
+            neck, r_hip, l_hip = kps[1], kps[8], kps[11]
+            if len(neck) >= 2 and neck[1] > 0 and len(r_hip) >= 2 and r_hip[1] > 0 and len(l_hip) >= 2 and l_hip[1] > 0:
+                return math.sqrt((neck[0] - (r_hip[0]+l_hip[0])/2.0)**2 + (neck[1] - (r_hip[1]+l_hip[1])/2.0)**2)
+            return 0.0
+        
+        for i, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", None)
+            norm = get_torso_norm(kps)
+            
+            if norm == 0.0:
+                raw_depths.append(None)
+                current_norms.append(None)
+                continue
+            
+            valid_x = [kps[1][0], kps[8][0], kps[11][0]]
+            valid_y = [kps[1][1], kps[8][1], kps[11][1]]
+            
+            v_idx = min(i, depth_np.shape[0] - 1)
+            H, W = depth_np.shape[1], depth_np.shape[2]
+            min_x, max_x = int(max(0, min(valid_x))), int(min(W-1, max(valid_x)))
+            min_y, max_y = int(max(0, min(valid_y))), int(min(H-1, max(valid_y)))
+            
+            if max_x > min_x and max_y > min_y:
+                c_depth = float(np.mean(depth_np[v_idx, min_y:max_y, min_x:max_x]))
+            else:
+                c_depth = 0.5 
+
+            if is_inverted:
+                c_depth = 1.0 / max(c_depth, 0.0001)
+
+            raw_depths.append(c_depth)
+            current_norms.append(norm)
+            valid_frames.append(i)
+
+        if not valid_frames:
+            return (pose_data_copy, "Fehler: Keine Posen mit Torso gefunden.")
+            
+        last_d, last_n = raw_depths[valid_frames[0]], current_norms[valid_frames[0]]
+        for i in range(len(raw_depths)):
+            if raw_depths[i] is not None: last_d = raw_depths[i]
+            else: raw_depths[i] = last_d
+                
+            if current_norms[i] is not None: last_n = current_norms[i]
+            else: current_norms[i] = last_n
+
+        smoothed_depths = []
+        for i in range(len(raw_depths)):
+            smoothed_depths.append(np.median(raw_depths[max(0, i - depth_smoothing//2) : min(len(raw_depths), i + depth_smoothing//2 + 1)]))
+
+        first_ist = current_norms[valid_frames[0]]
+        first_soll = smoothed_depths[valid_frames[0]] * slope + intercept
+        base_correction = 1.0
+        
+        if keep_start_size and first_soll > 0:
+            base_correction = first_ist / first_soll
+            log_messages.append(f"Keep Start Size AKTIV: Torso behält {first_ist:.1f}px bei Frame 0.\n")
+
+        for i, meta in enumerate(pose_metas):
+            if i not in valid_frames: 
+                continue
+            
+            c_depth = smoothed_depths[i]
+            c_norm = current_norms[i]
+            expected_norm = (c_depth * slope + intercept) * base_correction
+            
+            raw_scale = expected_norm / c_norm if c_norm > 0 else 1.0
+            global_scale = max(0.5, min(2.5, raw_scale))
+            clamped = " (GEBREMST!)" if global_scale != raw_scale else ""
+            
+            log_messages.append(f"Frame {i}: Distanz={c_depth:.3f}m | Ist(Norm)={c_norm:.1f}px | Soll={expected_norm:.1f}px | Faktor={global_scale:.2f}x{clamped}")
+            
+            kps = getattr(meta, "kps_body", [])
+            valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
+            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
+            pivot_y = max(valid_y) if valid_y else 0
+            pivot_x = np.mean(valid_x) if valid_x else 0
+            
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None and len(arr) > 0:
+                    for j in range(len(arr)):
+                        if len(arr[j]) >= 2 and arr[j][1] > 0:
+                            arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * global_scale
+                            arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * global_scale
+                            
+        return (pose_data_copy, "\n".join(log_messages))
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -11159,6 +11405,8 @@ NODE_CLASS_MAPPINGS = {
     "RetargetPoseCalibratorV7": RetargetPoseCalibratorV7,
     "RetargetPoseCalibratorV8": RetargetPoseCalibratorV8,
     "PoseGlobalPerspectiveScalerV12": PoseGlobalPerspectiveScalerV12,
+    "RetargetPoseCalibratorV9": RetargetPoseCalibratorV9,
+    "PoseGlobalPerspectiveScalerV13": PoseGlobalPerspectiveScalerV13,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -11233,6 +11481,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RetargetPoseCalibratorV7": "Retarget Pose Calibrator V7 (mit logs)",
     "RetargetPoseCalibratorV8": "Retarget Pose Calibrator V8 (Auto-Invert)",
     "PoseGlobalPerspectiveScalerV12": "Pose Global Perspective Scaler V12 (True Distance)",
+    "RetargetPoseCalibratorV9": "WanAnimate: Retarget Pose Calibrator (V9 Norm)",
+    "PoseGlobalPerspectiveScalerV13": "WanAnimate: Global Perspective Scaler (V13 Norm)",
 }
 
 
