@@ -10981,6 +10981,9 @@ class PoseGlobalPerspectiveScalerV12:
     DESCRIPTION = "V12: Versteht echte Distanz. Je größer die Distanz, desto kleiner die Person."
 
     def process(self, video_pose_data, calibration_data, video_depth_map, keep_start_size, depth_smoothing):
+        import copy
+        import numpy as np
+        
         pose_data_copy = copy.deepcopy(video_pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
         log_messages = ["=== V12 GLOBAL SCALER LOG ==="]
@@ -10994,35 +10997,54 @@ class PoseGlobalPerspectiveScalerV12:
         
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", None)
-            if kps is None or len(kps) == 0: 
-                raw_depths.append(None); current_sizes.append(None); continue
+            if kps is None or len(kps) == 0:
+                raw_depths.append(None)
+                current_sizes.append(None)
+                continue
+                
             valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
             valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
-            if len(valid_y) == 0: 
-                raw_depths.append(None); current_sizes.append(None); continue
-                
-            center_x = int(np.clip(np.mean(valid_x), 0, depth_np.shape[2]-1))
-            center_y = int(np.clip(np.mean(valid_y), 0, depth_np.shape[1]-1))
+            
+            if len(valid_y) == 0:
+                raw_depths.append(None)
+                current_sizes.append(None)
+                continue
+            
             v_idx = min(i, depth_np.shape[0] - 1)
             
-            c_depth = np.mean(depth_np[v_idx, max(0, center_y-5):min(depth_np.shape[1], center_y+6), max(0, center_x-5):min(depth_np.shape[2], center_x+6)])
+            # --- KORREKTE METHODE WIE IN V8 KALIBRIERUNG ---
+            H, W = depth_np.shape[1], depth_np.shape[2]
+            min_x, max_x = int(max(0, min(valid_x))), int(min(W-1, max(valid_x)))
+            min_y, max_y = int(max(0, min(valid_y))), int(min(H-1, max(valid_y)))
             
+            # Wir messen die Tiefe exakt wie in V8 über die gesamte Bounding-Box der Person
+            if max_x > min_x and max_y > min_y:
+                c_depth = float(np.mean(depth_np[v_idx, min_y:max_y, min_x:max_x]))
+            else:
+                c_depth = 0.5 # Fallback wie in V8
+
             # --- WANDLE AUCH HIER IN ECHTE DISTANZ UM ---
             if is_inverted:
                 c_depth = 1.0 / max(c_depth, 0.0001)
-            
+
             raw_depths.append(c_depth)
             current_sizes.append(max(valid_y) - min(valid_y))
             valid_frames.append(i)
 
-        if not valid_frames: return (pose_data_copy, "Fehler: Keine Posen gefunden.")
-
+        if not valid_frames:
+            return (pose_data_copy, "Fehler: Keine Posen gefunden.")
+            
         last_d, last_s = raw_depths[valid_frames[0]], current_sizes[valid_frames[0]]
         for i in range(len(raw_depths)):
-            if raw_depths[i] is not None: last_d = raw_depths[i]
-            else: raw_depths[i] = last_d
-            if current_sizes[i] is not None: last_s = current_sizes[i]
-            else: current_sizes[i] = last_s
+            if raw_depths[i] is not None: 
+                last_d = raw_depths[i]
+            else: 
+                raw_depths[i] = last_d
+                
+            if current_sizes[i] is not None: 
+                last_s = current_sizes[i]
+            else: 
+                current_sizes[i] = last_s
 
         smoothed_depths = []
         for i in range(len(raw_depths)):
@@ -11030,23 +11052,24 @@ class PoseGlobalPerspectiveScalerV12:
 
         first_ist = current_sizes[valid_frames[0]]
         first_soll = smoothed_depths[valid_frames[0]] * slope + intercept
-        
         base_correction = 1.0
+        
         if keep_start_size and first_soll > 0:
             base_correction = first_ist / first_soll
             log_messages.append(f"Keep Start Size AKTIV: Person behält {first_ist:.1f}px bei Frame 0.\n")
 
         for i, meta in enumerate(pose_metas):
-            if i not in valid_frames: continue
+            if i not in valid_frames: 
+                continue
             
             c_depth = smoothed_depths[i]
             c_size = current_sizes[i]
             expected_size = (c_depth * slope + intercept) * base_correction
             
             raw_scale = expected_size / c_size if c_size > 0 else 1.0
-            global_scale = max(0.5, min(2.5, raw_scale)) 
-            
+            global_scale = max(0.5, min(2.5, raw_scale))
             clamped = " (GEBREMST!)" if global_scale != raw_scale else ""
+            
             log_messages.append(f"Frame {i}: Distanz={c_depth:.3f}m | Ist={c_size:.1f}px | Soll={expected_size:.1f}px | Faktor={global_scale:.2f}x{clamped}")
             
             kps = getattr(meta, "kps_body", [])
@@ -11061,9 +11084,8 @@ class PoseGlobalPerspectiveScalerV12:
                         if len(arr[j]) >= 2 and arr[j][1] > 0:
                             arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * global_scale
                             arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * global_scale
-
+                            
         return (pose_data_copy, "\n".join(log_messages))
-
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
