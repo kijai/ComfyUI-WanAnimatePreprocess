@@ -10842,9 +10842,6 @@ class RetargetPoseCalibratorV7:
         return ({"perspective_slope": slope, "perspective_intercept": intercept, "true_3d_bones": true_3d_bones}, "\n".join(log_messages))
 
 
-# ======================================================================
-# 1. KALIBRIERUNG V8 (AUTO-INVERT FÜR DISPARITÄT)
-# ======================================================================
 class RetargetPoseCalibratorV8:
     @classmethod
     def INPUT_TYPES(cls):
@@ -10856,7 +10853,8 @@ class RetargetPoseCalibratorV8:
                 "depth_map_far": ("IMAGE",),
             },
             "optional": {
-                "nlf_close": ("NLFPRED",),
+                "nlf_close": ("NLFPRED", {"tooltip": "3D Daten Frame nah (Fallback)"}),
+                "nlf_far": ("NLFPRED", {"tooltip": "3D Daten Frame fern (Empfohlen, da ganzer Körper im Bild)"}),
             }
         }
 
@@ -10864,9 +10862,9 @@ class RetargetPoseCalibratorV8:
     RETURN_NAMES = ("calibration_data", "log_output",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V8: Erkennt und repariert automatisch invertierte KI-Tiefenkarten."
+    DESCRIPTION = "V8: Erkennt und repariert automatisch invertierte KI-Tiefenkarten (Disparität zu Distanz)."
 
-    def process(self, pose_close, depth_map_close, pose_far, depth_map_far, nlf_close=None):
+    def process(self, pose_close, depth_map_close, pose_far, depth_map_far, nlf_close=None, nlf_far=None):
         log_messages = ["=== V8 CALIBRATION LOG ==="]
         
         meta_close = pose_close.get("pose_metas", [])[0] if pose_close.get("pose_metas") else None
@@ -10912,7 +10910,7 @@ class RetargetPoseCalibratorV8:
         
         log_messages.append(f"KI-Roh-Tiefe Nah: {depth_c:.4f} | Fern: {depth_f:.4f}")
         
-        # --- FIX: AUTO INVERT ---
+        # --- FIX: AUTO INVERT (Disparität zu Distanz) ---
         is_inverted = False
         if depth_c > depth_f and full_height_close > theoretical_full_height_far:
             is_inverted = True
@@ -10933,14 +10931,32 @@ class RetargetPoseCalibratorV8:
             
         log_messages.append(f"\nPhysikalischer Slope: {slope:.2f}")
             
+        # --- DIE 3D KNOCHEN-MESSUNG (SMART FALLBACK) ---
         true_3d_bones = {}
-        if nlf_close is not None:
-            pose_3d = nlf_close.get('joints3d_nonparam', [nlf_close])[0][0][0]
-            def dist_3d(p1, p2): return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)
-            if len(pose_3d) > 13:
-                true_3d_bones = {"torso": dist_3d(pose_3d[1], pose_3d[8]), "r_thigh": dist_3d(pose_3d[8], pose_3d[9]), "r_calf": dist_3d(pose_3d[9], pose_3d[10]), "l_thigh": dist_3d(pose_3d[11], pose_3d[12]), "l_calf": dist_3d(pose_3d[12], pose_3d[13])}
+        target_nlf = nlf_far if nlf_far is not None else nlf_close
+        source_name = "nlf_far" if nlf_far is not None else "nlf_close"
+
+        if target_nlf is not None:
+            try:
+                pose_3d = target_nlf.get('joints3d_nonparam', [target_nlf])[0][0][0]
+                def dist_3d(p1, p2): return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)
+                
+                if len(pose_3d) > 13:
+                    true_3d_bones = {
+                        "torso": dist_3d(pose_3d[1], pose_3d[8]), 
+                        "r_thigh": dist_3d(pose_3d[8], pose_3d[9]), 
+                        "r_calf": dist_3d(pose_3d[9], pose_3d[10]), 
+                        "l_thigh": dist_3d(pose_3d[11], pose_3d[12]), 
+                        "l_calf": dist_3d(pose_3d[12], pose_3d[13])
+                    }
+                    log_messages.append(f"ERFOLG: Perfekte 3D-Knochenlängen aus '{source_name}' gelesen!")
+            except Exception as e:
+                log_messages.append(f"WARNUNG: Fehler beim Lesen der 3D-Daten aus '{source_name}': {str(e)}")
+        else:
+            log_messages.append("INFO: Weder nlf_far noch nlf_close angeschlossen. Überspringe 3D-Knochen.")
 
         return ({"perspective_slope": slope, "perspective_intercept": intercept, "true_3d_bones": true_3d_bones, "is_depth_inverted": is_inverted}, "\n".join(log_messages))
+
 
 # ======================================================================
 # 2. V12: GLOBAL PERSPECTIVE SCALER (MIT PHYSIKALISCHER DISTANZ)
@@ -10953,8 +10969,8 @@ class PoseGlobalPerspectiveScalerV12:
                 "video_pose_data": ("POSEDATA",),
                 "calibration_data": ("POSE_CALIBRATION",),
                 "video_depth_map": ("IMAGE",),
-                "keep_start_size": ("BOOLEAN", {"default": True}),
-                "depth_smoothing": ("INT", {"default": 5, "min": 1, "max": 31, "step": 2}),
+                "keep_start_size": ("BOOLEAN", {"default": True, "tooltip": "Behält die Originalgröße des Videos (Frame 0) bei."}),
+                "depth_smoothing": ("INT", {"default": 5, "min": 1, "max": 31, "step": 2, "tooltip": "Glättet zitternde Tiefen-Werte (Median Filter)."}),
             }
         }
 
@@ -10999,7 +11015,7 @@ class PoseGlobalPerspectiveScalerV12:
             current_sizes.append(max(valid_y) - min(valid_y))
             valid_frames.append(i)
 
-        if not valid_frames: return (pose_data_copy, "Fehler: Keine Posen.")
+        if not valid_frames: return (pose_data_copy, "Fehler: Keine Posen gefunden.")
 
         last_d, last_s = raw_depths[valid_frames[0]], current_sizes[valid_frames[0]]
         for i in range(len(raw_depths)):
@@ -11014,7 +11030,11 @@ class PoseGlobalPerspectiveScalerV12:
 
         first_ist = current_sizes[valid_frames[0]]
         first_soll = smoothed_depths[valid_frames[0]] * slope + intercept
-        base_correction = (first_ist / first_soll) if (keep_start_size and first_soll > 0) else 1.0
+        
+        base_correction = 1.0
+        if keep_start_size and first_soll > 0:
+            base_correction = first_ist / first_soll
+            log_messages.append(f"Keep Start Size AKTIV: Person behält {first_ist:.1f}px bei Frame 0.\n")
 
         for i, meta in enumerate(pose_metas):
             if i not in valid_frames: continue
@@ -11026,7 +11046,8 @@ class PoseGlobalPerspectiveScalerV12:
             raw_scale = expected_size / c_size if c_size > 0 else 1.0
             global_scale = max(0.5, min(2.5, raw_scale)) 
             
-            log_messages.append(f"Frame {i}: Distanz={c_depth:.3f}m | Ist={c_size:.1f}px | Soll={expected_size:.1f}px | Faktor={global_scale:.2f}x")
+            clamped = " (GEBREMST!)" if global_scale != raw_scale else ""
+            log_messages.append(f"Frame {i}: Distanz={c_depth:.3f}m | Ist={c_size:.1f}px | Soll={expected_size:.1f}px | Faktor={global_scale:.2f}x{clamped}")
             
             kps = getattr(meta, "kps_body", [])
             valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
@@ -11042,6 +11063,7 @@ class PoseGlobalPerspectiveScalerV12:
                             arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * global_scale
 
         return (pose_data_copy, "\n".join(log_messages))
+
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
