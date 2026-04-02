@@ -11206,7 +11206,7 @@ class RetargetPoseCalibratorV9:
         return ({"perspective_slope": slope, "perspective_intercept": intercept, "true_3d_bones": true_3d_bones, "is_depth_inverted": is_inverted}, "\n".join(log_messages))
 
 # ======================================================================
-# 2. V13: GLOBAL PERSPECTIVE SCALER (NORM-BASIERT)
+# 2. V13: GLOBAL PERSPECTIVE SCALER (NORM-BASIERT) - REPARIERT
 # ======================================================================
 class PoseGlobalPerspectiveScalerV13:
     @classmethod
@@ -11244,7 +11244,9 @@ class PoseGlobalPerspectiveScalerV13:
         raw_depths, current_norms, valid_frames = [], [], []
 
         def get_torso_norm(kps):
-            if not kps or len(kps) < 12: return 0.0
+            # KORREKTUR: "is None" statt "not kps", genau wie es in V12 richtig gemacht wurde!
+            if kps is None or len(kps) < 12: return 0.0
+            
             neck, r_hip, l_hip = kps[1], kps[8], kps[11]
             if len(neck) >= 2 and neck[1] > 0 and len(r_hip) >= 2 and r_hip[1] > 0 and len(l_hip) >= 2 and l_hip[1] > 0:
                 return math.sqrt((neck[0] - (r_hip[0]+l_hip[0])/2.0)**2 + (neck[1] - (r_hip[1]+l_hip[1])/2.0)**2)
