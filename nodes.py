@@ -11346,6 +11346,7 @@ class PoseGlobalPerspectiveScalerV14:
                 "calibration_data": ("POSE_CALIBRATION",),
                 "video_depth_map": ("IMAGE",),
                 "include_head": ("BOOLEAN", {"default": True, "tooltip": "Prüft zusätzlich, ob der Kopf (Nase) im Frame sichtbar ist."}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1, "tooltip": "Nimmt X Frames VOR und NACH dem Anker-Frame, um einen Durchschnitt zu bilden (robuster)."}),
             }
         }
 
@@ -11353,9 +11354,9 @@ class PoseGlobalPerspectiveScalerV14:
     RETURN_NAMES = ("scaled_pose_data", "log_output",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V14: Sucht den Anker-Frame (meiste Körperteile) und wendet EINEN festen Skalierungsfaktor jitter-frei an."
+    DESCRIPTION = "V14: Sucht den Anker-Frame und bildet (optional) einen Durchschnitt mit Nachbar-Frames für den perfekten festen Skalierungsfaktor."
 
-    def process(self, video_pose_data, calibration_data, video_depth_map, include_head):
+    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window):
         import copy
         import numpy as np
         import math
@@ -11378,19 +11379,14 @@ class PoseGlobalPerspectiveScalerV14:
 
         best_frame_idx = -1
         best_score = -1
-        anchor_norm = 0.0
-        anchor_depth = 0.0
         
-        # Kern-Punkte Basis: Hals(1), R-Hüfte(8), R-Knie(9), R-Knöchel(10), L-Hüfte(11), L-Knie(12), L-Knöchel(13)
         core_indices = [1, 8, 9, 10, 11, 12, 13]
-        
-        # OPTION: Kopf (Nase) hinzufügen
         if include_head:
-            core_indices.append(0) # 0 = Nase in OpenPose/DWPose
+            core_indices.append(0) # 0 = Nase
             
         max_possible_points = len(core_indices)
         
-        # 1. FINDE DEN BESTEN ANKER-FRAME
+        # 1. FINDE DEN BESTEN EINZEL-FRAME (Den "Epicenter" Frame)
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", None)
             norm = get_torso_norm(kps)
@@ -11398,51 +11394,71 @@ class PoseGlobalPerspectiveScalerV14:
             if norm == 0.0:
                 continue
             
-            # Zähle, wie viele Kernpunkte im Bild sind
-            visible_core = 0
-            for idx in core_indices:
-                if len(kps) > idx and len(kps[idx]) >= 2 and kps[idx][1] > 0:
-                    visible_core += 1
-                    
-            # Score: Sichtbare Punkte * 1000. Tie-Breaker ist die Norm.
+            visible_core = sum(1 for idx in core_indices if len(kps) > idx and len(kps[idx]) >= 2 and kps[idx][1] > 0)
             score = (visible_core * 1000) + norm
             
             if score > best_score:
                 best_score = score
                 best_frame_idx = i
-                anchor_norm = norm
-                
-                # Hole die Tiefe NUR für diesen perfekten Frame
-                valid_x = [kps[1][0], kps[8][0], kps[11][0]]
-                valid_y = [kps[1][1], kps[8][1], kps[11][1]]
-                v_idx = min(i, depth_np.shape[0] - 1)
-                H, W = depth_np.shape[1], depth_np.shape[2]
-                min_x, max_x = int(max(0, min(valid_x))), int(min(W-1, max(valid_x)))
-                min_y, max_y = int(max(0, min(valid_y))), int(min(H-1, max(valid_y)))
-                
-                if max_x > min_x and max_y > min_y:
-                    anchor_depth = float(np.mean(depth_np[v_idx, min_y:max_y, min_x:max_x]))
-                else:
-                    anchor_depth = 0.5
-                    
-                if is_inverted:
-                    anchor_depth = 1.0 / max(anchor_depth, 0.0001)
 
         if best_frame_idx == -1:
             return (pose_data_copy, "Fehler: Keine gültigen Posen gefunden.")
             
-        # 2. BERECHNE DEN EINEN FESTEN SKALIERUNGSFAKTOR
-        expected_norm = (anchor_depth * slope) + intercept
-        anchor_scale = expected_norm / anchor_norm if anchor_norm > 0 else 1.0
+        # 2. BERECHNE DURCHSCHNITT (AVERAGE) UM DEN ANKER-FRAME HERUM
+        start_idx = max(0, best_frame_idx - anchor_window)
+        end_idx = min(len(pose_metas) - 1, best_frame_idx + anchor_window)
         
-        log_messages.append(f"Anker-Frame gefunden: Frame {best_frame_idx}")
+        sum_norm = 0.0
+        sum_depth = 0.0
+        valid_frames_in_window = 0
+        
+        for i in range(start_idx, end_idx + 1):
+            meta = pose_metas[i]
+            kps = getattr(meta, "kps_body", None)
+            norm = get_torso_norm(kps)
+            
+            if norm == 0.0:
+                continue
+                
+            valid_x = [kps[1][0], kps[8][0], kps[11][0]]
+            valid_y = [kps[1][1], kps[8][1], kps[11][1]]
+            v_idx = min(i, depth_np.shape[0] - 1)
+            H, W = depth_np.shape[1], depth_np.shape[2]
+            min_x, max_x = int(max(0, min(valid_x))), int(min(W-1, max(valid_x)))
+            min_y, max_y = int(max(0, min(valid_y))), int(min(H-1, max(valid_y)))
+            
+            if max_x > min_x and max_y > min_y:
+                frame_depth = float(np.mean(depth_np[v_idx, min_y:max_y, min_x:max_x]))
+            else:
+                frame_depth = 0.5
+                
+            if is_inverted:
+                frame_depth = 1.0 / max(frame_depth, 0.0001)
+                
+            sum_norm += norm
+            sum_depth += frame_depth
+            valid_frames_in_window += 1
+            
+        # Durchschnitt ausrechnen
+        if valid_frames_in_window > 0:
+            avg_anchor_norm = sum_norm / valid_frames_in_window
+            avg_anchor_depth = sum_depth / valid_frames_in_window
+        else:
+            return (pose_data_copy, "Fehler: Konnte im Window keine gültigen Werte extrahieren.")
+
+        # 3. BERECHNE DEN EINEN FESTEN SKALIERUNGSFAKTOR AUS DEM DURCHSCHNITT
+        expected_norm = (avg_anchor_depth * slope) + intercept
+        anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
+        
+        log_messages.append(f"Zentraler Anker-Frame gefunden: Frame {best_frame_idx}")
         log_messages.append(f"-> Sichtbare Kern-Punkte: {int(best_score // 1000)}/{max_possible_points}")
-        log_messages.append(f"-> Torso-Norm (Ist): {anchor_norm:.1f}px")
-        log_messages.append(f"-> Tiefe an diesem Frame: {anchor_depth:.3f}m")
+        log_messages.append(f"-> Average Window genutzt: Frame {start_idx} bis {end_idx} ({valid_frames_in_window} Frames)")
+        log_messages.append(f"-> Durchschnittliche Torso-Norm (Ist): {avg_anchor_norm:.1f}px")
+        log_messages.append(f"-> Durchschnittliche Tiefe (Depth): {avg_anchor_depth:.3f}m")
         log_messages.append(f"-> Soll-Norm laut Kalibrierung: {expected_norm:.1f}px")
         log_messages.append(f"\n==> FESTER SKALIERUNGSFAKTOR FÜR GANZES VIDEO: {anchor_scale:.3f}x\n")
 
-        # 3. WENDE DEN FAKTOR AUF ALLE FRAMES AN
+        # 4. WENDE DEN FAKTOR AUF ALLE FRAMES AN
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
             valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
@@ -11451,7 +11467,6 @@ class PoseGlobalPerspectiveScalerV14:
             if not valid_y or not valid_x:
                 continue
                 
-            # Wir behalten den tiefsten Punkt (die Füße/Beine) jedes Einzelframes als Pivot
             pivot_y = max(valid_y)
             pivot_x = np.mean(valid_x)
             
@@ -11463,8 +11478,9 @@ class PoseGlobalPerspectiveScalerV14:
                             arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * anchor_scale
                             arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * anchor_scale
                             
-        log_messages.append("Erfolgreich: Fester Skalierungsfaktor wurde auf alle Frames angewandt. (100% Jitter-frei)")
+        log_messages.append("Erfolgreich: Fester, gemittelter Skalierungsfaktor wurde auf alle Frames angewandt.")
         return (pose_data_copy, "\n".join(log_messages))
+
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
