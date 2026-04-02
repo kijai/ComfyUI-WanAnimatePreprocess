@@ -11346,7 +11346,7 @@ class PoseGlobalPerspectiveScalerV14:
                 "calibration_data": ("POSE_CALIBRATION",),
                 "video_depth_map": ("IMAGE",),
                 "include_head": ("BOOLEAN", {"default": True, "tooltip": "Prüft zusätzlich, ob der Kopf (Nase) im Frame sichtbar ist."}),
-                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1, "tooltip": "Nimmt X Frames VOR und NACH dem Anker-Frame, um einen Durchschnitt zu bilden (robuster)."}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1, "tooltip": "Nimmt X Frames VOR und NACH dem Anker-Frame, um einen Durchschnitt zu bilden."}),
             }
         }
 
@@ -11354,7 +11354,7 @@ class PoseGlobalPerspectiveScalerV14:
     RETURN_NAMES = ("scaled_pose_data", "log_output",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V14: Sucht den Anker-Frame und bildet (optional) einen Durchschnitt mit Nachbar-Frames für den perfekten festen Skalierungsfaktor."
+    DESCRIPTION = "V14: Sucht den perfekten Anker-Frame (Fokus auf GANZKÖRPER und BEINLÄNGE) für Jitter-freies Skalieren."
 
     def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window):
         import copy
@@ -11370,11 +11370,40 @@ class PoseGlobalPerspectiveScalerV14:
         is_inverted = calibration_data.get("is_depth_inverted", False)
         depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
         
+        H, W = depth_np.shape[1], depth_np.shape[2]
+        
+        # --- SICHERHEITS-CHECK: Ist der Punkt wirklich im Bild und nicht am Rand zerquetscht? ---
+        def is_valid_point(pt):
+            if pt is None or len(pt) < 2: return False
+            x, y = pt[0], pt[1]
+            # Muss mind. 5 Pixel vom unteren/rechten Rand weg sein (verhindert halluzinierte Punkte)
+            return (0 < x < W - 5) and (0 < y < H - 5)
+
         def get_torso_norm(kps):
             if kps is None or len(kps) < 12: return 0.0
             neck, r_hip, l_hip = kps[1], kps[8], kps[11]
-            if len(neck) >= 2 and neck[1] > 0 and len(r_hip) >= 2 and r_hip[1] > 0 and len(l_hip) >= 2 and l_hip[1] > 0:
+            if is_valid_point(neck) and is_valid_point(r_hip) and is_valid_point(l_hip):
                 return math.sqrt((neck[0] - (r_hip[0]+l_hip[0])/2.0)**2 + (neck[1] - (r_hip[1]+l_hip[1])/2.0)**2)
+            return 0.0
+            
+        def get_leg_length(kps):
+            # Misst die echte Beinlänge (Mitte der Hüften bis Mitte der Knöchel)
+            if kps is None or len(kps) < 14: return 0.0
+            r_hip, l_hip = kps[8], kps[11]
+            r_ank, l_ank = kps[10], kps[13]
+            
+            hip_y = -1
+            if is_valid_point(r_hip) and is_valid_point(l_hip): hip_y = (r_hip[1] + l_hip[1]) / 2.0
+            elif is_valid_point(r_hip): hip_y = r_hip[1]
+            elif is_valid_point(l_hip): hip_y = l_hip[1]
+            
+            ank_y = -1
+            if is_valid_point(r_ank) and is_valid_point(l_ank): ank_y = (r_ank[1] + l_ank[1]) / 2.0
+            elif is_valid_point(r_ank): ank_y = r_ank[1]
+            elif is_valid_point(l_ank): ank_y = l_ank[1]
+            
+            if hip_y > 0 and ank_y > 0 and ank_y > hip_y:
+                return ank_y - hip_y
             return 0.0
 
         best_frame_idx = -1
@@ -11386,7 +11415,7 @@ class PoseGlobalPerspectiveScalerV14:
             
         max_possible_points = len(core_indices)
         
-        # 1. FINDE DEN BESTEN EINZEL-FRAME (Den "Epicenter" Frame)
+        # 1. FINDE DEN BESTEN EINZEL-FRAME
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", None)
             norm = get_torso_norm(kps)
@@ -11394,8 +11423,12 @@ class PoseGlobalPerspectiveScalerV14:
             if norm == 0.0:
                 continue
             
-            visible_core = sum(1 for idx in core_indices if len(kps) > idx and len(kps[idx]) >= 2 and kps[idx][1] > 0)
-            score = (visible_core * 1000) + norm
+            # Zähle nur WIRKLICH sichtbare Kernpunkte
+            visible_core = sum(1 for idx in core_indices if len(kps) > idx and is_valid_point(kps[idx]))
+            
+            # WICHTIG: Tie-Breaker ist jetzt die Beinlänge! (Je länger die Beine, desto besser der Frame)
+            leg_len = get_leg_length(kps)
+            score = (visible_core * 10000) + leg_len
             
             if score > best_score:
                 best_score = score
@@ -11423,7 +11456,7 @@ class PoseGlobalPerspectiveScalerV14:
             valid_x = [kps[1][0], kps[8][0], kps[11][0]]
             valid_y = [kps[1][1], kps[8][1], kps[11][1]]
             v_idx = min(i, depth_np.shape[0] - 1)
-            H, W = depth_np.shape[1], depth_np.shape[2]
+            
             min_x, max_x = int(max(0, min(valid_x))), int(min(W-1, max(valid_x)))
             min_y, max_y = int(max(0, min(valid_y))), int(min(H-1, max(valid_y)))
             
@@ -11439,19 +11472,19 @@ class PoseGlobalPerspectiveScalerV14:
             sum_depth += frame_depth
             valid_frames_in_window += 1
             
-        # Durchschnitt ausrechnen
         if valid_frames_in_window > 0:
             avg_anchor_norm = sum_norm / valid_frames_in_window
             avg_anchor_depth = sum_depth / valid_frames_in_window
         else:
             return (pose_data_copy, "Fehler: Konnte im Window keine gültigen Werte extrahieren.")
 
-        # 3. BERECHNE DEN EINEN FESTEN SKALIERUNGSFAKTOR AUS DEM DURCHSCHNITT
+        # 3. BERECHNE DEN EINEN FESTEN SKALIERUNGSFAKTOR
         expected_norm = (avg_anchor_depth * slope) + intercept
         anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
         
         log_messages.append(f"Zentraler Anker-Frame gefunden: Frame {best_frame_idx}")
-        log_messages.append(f"-> Sichtbare Kern-Punkte: {int(best_score // 1000)}/{max_possible_points}")
+        log_messages.append(f"-> Sichtbare Kern-Punkte: {int(best_score // 10000)}/{max_possible_points}")
+        log_messages.append(f"-> Gemessene Beinlänge für Score: {best_score % 10000:.1f}px")
         log_messages.append(f"-> Average Window genutzt: Frame {start_idx} bis {end_idx} ({valid_frames_in_window} Frames)")
         log_messages.append(f"-> Durchschnittliche Torso-Norm (Ist): {avg_anchor_norm:.1f}px")
         log_messages.append(f"-> Durchschnittliche Tiefe (Depth): {avg_anchor_depth:.3f}m")
@@ -11461,8 +11494,8 @@ class PoseGlobalPerspectiveScalerV14:
         # 4. WENDE DEN FAKTOR AUF ALLE FRAMES AN
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
-            valid_y = [kp[1] for kp in kps if len(kp) >= 2 and kp[1] > 0]
-            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and kp[0] > 0]
+            valid_y = [kp[1] for kp in kps if len(kp) >= 2 and is_valid_point(kp)]
+            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and is_valid_point(kp)]
             
             if not valid_y or not valid_x:
                 continue
