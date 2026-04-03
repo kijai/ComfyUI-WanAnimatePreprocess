@@ -11359,7 +11359,7 @@ class PoseGlobalPerspectiveScalerV14:
     RETURN_NAMES = ("scaled_pose_data", "log_output",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V14: Multi-Stufen-Filter mit striktem Confidence-Check für fehlende/abgeschnittene Gliedmaßen."
+    DESCRIPTION = "V14: 3-Stufen-Filter (Punkte -> Schultern -> Beine) ohne aggressiven Rand-Löscher."
 
     def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, video_nlf_data=None):
         import copy
@@ -11376,19 +11376,17 @@ class PoseGlobalPerspectiveScalerV14:
         depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
         
         H, W = depth_np.shape[1], depth_np.shape[2]
-        EDGE_MARGIN = 15 
         
-        # --- NEU: DER CONFIDENCE FILTER ---
+        # EDGE_MARGIN ist jetzt auf 2 reduziert (fast deaktiviert). 
+        # So werden Frames wie Frame 0, wo die Füße ganz unten sind, nicht mehr gelöscht!
+        EDGE_MARGIN = 2 
+        
         def is_valid_point(pt):
             if pt is None or len(pt) < 2: return False
-            # DWPose/OpenPose speichern oft [x, y, confidence]. Prüfe den 3. Wert!
-            if len(pt) >= 3:
-                if pt[2] < min_confidence:
-                    return False
-            # Fallback, falls x und y null sind (oft bei "nicht gefunden")
+            if len(pt) >= 3 and pt[2] < min_confidence:
+                return False
             if pt[0] <= 0 or pt[1] <= 0:
                 return False
-                
             return (EDGE_MARGIN < pt[0] < W - EDGE_MARGIN) and (EDGE_MARGIN < pt[1] < H - EDGE_MARGIN)
 
         def get_torso_norm(kps):
@@ -11417,6 +11415,7 @@ class PoseGlobalPerspectiveScalerV14:
             return 0.0
 
         def get_parallel_score(kps):
+            # Schulter-Logik: Schulterbreite / Torsohöhe
             if kps is None or len(kps) < 12: return 0.0
             r_sho, l_sho = kps[2], kps[5]
             if is_valid_point(r_sho) and is_valid_point(l_sho):
@@ -11459,13 +11458,13 @@ class PoseGlobalPerspectiveScalerV14:
         if not frame_stats:
             return (pose_data_copy, "Fehler: Keine gültigen Posen gefunden.")
 
-        # --- STUFE 1: Passfilter (Punkte) ---
+        # --- STUFE 1: Passfilter (Punkte + Confidence) ---
         candidates_1 = [f for f in frame_stats if f['core'] == max_core_points_found]
         log_messages.append(f"Passfilter 1 (Punkte + Confidence >= {min_confidence}): Max {max_core_points_found}/{max_possible_points} gefunden. -> {len(candidates_1)} Frames qualifiziert.")
 
         # --- STUFE 2: Passfilter (Schulter-Twist) ---
         max_parallel = max(c['parallel'] for c in candidates_1)
-        tolerance = 0.15
+        tolerance = 0.15 # 15% Toleranz vom allerbesten Schulter-Wert
         candidates_2 = [c for c in candidates_1 if c['parallel'] >= max_parallel - tolerance]
         log_messages.append(f"Passfilter 2 (Schulter): Frontal-Wert {max_parallel:.2f}. -> {len(candidates_2)} Frames im Toleranzbereich.")
 
@@ -11474,6 +11473,7 @@ class PoseGlobalPerspectiveScalerV14:
         best_frame_idx = best_frame_data['idx']
         log_messages.append(f"Passfilter 3 (Beinlänge): Frame {best_frame_idx} gewinnt mit {best_frame_data['leg']:.1f}px Länge!\n")
             
+        # --- AVERAGE WINDOW ---
         start_idx = max(0, best_frame_idx - anchor_window)
         end_idx = min(len(pose_metas) - 1, best_frame_idx + anchor_window)
         
@@ -11515,6 +11515,7 @@ class PoseGlobalPerspectiveScalerV14:
         log_messages.append(f"-> Soll-Norm laut Kalibrierung: {expected_norm:.1f}px")
         log_messages.append(f"\n==> FESTER SKALIERUNGSFAKTOR FÜR GANZES VIDEO: {anchor_scale:.3f}x\n")
 
+        # --- FAKTOR ANWENDEN ---
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
             valid_y = [kp[1] for kp in kps if len(kp) >= 2 and is_valid_point(kp)]
