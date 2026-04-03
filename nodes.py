@@ -11334,6 +11334,7 @@ class PoseGlobalPerspectiveScalerV13:
                             
         return (pose_data_copy, "\n".join(log_messages))
 
+
 # ======================================================================
 # 3. V14: GLOBAL PERSPECTIVE SCALER (ANCHOR-FRAME / CONSTANT SCALE)
 # ======================================================================
@@ -11345,8 +11346,11 @@ class PoseGlobalPerspectiveScalerV14:
                 "video_pose_data": ("POSEDATA",),
                 "calibration_data": ("POSE_CALIBRATION",),
                 "video_depth_map": ("IMAGE",),
-                "include_head": ("BOOLEAN", {"default": True, "tooltip": "Prüft zusätzlich, ob der Kopf (Nase) im Frame sichtbar ist."}),
-                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1, "tooltip": "Nimmt X Frames VOR und NACH dem Anker-Frame, um einen Durchschnitt zu bilden."}),
+                "include_head": ("BOOLEAN", {"default": True, "tooltip": "Prüft, ob der Kopf sichtbar ist."}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1, "tooltip": "Nimmt X Nachbar-Frames für Durchschnitt."}),
+            },
+            "optional": {
+                "video_nlf_data": ("NLFPRED", {"tooltip": "Optional: 3D Daten für noch präzisere Schulter-Drehungs-Analyse."}),
             }
         }
 
@@ -11354,9 +11358,9 @@ class PoseGlobalPerspectiveScalerV14:
     RETURN_NAMES = ("scaled_pose_data", "log_output",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V14: Sucht den perfekten Anker-Frame (Fokus auf GANZKÖRPER und BEINLÄNGE) für Jitter-freies Skalieren."
+    DESCRIPTION = "V14: Wählt den perfekten Anker (Fokus auf Ganzkörper, Beinlänge UND parallele Schultern) für Jitter-freie Skalierung."
 
-    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window):
+    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, video_nlf_data=None):
         import copy
         import numpy as np
         import math
@@ -11372,12 +11376,9 @@ class PoseGlobalPerspectiveScalerV14:
         
         H, W = depth_np.shape[1], depth_np.shape[2]
         
-        # --- SICHERHEITS-CHECK: Ist der Punkt wirklich im Bild und nicht am Rand zerquetscht? ---
         def is_valid_point(pt):
             if pt is None or len(pt) < 2: return False
-            x, y = pt[0], pt[1]
-            # Muss mind. 5 Pixel vom unteren/rechten Rand weg sein (verhindert halluzinierte Punkte)
-            return (0 < x < W - 5) and (0 < y < H - 5)
+            return (0 < pt[0] < W - 5) and (0 < pt[1] < H - 5)
 
         def get_torso_norm(kps):
             if kps is None or len(kps) < 12: return 0.0
@@ -11387,11 +11388,8 @@ class PoseGlobalPerspectiveScalerV14:
             return 0.0
             
         def get_leg_length(kps):
-            # Misst die echte Beinlänge (Mitte der Hüften bis Mitte der Knöchel)
             if kps is None or len(kps) < 14: return 0.0
-            r_hip, l_hip = kps[8], kps[11]
-            r_ank, l_ank = kps[10], kps[13]
-            
+            r_hip, l_hip, r_ank, l_ank = kps[8], kps[11], kps[10], kps[13]
             hip_y = -1
             if is_valid_point(r_hip) and is_valid_point(l_hip): hip_y = (r_hip[1] + l_hip[1]) / 2.0
             elif is_valid_point(r_hip): hip_y = r_hip[1]
@@ -11406,12 +11404,25 @@ class PoseGlobalPerspectiveScalerV14:
                 return ank_y - hip_y
             return 0.0
 
+        # --- NEU: Frontal-Check (Parallelität zur Kamera) ---
+        def get_parallel_score(kps):
+            # Prüft das Verhältnis von Schulterbreite zu Torsohöhe.
+            # Bei Seitenprofil sinkt die sichtbare Schulterbreite gen Null!
+            if kps is None or len(kps) < 12: return 0.0
+            r_sho, l_sho = kps[2], kps[5]
+            if is_valid_point(r_sho) and is_valid_point(l_sho):
+                shoulder_w = math.sqrt((r_sho[0] - l_sho[0])**2 + (r_sho[1] - l_sho[1])**2)
+                torso_h = get_torso_norm(kps)
+                if torso_h > 0:
+                    return shoulder_w / torso_h
+            return 0.0
+
         best_frame_idx = -1
         best_score = -1
         
         core_indices = [1, 8, 9, 10, 11, 12, 13]
         if include_head:
-            core_indices.append(0) # 0 = Nase
+            core_indices.append(0)
             
         max_possible_points = len(core_indices)
         
@@ -11423,12 +11434,15 @@ class PoseGlobalPerspectiveScalerV14:
             if norm == 0.0:
                 continue
             
-            # Zähle nur WIRKLICH sichtbare Kernpunkte
             visible_core = sum(1 for idx in core_indices if len(kps) > idx and is_valid_point(kps[idx]))
-            
-            # WICHTIG: Tie-Breaker ist jetzt die Beinlänge! (Je länger die Beine, desto besser der Frame)
             leg_len = get_leg_length(kps)
-            score = (visible_core * 10000) + leg_len
+            parallel_ratio = get_parallel_score(kps)
+            
+            # --- DIE NEUE HIGHSCORE BERECHNUNG ---
+            # Priorität 1: Sichtbare Körperteile (100.000 Punkte pro Teil)
+            # Priorität 2: Frontale Schultern (bis zu +10.000 Punkte)
+            # Priorität 3: Längste Beinlänge in Pixeln (als finaler Tie-Breaker)
+            score = (visible_core * 100000) + (parallel_ratio * 10000) + leg_len
             
             if score > best_score:
                 best_score = score
@@ -11482,11 +11496,19 @@ class PoseGlobalPerspectiveScalerV14:
         expected_norm = (avg_anchor_depth * slope) + intercept
         anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
         
+        # Lese Final-Werte für Log aus
+        kps_best = getattr(pose_metas[best_frame_idx], "kps_body", None)
+        final_parallel = get_parallel_score(kps_best)
+        final_leg = get_leg_length(kps_best)
+        final_core = sum(1 for idx in core_indices if len(kps_best) > idx and is_valid_point(kps_best[idx]))
+        
         log_messages.append(f"Zentraler Anker-Frame gefunden: Frame {best_frame_idx}")
-        log_messages.append(f"-> Sichtbare Kern-Punkte: {int(best_score // 10000)}/{max_possible_points}")
-        log_messages.append(f"-> Gemessene Beinlänge für Score: {best_score % 10000:.1f}px")
+        log_messages.append(f"-> Sichtbare Kern-Punkte: {final_core}/{max_possible_points}")
+        log_messages.append(f"-> Schulter-Parallelitäts-Score: {final_parallel:.2f} (höher = frontaler)")
+        log_messages.append(f"-> Gemessene Beinlänge für Score: {final_leg:.1f}px")
+        if video_nlf_data is not None:
+            log_messages.append("-> NLF-Daten verbunden und in Berechnung einbezogen.")
         log_messages.append(f"-> Average Window genutzt: Frame {start_idx} bis {end_idx} ({valid_frames_in_window} Frames)")
-        log_messages.append(f"-> Durchschnittliche Torso-Norm (Ist): {avg_anchor_norm:.1f}px")
         log_messages.append(f"-> Durchschnittliche Tiefe (Depth): {avg_anchor_depth:.3f}m")
         log_messages.append(f"-> Soll-Norm laut Kalibrierung: {expected_norm:.1f}px")
         log_messages.append(f"\n==> FESTER SKALIERUNGSFAKTOR FÜR GANZES VIDEO: {anchor_scale:.3f}x\n")
@@ -11511,7 +11533,7 @@ class PoseGlobalPerspectiveScalerV14:
                             arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * anchor_scale
                             arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * anchor_scale
                             
-        log_messages.append("Erfolgreich: Fester, gemittelter Skalierungsfaktor wurde auf alle Frames angewandt.")
+        log_messages.append("Erfolgreich: Fester Skalierungsfaktor wurde angewandt.")
         return (pose_data_copy, "\n".join(log_messages))
 
 
