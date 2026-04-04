@@ -8605,9 +8605,6 @@ class PoseGlobalPerspectiveScalerV14:
 # ======================================================================
 # 3. V17: GLOBAL PERSPECTIVE SCALER (V14 INPUTS + SCORING LOGIC)
 # ======================================================================
-# ======================================================================
-# 3. V17: GLOBAL PERSPECTIVE SCALER (V14 INPUTS + SCORING LOGIC)
-# ======================================================================
 class PoseGlobalPerspectiveScalerV17:
     @classmethod
     def INPUT_TYPES(cls):
@@ -8649,10 +8646,9 @@ class PoseGlobalPerspectiveScalerV17:
         H, W = depth_np.shape[1], depth_np.shape[2]
         EDGE_MARGIN = 2
         
-        def is_valid_point(pt, strict_conf=None):
-            conf_limit = strict_conf if strict_conf is not None else min_confidence
-            if pt is None or len(pt) < 2: return False
-            if len(pt) >= 3 and pt[2] < conf_limit: return False
+        def is_valid_point(pt):
+            if pt is None or len(pt) < 3: return False
+            if pt[2] < min_confidence: return False
             if pt[0] <= 0 or pt[1] <= 0: return False
             return (EDGE_MARGIN < pt[0] < W - EDGE_MARGIN) and (EDGE_MARGIN < pt[1] < H - EDGE_MARGIN)
 
@@ -8668,7 +8664,7 @@ class PoseGlobalPerspectiveScalerV17:
             pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0] if isinstance(video_nlf_data, dict) else video_nlf_data
 
         body_lengths = []
-        valid_body_indices = [1, 2, 5, 8, 11, 9, 12, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24] 
+        valid_body_indices = [1, 2, 5, 8, 11, 9, 12, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23] 
         if include_head: valid_body_indices.append(0)
 
         for meta in pose_metas:
@@ -8684,52 +8680,85 @@ class PoseGlobalPerspectiveScalerV17:
 
         frame_scores = []
         score_details = []
+        frame_logs = []
         
         for i, meta in enumerate(pose_metas):
             kps_2d = getattr(meta, "kps_body", None)
             if kps_2d is None or len(kps_2d) < 14 or get_torso_norm(kps_2d) == 0.0:
                 frame_scores.append(-1.0)
                 score_details.append({"w":0, "f":0, "l":0, "t":-1})
+                frame_logs.append("Ungültiger Torso")
                 continue
 
-            # 1. Beine (Strikt: Hacken/Knöchel mit höherer Confidence erforderlich)
-            has_heels = False
+            found_points = []
+            
+            # --- 1. Füße / Hacken (Indizes 18, 19, 20 und 21, 22, 23) ---
+            has_feet = False
+            feet_indices = [18, 19, 20, 21, 22, 23]
             if len(kps_2d) > 23:
-                has_heels = is_valid_point(kps_2d[20], 0.4) or is_valid_point(kps_2d[23], 0.4)
-            if not has_heels:
-                has_heels = is_valid_point(kps_2d[10], 0.4) or is_valid_point(kps_2d[13], 0.4)
+                for idx in feet_indices:
+                    if is_valid_point(kps_2d[idx]):
+                        has_feet = True
+                        found_points.append(f"Fuß({idx})[{kps_2d[idx][2]:.2f}]")
+            
+            # --- 2. Knöchel / Waden (Indizes 10, 13) ---
+            has_ankles = False
+            if len(kps_2d) > 13:
+                if is_valid_point(kps_2d[10]):
+                    has_ankles = True
+                    found_points.append(f"R-Knöchel(10)[{kps_2d[10][2]:.2f}]")
+                if is_valid_point(kps_2d[13]):
+                    has_ankles = True
+                    found_points.append(f"L-Knöchel(13)[{kps_2d[13][2]:.2f}]")
 
-            waden_pts = 1000.0 if has_heels else 0.0
-            schenkel_pts = 500.0 if (waden_pts == 0 and (is_valid_point(kps_2d[9]) or is_valid_point(kps_2d[12]))) else 0.0
+            # --- 3. Knie / Schenkel (Indizes 9, 12) ---
+            has_knees = False
+            if len(kps_2d) > 12:
+                if is_valid_point(kps_2d[9]):
+                    has_knees = True
+                    found_points.append(f"R-Knie(9)[{kps_2d[9][2]:.2f}]")
+                if is_valid_point(kps_2d[12]):
+                    has_knees = True
+                    found_points.append(f"L-Knie(12)[{kps_2d[12][2]:.2f}]")
+
+            # Punktevergabe: Beine geben 1000 bei Knöchel/Fuß, 500 bei Knie
+            waden_pts = 1000.0 if (has_feet or has_ankles) else 0.0
+            schenkel_pts = 500.0 if (waden_pts == 0 and has_knees) else 0.0
             bein_pts = max(waden_pts, schenkel_pts)
 
-            # 2. Frontal (Toleranter & Tensor-Sicher)
+            # --- 4. Frontal ---
             frontal_pts = 0.0
             if pose_input_3d is not None and i < len(pose_input_3d):
                 pose_3d_frame = pose_input_3d[i]
-                # FIX: Explizite Prüfung statt boolschem Array-Vergleich
                 if pose_3d_frame is not None and len(pose_3d_frame) > 0 and len(pose_3d_frame[0]) > 5:
                     z_right, z_left = float(pose_3d_frame[0][2][2]), float(pose_3d_frame[0][5][2])
                     z_diff = abs(z_left - z_right)
                     frontal_pts = max(0.0, 500.0 - (z_diff * 150.0))
 
-            # 3. Länge
+            # --- 5. Länge ---
             length_pts = (body_lengths[i] / max_body_length) * 100.0
             
             total = bein_pts + frontal_pts + length_pts
             frame_scores.append(total)
             score_details.append({"w": bein_pts, "f": frontal_pts, "l": length_pts, "t": total})
+            frame_logs.append(" | ".join(found_points) if found_points else "Keine Bein-Punkte > Min-Confidence")
 
         best_idx = int(np.argmax(frame_scores))
         
         if frame_scores[best_idx] < 0:
             return (pose_data_copy, "Fehler: Kein gültiger Frame gefunden.")
 
-        log_messages.append(f"-> FRAME 0 INFO: Gesamtpunkte {frame_scores[0]:.1f} (Beine/Hacken: {score_details[0]['w']:.1f} | Frontal: {score_details[0]['f']:.1f} | Länge: {score_details[0]['l']:.1f})")
-        log_messages.append(f"-> GEWINNER INFO (Frame {best_idx}): Gesamtpunkte {frame_scores[best_idx]:.1f} (Beine/Hacken: {score_details[best_idx]['w']:.1f} | Frontal: {score_details[best_idx]['f']:.1f} | Länge: {score_details[best_idx]['l']:.1f})")
+        # DEATILLIERTES LOGGING
+        log_messages.append("--- PUNKTANALYSE ---")
+        log_messages.append(f"Frame 0 Beinpunkte: {frame_logs[0]}")
+        log_messages.append(f"Gewinner Frame {best_idx} Beinpunkte: {frame_logs[best_idx]}")
+        log_messages.append("--------------------")
+        
+        log_messages.append(f"-> FRAME 0 INFO: Gesamtpunkte {frame_scores[0]:.1f} (Beine/Füße: {score_details[0]['w']:.1f} | Frontal: {score_details[0]['f']:.1f} | Länge: {score_details[0]['l']:.1f})")
+        log_messages.append(f"-> GEWINNER INFO (Frame {best_idx}): Gesamtpunkte {frame_scores[best_idx]:.1f} (Beine/Füße: {score_details[best_idx]['w']:.1f} | Frontal: {score_details[best_idx]['f']:.1f} | Länge: {score_details[best_idx]['l']:.1f})")
         log_messages.append(f"-> Physische Y-Länge des Gewinners: {body_lengths[best_idx]:.1f}px")
 
-        # SCALING
+        # SCALING UNANGETASTET
         start_idx = max(0, best_idx - anchor_window)
         end_idx = min(len(pose_metas) - 1, best_idx + anchor_window)
         sum_norm, sum_depth, valid_frames_in_window = 0.0, 0.0, 0
@@ -8752,7 +8781,7 @@ class PoseGlobalPerspectiveScalerV17:
         expected_norm = (avg_anchor_depth * slope) + intercept
         anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
         
-        log_messages.append(f"-> Average Window genutzt: Frame {start_idx} bis {end_idx}")
+        log_messages.append(f"\n-> Average Window genutzt: Frame {start_idx} bis {end_idx}")
         log_messages.append(f"-> Durchschnittliche Torso-Norm (Ist): {avg_anchor_norm:.1f}px")
         log_messages.append(f"-> Durchschnittliche Tiefe (Depth): {avg_anchor_depth:.3f}m")
         log_messages.append(f"-> Soll-Norm laut Kalibrierung: {expected_norm:.1f}px")
@@ -8774,7 +8803,9 @@ class PoseGlobalPerspectiveScalerV17:
                             
         log_messages.append("Erfolgreich: Skalierung angewandt.")
         return (pose_data_copy, "\n".join(log_messages))
-        
+
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
