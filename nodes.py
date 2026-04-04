@@ -9266,6 +9266,296 @@ class PoseGlobalPerspectiveScalerV21:
         log_messages.append("Erfolgreich: Skalierung angewandt.")
         return (pose_data_copy, "\n".join(log_messages))
 
+# ======================================================================
+# 3. V23: GLOBAL PERSPECTIVE SCALER (TRUE 3D ANGLE CALCULATION)
+# ======================================================================
+class PoseGlobalPerspectiveScalerV23:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_depth_map": ("IMAGE",),
+                "include_head": ("BOOLEAN", {"default": True}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "frontal_method": (["3D_NLF", "2D_Ratio"], {"default": "3D_NLF"}),
+                "frontal_2d_threshold": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 90.0, "step": 1.0, "tooltip": "Maximaler Winkel in Grad (0 = perfekt frontal, 90 = komplett seitlich)"}),
+            },
+            "optional": {
+                "video_nlf_data": ("NLFPRED",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING",)
+    RETURN_NAMES = ("scaled_pose_data", "log_output",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+
+    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method="3D_NLF", frontal_2d_threshold=0.65, frontal_3d_angle_tolerance=20.0, video_nlf_data=None):
+        import copy
+        import numpy as np
+        import math
+        
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        log_messages = ["=== V23 GLOBAL SCALER LOG (3D ANGLE & FOOT BONUS) ==="]
+
+        if not pose_metas:
+            return (pose_data_copy, "Fehler: Keine Pose-Daten gefunden.")
+        
+        slope = calibration_data.get("perspective_slope", 0.0)
+        intercept = calibration_data.get("perspective_intercept", 1.0)
+        is_inverted = calibration_data.get("is_depth_inverted", False)
+        depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
+        H, W = depth_np.shape[1], depth_np.shape[2]
+        EDGE_MARGIN = 2
+        
+        def get_conf(kps, confs, idx):
+            if confs is not None and idx < len(confs):
+                return float(confs[idx])
+            if len(kps[idx]) >= 3:
+                return float(kps[idx][2])
+            return 1.0
+
+        def is_valid_point(kps, confs, idx):
+            if kps is None or idx >= len(kps): return False
+            pt = kps[idx]
+            if pt is None or len(pt) < 2: return False
+            if get_conf(kps, confs, idx) < min_confidence: return False
+            if pt[0] <= 0 or pt[1] <= 0: return False
+            return (EDGE_MARGIN < pt[0] < W - EDGE_MARGIN) and (EDGE_MARGIN < pt[1] < H - EDGE_MARGIN)
+
+        def get_torso_norm(kps, confs):
+            if kps is None or len(kps) < 12: return 0.0
+            if is_valid_point(kps, confs, 1) and is_valid_point(kps, confs, 8) and is_valid_point(kps, confs, 11):
+                neck, r_hip, l_hip = kps[1], kps[8], kps[11]
+                return math.sqrt((neck[0] - (r_hip[0]+l_hip[0])/2.0)**2 + (neck[1] - (r_hip[1]+l_hip[1])/2.0)**2)
+            return 0.0
+
+        pose_input_3d = None
+        if video_nlf_data is not None:
+            if isinstance(video_nlf_data, dict):
+                pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0]
+            else:
+                pose_input_3d = video_nlf_data
+
+        body_lengths = []
+        valid_body_indices = [1, 2, 5, 8, 11, 9, 12, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23] 
+        if include_head: valid_body_indices.append(0)
+
+        # 1. Prä-Analyse & 3D-Winkel-Berechnung
+        frame_data = []
+        has_premium_frontal = False
+        
+        for i, meta in enumerate(pose_metas):
+            kps_2d = getattr(meta, "kps_body", None)
+            confs = getattr(meta, "kps_body_p", None)
+            
+            torso_norm = get_torso_norm(kps_2d, confs)
+            if kps_2d is None or len(kps_2d) < 14 or torso_norm == 0.0:
+                frame_data.append({'valid': False})
+                body_lengths.append(0.0)
+                continue
+                
+            valid_y = [kps_2d[idx][1] for idx in valid_body_indices if is_valid_point(kps_2d, confs, idx)]
+            length = max(valid_y) - min(valid_y) if valid_y else 0.0
+            body_lengths.append(length)
+
+            has_feet = any(is_valid_point(kps_2d, confs, idx) for idx in [18, 19, 20, 21, 22, 23])
+            has_ankles = any(is_valid_point(kps_2d, confs, idx) for idx in [10, 13])
+            has_knees = any(is_valid_point(kps_2d, confs, idx) for idx in [9, 12])
+            has_lower_body = has_feet or has_ankles or has_knees
+            
+            # --- ZENTRALE FRONTAL-BERECHNUNG ---
+            is_frontal = False
+            frontal_pts = 0.0
+            used_method_log = ""
+            
+            # 2D Ratio immer als Fallback berechnen
+            frontal_ratio_2d = 0.0
+            if is_valid_point(kps_2d, confs, 2) and is_valid_point(kps_2d, confs, 5):
+                shoulder_width = math.sqrt((kps_2d[2][0] - kps_2d[5][0])**2 + (kps_2d[2][1] - kps_2d[5][1])**2)
+                frontal_ratio_2d = shoulder_width / torso_norm if torso_norm > 0 else 0.0
+
+            if frontal_method == "3D_NLF" and pose_input_3d is not None and i < len(pose_input_3d):
+                pose_3d_frame = pose_input_3d[i]
+                if pose_3d_frame is not None and len(pose_3d_frame) > 0:
+                    person_3d = pose_3d_frame[0]
+                    num_joints = len(person_3d)
+                    
+                    idx_r, idx_l = 2, 5
+                    format_name = "OpenPose"
+                    if num_joints == 17:
+                        idx_r, idx_l = 11, 14
+                        format_name = "H36M"
+                    elif num_joints in [24, 45, 68]:
+                        idx_r, idx_l = 16, 17
+                        format_name = "SMPL"
+                    
+                    if num_joints > max(idx_r, idx_l):
+                        # ECHTE WINKELBERECHNUNG (X und Z)
+                        x_r, z_r = float(person_3d[idx_r][0]), float(person_3d[idx_r][2])
+                        x_l, z_l = float(person_3d[idx_l][0]), float(person_3d[idx_l][2])
+                        
+                        dx = abs(x_l - x_r)
+                        dz = abs(z_l - z_r)
+                        
+                        # atan2 liefert Winkel im Bogenmaß, wir wandeln in Grad um
+                        angle_deg = math.degrees(math.atan2(dz, dx)) if (dx != 0 or dz != 0) else 0.0
+                        
+                        is_frontal = angle_deg <= frontal_3d_angle_tolerance
+                        # Punkte skalieren: 0° = 500 Pkt, 45° = 0 Pkt
+                        frontal_pts = 500.0 * max(0.0, 1.0 - (angle_deg / 45.0))
+                        used_method_log = f"3D({format_name}, {angle_deg:.1f}°)"
+                    else:
+                        is_frontal = frontal_ratio_2d >= frontal_2d_threshold
+                        frontal_pts = min(500.0, (frontal_ratio_2d / 0.8) * 500.0)
+                        used_method_log = f"2D-Fallback({frontal_ratio_2d:.2f})"
+                else:
+                    is_frontal = frontal_ratio_2d >= frontal_2d_threshold
+                    frontal_pts = min(500.0, (frontal_ratio_2d / 0.8) * 500.0)
+                    used_method_log = f"2D-Fallback({frontal_ratio_2d:.2f})"
+            else:
+                is_frontal = frontal_ratio_2d >= frontal_2d_threshold
+                frontal_pts = min(500.0, (frontal_ratio_2d / 0.8) * 500.0)
+                used_method_log = f"2D-Ratio({frontal_ratio_2d:.2f})"
+                
+            if is_frontal and has_lower_body:
+                has_premium_frontal = True
+                
+            frame_data.append({
+                'valid': True,
+                'has_feet': has_feet,
+                'has_ankles': has_ankles,
+                'has_knees': has_knees,
+                'is_frontal': is_frontal,
+                'frontal_pts': frontal_pts,
+                'used_method_log': used_method_log,
+                'length': length
+            })
+
+        max_body_length = max(body_lengths) if body_lengths else 1.0
+        if max_body_length <= 0: max_body_length = 1.0
+
+        if has_premium_frontal:
+            log_messages.append(f">> PASS-FILTER AKTIV: Frontale Frames (innerhalb Toleranz) mit Beinen gefunden! Seitliche Frames werden aussortiert.")
+
+        frame_scores = []
+        score_details = []
+        frame_logs = []
+        
+        # 2. Scoring & Gating
+        for i, data in enumerate(frame_data):
+            if not data['valid']:
+                frame_scores.append(-1.0)
+                score_details.append({"w":0, "f":0, "fb":0, "l":0, "t":-1})
+                frame_logs.append("Ungültiger Torso")
+                continue
+
+            # GATING LOGIK
+            if has_premium_frontal and not data['is_frontal']:
+                frame_scores.append(-1.0)
+                score_details.append({"w":0, "f":0, "fb":0, "l":0, "t":-1})
+                frame_logs.append(f"Aussortiert! (Zu stark gedreht: {data['used_method_log']})")
+                continue
+
+            # Punkte Beine (Basis)
+            waden_pts = 1000.0 if (data['has_feet'] or data['has_ankles']) else 0.0
+            schenkel_pts = 500.0 if (waden_pts == 0 and data['has_knees']) else 0.0
+            bein_pts = max(waden_pts, schenkel_pts)
+
+            # Fuß + Frontal Bonus
+            fuss_bonus_pts = 500.0 if (data['has_feet'] and data['is_frontal']) else 0.0
+            frontal_pts = data['frontal_pts']
+
+            # Punkte Länge
+            length_pts = (data['length'] / max_body_length) * 100.0
+            
+            total = bein_pts + fuss_bonus_pts + frontal_pts + length_pts
+            frame_scores.append(total)
+            score_details.append({"w": bein_pts, "fb": fuss_bonus_pts, "f": frontal_pts, "l": length_pts, "t": total})
+            
+            leg_str = "Füße/Knöchel" if waden_pts > 0 else ("Knie" if schenkel_pts > 0 else "Keine Beine")
+            bonus_str = " | +500 Fuß-Bonus!" if fuss_bonus_pts > 0 else ""
+            frame_logs.append(f"Gültig -> Beine: {leg_str} | Frontal: {data['used_method_log']}{bonus_str}")
+
+        best_idx = int(np.argmax(frame_scores))
+        
+        if frame_scores[best_idx] < 0:
+            return (pose_data_copy, "Fehler: Kein gültiger Frame (mit Torso) gefunden.")
+
+        # --- LOGGING ---
+        log_messages.append("\n================ PUNKTANALYSE ================")
+        log_messages.append(f"Frame 0  -> {frame_logs[0]}")
+        log_messages.append(f"Gewinner Frame {best_idx} -> {frame_logs[best_idx]}")
+        log_messages.append("==============================================\n")
+        
+        log_messages.append(f"-> FRAME 0 INFO: Gesamtpunkte {frame_scores[0]:.1f} (Beine: {score_details[0]['w']:.1f} | Fuß-Bonus: {score_details[0]['fb']:.1f} | Frontal: {score_details[0]['f']:.1f} | Länge: {score_details[0]['l']:.1f})")
+        log_messages.append(f"-> GEWINNER INFO (Frame {best_idx}): Gesamtpunkte {frame_scores[best_idx]:.1f} (Beine: {score_details[best_idx]['w']:.1f} | Fuß-Bonus: {score_details[best_idx]['fb']:.1f} | Frontal: {score_details[best_idx]['f']:.1f} | Länge: {score_details[best_idx]['l']:.1f})")
+        log_messages.append(f"-> Physische Y-Länge des Gewinners: {body_lengths[best_idx]:.1f}px")
+
+        # SCALING ANWENDEN
+        start_idx = max(0, best_idx - anchor_window)
+        end_idx = min(len(pose_metas) - 1, best_idx + anchor_window)
+        sum_norm, sum_depth, valid_frames_in_window = 0.0, 0.0, 0
+        
+        for i in range(start_idx, end_idx + 1):
+            kps = getattr(pose_metas[i], "kps_body", None)
+            confs = getattr(pose_metas[i], "kps_body_p", None)
+            norm = get_torso_norm(kps, confs)
+            if norm == 0.0: continue
+            valid_x, valid_y = [kps[1][0], kps[8][0], kps[11][0]], [kps[1][1], kps[8][1], kps[11][1]]
+            min_x, max_x = int(max(0, min(valid_x))), int(min(W-1, max(valid_x)))
+            min_y, max_y = int(max(0, min(valid_y))), int(min(H-1, max(valid_y)))
+            frame_depth = float(np.mean(depth_np[min(i, H-1), min_y:max_y, min_x:max_x])) if max_x > min_x and max_y > min_y else 0.5
+            if is_inverted: frame_depth = 1.0 / max(frame_depth, 0.0001)
+            sum_norm += norm
+            sum_depth += frame_depth
+            valid_frames_in_window += 1
+
+        if valid_frames_in_window == 0:
+            return (pose_data_copy, "Fehler: Im Anchor-Window konnte keine Tiefe/Norm ermittelt werden.")
+
+        avg_anchor_norm = sum_norm / valid_frames_in_window
+        avg_anchor_depth = sum_depth / valid_frames_in_window
+        expected_norm = (avg_anchor_depth * slope) + intercept
+        anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
+        
+        log_messages.append(f"\n-> Average Window genutzt: Frame {start_idx} bis {end_idx}")
+        log_messages.append(f"-> Durchschnittliche Torso-Norm (Ist): {avg_anchor_norm:.1f}px")
+        log_messages.append(f"-> Durchschnittliche Tiefe (Depth): {avg_anchor_depth:.3f}m")
+        log_messages.append(f"-> Soll-Norm laut Kalibrierung: {expected_norm:.1f}px")
+        log_messages.append(f"\n==> FESTER SKALIERUNGSFAKTOR FÜR GANZES VIDEO: {anchor_scale:.3f}x\n")
+
+        for i, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            confs = getattr(meta, "kps_body_p", None)
+            
+            valid_y = []
+            valid_x = []
+            for idx in range(len(kps)):
+                if is_valid_point(kps, confs, idx):
+                    valid_y.append(kps[idx][1])
+                    valid_x.append(kps[idx][0])
+                    
+            if not valid_y or not valid_x: continue
+            pivot_y, pivot_x = max(valid_y), np.mean(valid_x)
+            
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None and len(arr) > 0:
+                    for j in range(len(arr)):
+                        if len(arr[j]) >= 2 and arr[j][1] > 0:
+                            arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * anchor_scale
+                            arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * anchor_scale
+                            
+        log_messages.append("Erfolgreich: Skalierung angewandt.")
+        return (pose_data_copy, "\n".join(log_messages))
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -9320,6 +9610,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV17": PoseGlobalPerspectiveScalerV17,
     "PoseGlobalPerspectiveScalerV18": PoseGlobalPerspectiveScalerV18,
     "PoseGlobalPerspectiveScalerV21": PoseGlobalPerspectiveScalerV21,
+    "PoseGlobalPerspectiveScalerV23": PoseGlobalPerspectiveScalerV23,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -9376,6 +9667,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV17": "WanAnimate: Global Scaler (V17 Scoring)",
     "PoseGlobalPerspectiveScalerV18": "WanAnimate: Global Scaler (V18 Scoring)",
     "PoseGlobalPerspectiveScalerV21": "WanAnimate: Global Scaler (V21 Toggle + PassFilter)",
+    "PoseGlobalPerspectiveScalerV23": "WanAnimate: Global Scaler (V23 True 3D Angle)",
+}
 }
 
 
