@@ -11535,128 +11535,6 @@ class PoseGlobalPerspectiveScalerV14:
                             
         log_messages.append("Erfolgreich: Fester Skalierungsfaktor wurde angewandt.")
         return (pose_data_copy, "\n".join(log_messages))
-# ======================================================================
-# 3. V17: GLOBAL PERSPECTIVE SCALER (scoring system)
-# ======================================================================
-class PoseGlobalPerspectiveScalerV17:
-    """
-    V17 Scaler: Nutzt NLF 3D-Z-Tiefendaten zur Bestimmung der Schulter-Parallelität 
-    sowie Beinerkennung (Waden), um den optimalen Referenz-Frame für den globalen Skalierungsfaktor zu finden.
-    Ignoriert V15/V16 2D-Breiten-Heuristiken.
-    """
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "pose_data": ("POSEDATA",),
-                "target_torso_norm": ("FLOAT", {"default": 457.4, "min": 50.0, "max": 2000.0, "step": 0.1, "tooltip": "Ziel-Soll-Norm in Pixeln"}),
-                "parallel_tolerance": ("FLOAT", {"default": 0.15, "min": 0.01, "max": 1.0, "step": 0.01, "tooltip": "Max. Z-Tiefen-Differenz für Parallelität"}),
-            }
-        }
-
-    RETURN_TYPES = ("POSEDATA", "FLOAT", "INT")
-    RETURN_NAMES = ("pose_data", "scale_factor", "best_frame_idx")
-    FUNCTION = "process"
-    CATEGORY = "WanAnimatePreprocess/Scaling"
-
-    def process(self, pose_data, target_torso_norm, parallel_tolerance):
-        import copy
-        pose_data_copy = copy.deepcopy(pose_data)
-        pose_metas = pose_data_copy.get("pose_metas", [])
-
-        if not pose_metas:
-            return (pose_data_copy, 1.0, -1)
-
-        best_frame_idx = -1
-        best_score = -float('inf')
-
-        # --- 1. Frame-Scoring via 3D/NLF und Waden-Erkennung ---
-        for i, meta in enumerate(pose_metas):
-            kps_2d = getattr(meta, "kps_body", [])
-            kps_p = getattr(meta, "kps_body_p", [])
-            
-            # Falls NLF die 3D Daten in einem anderen Key speichert, hier ggf. anpassen
-            kps_3d = getattr(meta, "kps_body_3d", None) 
-            if kps_3d is None:
-                kps_3d = getattr(meta, "nlf_kps", None)
-
-            if not kps_2d or len(kps_2d) < 17:
-                continue
-
-            visible_points = sum(1 for idx in range(len(kps_2d)) if (kps_p[idx] if kps_p is not None else 1.0) >= 0.3)
-            leg_points = sum(1 for idx in [13, 14, 15, 16] if idx < len(kps_2d) and (kps_p[idx] if kps_p is not None else 1.0) >= 0.3)
-
-            z_diff = 999.0
-            is_parallel = False
-
-            # Z-Differenz für Schultern (Links: 5, Rechts: 6 in 3D) checken
-            if kps_3d is not None and len(kps_3d) > 6:
-                if kps_3d[5] is not None and kps_3d[6] is not None and len(kps_3d[5]) >= 3 and len(kps_3d[6]) >= 3:
-                    z_left = kps_3d[5][2]
-                    z_right = kps_3d[6][2]
-                    z_diff = abs(z_left - z_right)
-                    if z_diff < parallel_tolerance:
-                        is_parallel = True
-
-            # TIER SCORING
-            score = 0
-            if is_parallel and leg_points > 0:
-                score += 10000  # Tier 1 (Frame 0 Äquivalent)
-            elif leg_points > 0:
-                score += 5000   # Tier 2 (Frame 65 Äquivalent)
-            elif is_parallel:
-                score += 2000   # Tier 3
-                
-            score += visible_points * 10.0
-            if z_diff != 999.0:
-                score -= z_diff * 100.0
-
-            if score > best_score:
-                best_score = score
-                best_frame_idx = i
-
-        if best_frame_idx == -1:
-            best_frame_idx = 0  # Fallback
-
-        # --- 2. Berechnung & Anwendung Skalierungsfaktor ---
-        best_meta = pose_metas[best_frame_idx]
-        kps_2d = getattr(best_meta, "kps_body", [])
-        
-        try:
-            shoulder_mid_y = (kps_2d[5][1] + kps_2d[6][1]) / 2.0
-            hip_mid_y = (kps_2d[11][1] + kps_2d[12][1]) / 2.0
-            current_torso_norm = abs(hip_mid_y - shoulder_mid_y)
-        except (IndexError, TypeError):
-            current_torso_norm = target_torso_norm
-
-        scale_factor = 1.0
-        if current_torso_norm > 0:
-            scale_factor = target_torso_norm / current_torso_norm
-
-            for meta in pose_metas:
-                body = getattr(meta, "kps_body", None)
-                if not body: continue
-                
-                try:
-                    pivot_y = (body[11][1] + body[12][1]) / 2.0
-                    pivot_x = (body[11][0] + body[12][0]) / 2.0
-                except:
-                    pivot_y, pivot_x = 0.0, 0.0
-
-                for index, kp in enumerate(body):
-                    if kp is None or len(kp) < 2: continue
-                    new_x = pivot_x + (kp[0] - pivot_x) * scale_factor
-                    new_y = pivot_y + (kp[1] - pivot_y) * scale_factor
-                    
-                    if isinstance(body[index], list):
-                        body[index][0], body[index][1] = float(new_x), float(new_y)
-                    else:
-                        mutable = list(body[index])
-                        mutable[0], mutable[1] = float(new_x), float(new_y)
-                        body[index] = mutable
-
-        pose_data_copy["pose_metas"] = pose_metas
-        return (pose_data_copy, float(scale_factor), int(best_frame_idx))
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -11733,7 +11611,7 @@ NODE_CLASS_MAPPINGS = {
     "RetargetPoseCalibratorV9": RetargetPoseCalibratorV9,
     "PoseGlobalPerspectiveScalerV13": PoseGlobalPerspectiveScalerV13,
     "PoseGlobalPerspectiveScalerV14": PoseGlobalPerspectiveScalerV14,
-    "PoseGlobalPerspectiveScalerV17": PoseGlobalPerspectiveScalerV17,
+
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -11811,7 +11689,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RetargetPoseCalibratorV9": "WanAnimate: Retarget Pose Calibrator (V9 Norm)",
     "PoseGlobalPerspectiveScalerV13": "WanAnimate: Global Perspective Scaler (V13 Norm)",
     "PoseGlobalPerspectiveScalerV14": "WanAnimate: Global Scaler (V14 Anchor Constant)",
-    "PoseGlobalPerspectiveScalerV17": "Pose Global Perspective Scaler V17 (Auto-Scoring)",
+
 }
 
 
