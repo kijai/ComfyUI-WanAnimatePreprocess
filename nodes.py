@@ -8840,6 +8840,525 @@ class PoseGlobalPerspectiveScalerV26:
         log_messages.append("Erfolgreich: Skalierung angewandt.")
         return (pose_data_copy, "\n".join(log_messages))
 
+# ======================================================================
+# V15: POSE CALIBRATION (DYNAMIC FULL-BODY + UNSCALED DEPTH + PINHOLE)
+# ======================================================================
+class PoseCalibrationV15:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_nah_scaled": ("POSEDATA", {"tooltip": "Skalierte Pose für Pixel-Größe"}),
+                "pose_nah_unscaled": ("POSEDATA", {"tooltip": "Originale Pose als Maske für Depth-Map"}),
+                "depth_nah": ("IMAGE",),
+                
+                "pose_fern_scaled": ("POSEDATA", {"tooltip": "Skalierte Pose für Pixel-Größe"}),
+                "pose_fern_unscaled": ("POSEDATA", {"tooltip": "Originale Pose als Maske für Depth-Map"}),
+                "depth_fern": ("IMAGE",),
+                
+                "norm_method": (["Dynamic Full-Body", "Torso (Neck-Hip)"], {"default": "Dynamic Full-Body"}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "invert_depth": ("BOOLEAN", {"default": False}),
+                "use_pinhole_math": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "intrinsics_json": ("STRING", {"forceInput": True, "tooltip": "Intrinsics JSON aus DA3"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION", "STRING",)
+    RETURN_NAMES = ("calibration_data", "log_output",)
+    FUNCTION = "calibrate"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+
+    def calibrate(self, pose_nah_scaled, pose_nah_unscaled, depth_nah, 
+                  pose_fern_scaled, pose_fern_unscaled, depth_fern, 
+                  norm_method, min_confidence, invert_depth, use_pinhole_math=True, intrinsics_json=None):
+        import numpy as np
+        import math
+        import json
+        
+        log_messages = ["=== V15 CALIBRATION LOG (UNSCALED DEPTH + PINHOLE) ==="]
+        log_messages.append(f"Methode: {norm_method}")
+
+        def get_body_metrics(pose_s, pose_u, depth_map):
+            meta_s = pose_s.get("pose_metas", [])[0]
+            meta_u = pose_u.get("pose_metas", [])[0]
+            
+            # Scaled für Pixel-Abmessungen
+            kps_s = getattr(meta_s, "kps_body", None)
+            confs_s = getattr(meta_s, "kps_body_p", None)
+            
+            # Unscaled für Depth-Map Sampling
+            kps_u = getattr(meta_u, "kps_body", None)
+            confs_u = getattr(meta_u, "kps_body_p", None)
+            
+            depth_np = depth_map.cpu().numpy() if hasattr(depth_map, 'cpu') else depth_map
+            H, W = depth_np.shape[1], depth_np.shape[2]
+            
+            # Validierung für Scaled
+            def get_c_s(idx):
+                if confs_s is not None and idx < len(confs_s): return float(confs_s[idx])
+                if len(kps_s[idx]) >= 3: return float(kps_s[idx][2])
+                return 1.0
+
+            def is_val_s(idx):
+                if kps_s is None or idx >= len(kps_s): return False
+                pt = kps_s[idx]
+                if pt is None or len(pt) < 2: return False
+                if get_c_s(idx) < min_confidence: return False
+                return True # Begrenzung wird bei Scaled ignoriert, da es über den Canvas hinausragen kann
+
+            # Validierung für Unscaled (Depth)
+            def get_c_u(idx):
+                if confs_u is not None and idx < len(confs_u): return float(confs_u[idx])
+                if len(kps_u[idx]) >= 3: return float(kps_u[idx][2])
+                return 1.0
+
+            def is_val_u(idx):
+                if kps_u is None or idx >= len(kps_u): return False
+                pt = kps_u[idx]
+                if pt is None or len(pt) < 2: return False
+                if get_c_u(idx) < min_confidence: return False
+                return (0 <= pt[0] < W) and (0 <= pt[1] < H)
+
+            if kps_s is None or len(kps_s) < 14: 
+                return {'torso': 0.0, 'max_len': 0.0, 'depth': 0.5, 'parts': 'None'}
+
+            # PIXELGRÖSSE BERECHNEN (MIT SCALED)
+            torso_len = 0.0
+            if is_val_s(1) and is_val_s(8) and is_val_s(11):
+                torso_len = math.sqrt((kps_s[1][0] - (kps_s[8][0]+kps_s[11][0])/2.0)**2 + (kps_s[1][1] - (kps_s[8][1]+kps_s[11][1])/2.0)**2)
+
+            top_y, bottom_y = None, None
+            if is_val_s(0): top_y = kps_s[0][1]
+            elif is_val_s(1): top_y = kps_s[1][1]
+
+            parts_str = "Torso"
+            heels = [idx for idx in [10, 13, 21, 24] if is_val_s(idx)]
+            knees = [idx for idx in [9, 12] if is_val_s(idx)]
+            hips = [idx for idx in [8, 11] if is_val_s(idx)]
+
+            if heels:
+                bottom_y = max([kps_s[idx][1] for idx in heels])
+                parts_str = "Ganzkörper (mit Füßen)"
+            elif knees:
+                bottom_y = max([kps_s[idx][1] for idx in knees])
+                parts_str = "Bis Knie"
+            elif hips:
+                bottom_y = max([kps_s[idx][1] for idx in hips])
+                parts_str = "Nur Torso"
+
+            max_len = torso_len 
+            if top_y is not None and bottom_y is not None and bottom_y > top_y:
+                max_len = bottom_y - top_y
+
+            # TIEFE AUSLESEN (MIT UNSCALED)
+            torso_x_u, torso_y_u = [], []
+            if is_val_u(1) and is_val_u(8) and is_val_u(11):
+                torso_x_u.extend([kps_u[1][0], kps_u[8][0], kps_u[11][0]])
+                torso_y_u.extend([kps_u[1][1], kps_u[8][1], kps_u[11][1]])
+
+            depth_vals = []
+            for px, py in zip(torso_x_u, torso_y_u):
+                ix, iy = int(px), int(py)
+                if 0 <= ix < W and 0 <= iy < H:
+                    depth_vals.append(depth_np[0, iy, ix])
+            
+            d_val = float(np.mean(depth_vals)) if depth_vals else 0.5
+            if invert_depth: d_val = 1.0 / max(d_val, 0.0001)
+            
+            return {'torso': torso_len, 'max_len': max_len, 'depth': d_val, 'parts': parts_str}
+
+        data_nah = get_body_metrics(pose_nah_scaled, pose_nah_unscaled, depth_nah)
+        data_fern = get_body_metrics(pose_fern_scaled, pose_fern_unscaled, depth_fern)
+
+        if data_nah['torso'] == 0.0 or data_fern['torso'] == 0.0:
+            return ({}, "Fehler: Torso konnte nicht in beiden Posen erkannt werden.")
+
+        norm_nah = data_nah['torso']
+        norm_fern = data_fern['torso']
+
+        log_messages.append("\n--- EXTRAPOLATION RECHENVORGANG ---")
+        if norm_method == "Dynamic Full-Body":
+            ratio_nah = data_nah['max_len'] / data_nah['torso']
+            ratio_fern = data_fern['max_len'] / data_fern['torso']
+            torso_scale_factor = data_nah['torso'] / data_fern['torso']
+
+            log_messages.append(f"Torso-Faktor = Torso Nah ({data_nah['torso']:.1f}) / Torso Fern ({data_fern['torso']:.1f}) = {torso_scale_factor:.3f}")
+
+            if ratio_fern > ratio_nah:
+                norm_fern = data_fern['max_len']
+                norm_nah = data_fern['max_len'] * torso_scale_factor
+                log_messages.append(f"'Fern' zeigt mehr vom Körper ({data_fern['parts']}).")
+                log_messages.append(f"Extrapoliere 'Nah' = Max_Len_Fern ({data_fern['max_len']:.1f}) * Torso-Faktor ({torso_scale_factor:.3f}) = {norm_nah:.1f} px")
+            else:
+                norm_nah = data_nah['max_len']
+                norm_fern = data_nah['max_len'] / torso_scale_factor
+                if ratio_nah > ratio_fern:
+                    log_messages.append(f"'Nah' zeigt mehr vom Körper ({data_nah['parts']}).")
+                    log_messages.append(f"Extrapoliere 'Fern' = Max_Len_Nah ({data_nah['max_len']:.1f}) / Torso-Faktor ({torso_scale_factor:.3f}) = {norm_fern:.1f} px")
+                else:
+                    log_messages.append(f"Beide Frames zeigen proportional gleich viel Körper ({data_nah['parts']}). Keine Extrapolation nötig.")
+        else:
+            log_messages.append("Methode 'Torso' gewählt. Keine Extrapolation angewandt.")
+
+        # --- LINEARE BERECHNUNG (ALS FALLBACK/VERGLEICH) ---
+        depth_diff = data_fern['depth'] - data_nah['depth']
+        slope = 0.0 if abs(depth_diff) < 0.001 else (norm_fern - norm_nah) / depth_diff
+        intercept = norm_nah - (slope * data_nah['depth'])
+
+        # --- NEU: PINHOLE BERECHNUNG ---
+        fx = 512.0
+        if intrinsics_json:
+            try:
+                int_data = json.loads(intrinsics_json)
+                if "intrinsics" in int_data and len(int_data["intrinsics"]) > 0:
+                    matrix = int_data["intrinsics"][0].get("image_0", None)
+                    if matrix is not None:
+                        fx = float(matrix[0][0])
+                        log_messages.append(f"\nBrennweite (fx) aus DA3 geladen: {fx:.2f}")
+            except Exception as e:
+                log_messages.append(f"\nWarnung: Intrinsics JSON Fehler ({e}). Nutze Fallback fx={fx}.")
+
+        log_messages.append("\n--- PINHOLE DELTA RECHNUNG ---")
+        delta_z = data_fern['depth'] - data_nah['depth']
+        log_messages.append(f"Gemessene metrische Differenz (Delta Z): {delta_z:.3f}m")
+
+        echte_groesse = 0.0
+        if delta_z > 0 and (norm_nah - norm_fern) > 0:
+            echte_groesse = (delta_z * norm_nah * norm_fern) / (fx * (norm_nah - norm_fern))
+            log_messages.append(f"Echte physikalische Größe berechnet: {echte_groesse:.3f}m")
+        else:
+            echte_groesse = (norm_nah * data_nah['depth']) / fx
+            log_messages.append(f"Warnung: Delta Z negativ oder Norm-Fehler. Nutze Absolutwert-Fallback: {echte_groesse:.3f}m")
+
+        log_messages.append("\n=== ERGEBNIS ===")
+        log_messages.append(f"Finale Norm Nah: {norm_nah:.1f} px | Tiefe Nah (Unscaled): {data_nah['depth']:.4f}")
+        log_messages.append(f"Finale Norm Fern: {norm_fern:.1f} px | Tiefe Fern (Unscaled): {data_fern['depth']:.4f}")
+        log_messages.append(f"Echte Größe: {echte_groesse:.3f}m | fx: {fx:.2f}")
+
+        calib_data = {
+            "perspective_slope": slope,
+            "perspective_intercept": intercept,
+            "is_depth_inverted": invert_depth,
+            "norm_method": norm_method,
+            "use_pinhole_math": use_pinhole_math,
+            "focal_length_fx": fx,
+            "echte_groesse": echte_groesse
+        }
+        return (calib_data, "\n".join(log_messages))
+
+# ======================================================================
+# V28: GLOBAL PERSPECTIVE SCALER (FULL-BODY + UNSCALED DEPTH + PINHOLE)
+# ======================================================================
+class PoseGlobalPerspectiveScalerV28:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_scaled": ("POSEDATA", {"tooltip": "Skalierte Video-Posen (diese werden am Ende angepasst)"}),
+                "video_pose_unscaled": ("POSEDATA", {"tooltip": "Originale Video-Posen (nur als Maske für Depth-Auslesung)"}),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_depth_map": ("IMAGE",),
+                "include_head": ("BOOLEAN", {"default": True}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "frontal_method": (["3D_NLF", "2D_Ratio"], {"default": "3D_NLF"}),
+                "frontal_2d_threshold": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 90.0, "step": 1.0}),
+            },
+            "optional": {
+                "video_nlf_data": ("NLFPRED",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING",)
+    RETURN_NAMES = ("scaled_pose_data", "log_output",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+
+    def process(self, video_pose_scaled, video_pose_unscaled, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method="3D_NLF", frontal_2d_threshold=0.65, frontal_3d_angle_tolerance=20.0, video_nlf_data=None):
+        import copy
+        import numpy as np
+        import math
+        
+        pose_data_copy = copy.deepcopy(video_pose_scaled)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        pose_metas_unscaled = video_pose_unscaled.get("pose_metas", [])
+        log_messages = ["=== V28 GLOBAL SCALER LOG (UNSCALED DEPTH + PINHOLE) ==="]
+
+        if not pose_metas or not pose_metas_unscaled: return (pose_data_copy, "Fehler: Keine Pose-Daten.")
+        
+        slope = calibration_data.get("perspective_slope", 0.0)
+        intercept = calibration_data.get("perspective_intercept", 1.0)
+        is_inverted = calibration_data.get("is_depth_inverted", False)
+        norm_method = calibration_data.get("norm_method", "Dynamic Full-Body")
+        
+        use_pinhole_math = calibration_data.get("use_pinhole_math", False)
+        fx = calibration_data.get("focal_length_fx", 512.0)
+        echte_groesse = calibration_data.get("echte_groesse", 0.0)
+        
+        log_messages.append(f"Genutzte Skalierungs-Norm: {norm_method}\n")
+        
+        depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
+        H, W = depth_np.shape[1], depth_np.shape[2]
+        
+        def get_conf(kps, confs, idx):
+            if confs is not None and idx < len(confs): return float(confs[idx])
+            if len(kps[idx]) >= 3: return float(kps[idx][2])
+            return 1.0
+
+        def is_valid_point(kps, confs, idx, check_bounds=False):
+            if kps is None or idx >= len(kps): return False
+            pt = kps[idx]
+            if pt is None or len(pt) < 2: return False
+            if get_conf(kps, confs, idx) < min_confidence: return False
+            if check_bounds:
+                return (0 <= pt[0] < W) and (0 <= pt[1] < H)
+            return True
+
+        pose_input_3d = None
+        if video_nlf_data is not None:
+            if isinstance(video_nlf_data, dict): pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0]
+            else: pose_input_3d = video_nlf_data
+
+        body_lengths = []
+        valid_body_indices = [1, 2, 5, 8, 11, 9, 12, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23] 
+        if include_head: valid_body_indices.append(0)
+
+        frame_data = []
+        has_premium_frontal = False
+        
+        for i, meta_s in enumerate(pose_metas):
+            kps_2d_s = getattr(meta_s, "kps_body", None)
+            confs_s = getattr(meta_s, "kps_body_p", None)
+            
+            meta_u = pose_metas_unscaled[i] if i < len(pose_metas_unscaled) else pose_metas_unscaled[-1]
+            kps_2d_u = getattr(meta_u, "kps_body", None)
+            confs_u = getattr(meta_u, "kps_body_p", None)
+            
+            t_norm = 0.0
+            if is_valid_point(kps_2d_s, confs_s, 1) and is_valid_point(kps_2d_s, confs_s, 8) and is_valid_point(kps_2d_s, confs_s, 11):
+                t_norm = math.sqrt((kps_2d_s[1][0] - (kps_2d_s[8][0]+kps_2d_s[11][0])/2.0)**2 + (kps_2d_s[1][1] - (kps_2d_s[8][1]+kps_2d_s[11][1])/2.0)**2)
+                
+            if kps_2d_s is None or len(kps_2d_s) < 14 or t_norm == 0.0:
+                frame_data.append({'valid': False})
+                body_lengths.append(0.0)
+                continue
+                
+            valid_y = [kps_2d_s[idx][1] for idx in valid_body_indices if is_valid_point(kps_2d_s, confs_s, idx)]
+            length = max(valid_y) - min(valid_y) if valid_y else 0.0
+            body_lengths.append(length)
+
+            has_feet = any(is_valid_point(kps_2d_s, confs_s, idx) for idx in [18, 19, 20, 21, 22, 23])
+            has_ankles = any(is_valid_point(kps_2d_s, confs_s, idx) for idx in [10, 13])
+            has_knees = any(is_valid_point(kps_2d_s, confs_s, idx) for idx in [9, 12])
+            has_lower_body = has_feet or has_ankles or has_knees
+            
+            is_frontal = False
+            frontal_pts = 0.0
+            used_method_log = ""
+            
+            frontal_ratio_2d = 0.0
+            if is_valid_point(kps_2d_s, confs_s, 2) and is_valid_point(kps_2d_s, confs_s, 5):
+                shoulder_width = math.sqrt((kps_2d_s[2][0] - kps_2d_s[5][0])**2 + (kps_2d_s[2][1] - kps_2d_s[5][1])**2)
+                frontal_ratio_2d = shoulder_width / t_norm if t_norm > 0 else 0.0
+
+            if frontal_method == "3D_NLF" and pose_input_3d is not None and i < len(pose_input_3d):
+                pose_3d_frame = pose_input_3d[i]
+                if pose_3d_frame is not None and len(pose_3d_frame) > 0:
+                    person_3d = pose_3d_frame[0]
+                    num_joints = len(person_3d)
+                    
+                    idx_r, idx_l = 2, 5
+                    format_name = "OpenPose"
+                    if num_joints == 17:
+                        idx_r, idx_l = 11, 14
+                        format_name = "H36M"
+                    elif num_joints in [24, 45, 68]:
+                        idx_r, idx_l = 16, 17
+                        format_name = "SMPL"
+                    
+                    if num_joints > max(idx_r, idx_l):
+                        x_r, z_r = float(person_3d[idx_r][0]), float(person_3d[idx_r][2])
+                        x_l, z_l = float(person_3d[idx_l][0]), float(person_3d[idx_l][2])
+                        dx, dz = abs(x_l - x_r), abs(z_l - z_r)
+                        angle_deg = math.degrees(math.atan2(dz, dx)) if (dx != 0 or dz != 0) else 0.0
+                        
+                        is_frontal = angle_deg <= frontal_3d_angle_tolerance
+                        frontal_pts = 500.0 * max(0.0, 1.0 - (angle_deg / 45.0))
+                        used_method_log = f"3D({format_name}, {angle_deg:.1f}°)"
+                    else:
+                        is_frontal = frontal_ratio_2d >= frontal_2d_threshold
+                        frontal_pts = min(500.0, (frontal_ratio_2d / 0.8) * 500.0)
+                        used_method_log = f"2D-Fallback({frontal_ratio_2d:.2f})"
+                else:
+                    is_frontal = frontal_ratio_2d >= frontal_2d_threshold
+                    frontal_pts = min(500.0, (frontal_ratio_2d / 0.8) * 500.0)
+                    used_method_log = f"2D-Fallback({frontal_ratio_2d:.2f})"
+            else:
+                is_frontal = frontal_ratio_2d >= frontal_2d_threshold
+                frontal_pts = min(500.0, (frontal_ratio_2d / 0.8) * 500.0)
+                used_method_log = f"2D-Ratio({frontal_ratio_2d:.2f})"
+                
+            if is_frontal and has_lower_body:
+                has_premium_frontal = True
+                
+            frame_data.append({
+                'valid': True, 'has_feet': has_feet, 'has_ankles': has_ankles, 'has_knees': has_knees,
+                'is_frontal': is_frontal, 'frontal_pts': frontal_pts, 'used_method_log': used_method_log, 'length': length,
+                'kps_u': kps_2d_u, 'confs_u': confs_u, 'kps_s': kps_2d_s, 'confs_s': confs_s
+            })
+
+        max_body_length = max(body_lengths) if body_lengths else 1.0
+        if max_body_length <= 0: max_body_length = 1.0
+
+        if has_premium_frontal:
+            log_messages.append(f">> PASS-FILTER AKTIV: Frontale Frames gefunden! Seitliche Frames fliegen raus.")
+
+        frame_scores = []
+        for i, data in enumerate(frame_data):
+            if not data['valid'] or (has_premium_frontal and not data['is_frontal']):
+                frame_scores.append(-1.0)
+                continue
+
+            waden_pts = 1000.0 if (data['has_feet'] or data['has_ankles']) else 0.0
+            schenkel_pts = 500.0 if (waden_pts == 0 and data['has_knees']) else 0.0
+            bein_pts = max(waden_pts, schenkel_pts)
+            fuss_bonus_pts = 500.0 if (data['has_feet'] and data['is_frontal']) else 0.0
+            
+            total = bein_pts + fuss_bonus_pts + data['frontal_pts'] + ((data['length'] / max_body_length) * 100.0)
+            frame_scores.append(total)
+
+        best_idx = int(np.argmax(frame_scores))
+        if frame_scores[best_idx] < 0: return (pose_data_copy, "Fehler: Kein gültiger Frame gefunden.")
+
+        # --- SCALING BERECHNUNG ---
+        start_idx = max(0, best_idx - anchor_window)
+        end_idx = min(len(pose_metas) - 1, best_idx + anchor_window)
+        sum_norm, sum_depth, valid_frames_in_window = 0.0, 0.0, 0
+        
+        for i in range(start_idx, end_idx + 1):
+            fd = frame_data[i]
+            if not fd['valid']: continue
+
+            kps_s = fd['kps_s']
+            confs_s = fd['confs_s']
+            kps_u = fd['kps_u']
+            confs_u = fd['confs_u']
+            
+            norm_val = 0.0
+            # NORM AUS SCALED BERECHNEN
+            if norm_method == "Torso (Neck-Hip)":
+                if is_valid_point(kps_s, confs_s, 1) and is_valid_point(kps_s, confs_s, 8) and is_valid_point(kps_s, confs_s, 11):
+                    norm_val = math.sqrt((kps_s[1][0] - (kps_s[8][0]+kps_s[11][0])/2.0)**2 + (kps_s[1][1] - (kps_s[8][1]+kps_s[11][1])/2.0)**2)
+            else:
+                top_y, bottom_y = None, None
+                if is_valid_point(kps_s, confs_s, 0): top_y = kps_s[0][1]
+                elif is_valid_point(kps_s, confs_s, 1): top_y = kps_s[1][1]
+
+                heels = [idx for idx in [10, 13, 21, 24] if is_valid_point(kps_s, confs_s, idx)]
+                knees = [idx for idx in [9, 12] if is_valid_point(kps_s, confs_s, idx)]
+                hips = [idx for idx in [8, 11] if is_valid_point(kps_s, confs_s, idx)]
+
+                if heels: bottom_y = max([kps_s[idx][1] for idx in heels])
+                elif knees: bottom_y = max([kps_s[idx][1] for idx in knees])
+                elif hips: bottom_y = max([kps_s[idx][1] for idx in hips])
+
+                if top_y is not None and bottom_y is not None and bottom_y > top_y:
+                    norm_val = bottom_y - top_y
+
+            if norm_val == 0.0: continue
+
+            # TIEFE AUS UNSCALED BERECHNEN
+            depth_vals = []
+            v_idx = min(i, depth_np.shape[0] - 1)
+            
+            unscaled_x, unscaled_y = [], []
+            if norm_method == "Torso (Neck-Hip)":
+                if is_valid_point(kps_u, confs_u, 1, True) and is_valid_point(kps_u, confs_u, 8, True) and is_valid_point(kps_u, confs_u, 11, True):
+                    unscaled_x.extend([kps_u[1][0], kps_u[8][0], kps_u[11][0]])
+                    unscaled_y.extend([kps_u[1][1], kps_u[8][1], kps_u[11][1]])
+            else:
+                if is_valid_point(kps_u, confs_u, 0, True): unscaled_x.append(kps_u[0][0]); unscaled_y.append(kps_u[0][1])
+                elif is_valid_point(kps_u, confs_u, 1, True): unscaled_x.append(kps_u[1][0]); unscaled_y.append(kps_u[1][1])
+
+                heels_u = [idx for idx in [10, 13, 21, 24] if is_valid_point(kps_u, confs_u, idx, True)]
+                knees_u = [idx for idx in [9, 12] if is_valid_point(kps_u, confs_u, idx, True)]
+                hips_u = [idx for idx in [8, 11] if is_valid_point(kps_u, confs_u, idx, True)]
+
+                if heels_u:
+                    for idx in heels_u: unscaled_x.append(kps_u[idx][0]); unscaled_y.append(kps_u[idx][1])
+                elif knees_u:
+                    for idx in knees_u: unscaled_x.append(kps_u[idx][0]); unscaled_y.append(kps_u[idx][1])
+                elif hips_u:
+                    for idx in hips_u: unscaled_x.append(kps_u[idx][0]); unscaled_y.append(kps_u[idx][1])
+
+            for px, py in zip(unscaled_x, unscaled_y):
+                ix, iy = int(px), int(py)
+                if 0 <= ix < W and 0 <= iy < H:
+                    depth_vals.append(depth_np[v_idx, iy, ix])
+                    
+            frame_depth = float(np.mean(depth_vals)) if depth_vals else 0.5
+            if is_inverted: frame_depth = 1.0 / max(frame_depth, 0.0001)
+            
+            sum_norm += norm_val
+            sum_depth += frame_depth
+            valid_frames_in_window += 1
+
+        if valid_frames_in_window == 0:
+            return (pose_data_copy, "Fehler: Im Anchor-Window konnte keine Tiefe/Norm ermittelt werden.")
+
+        avg_anchor_norm = sum_norm / valid_frames_in_window
+        avg_anchor_depth = sum_depth / valid_frames_in_window
+
+        log_messages.append(f"\n--- SKALIERUNG RECHENVORGANG ---")
+        log_messages.append(f"Gewinner Frame: {best_idx}")
+        log_messages.append(f"Ist-Norm (Video via SCALED): {avg_anchor_norm:.1f} px")
+        log_messages.append(f"Ist-Tiefe (Video via UNSCALED): {avg_anchor_depth:.3f} m")
+
+        # NEUE FORMEL ODER FALLBACK
+        if use_pinhole_math and echte_groesse > 0.0:
+            log_messages.append("\n--> PINHOLE SKALIERUNG AKTIV")
+            expected_norm = (echte_groesse * fx) / avg_anchor_depth
+            log_messages.append(f"Soll-Norm = ({echte_groesse:.3f}m * {fx:.2f}) / {avg_anchor_depth:.3f}m = {expected_norm:.1f} px")
+        else:
+            log_messages.append("\n--> LINEARE SKALIERUNG AKTIV (FALLBACK)")
+            expected_norm = (avg_anchor_depth * slope) + intercept
+            log_messages.append(f"Soll-Norm = ({avg_anchor_depth:.3f} * {slope:.2f}) + {intercept:.2f} = {expected_norm:.1f} px")
+
+        anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
+        
+        log_messages.append(f"\nFaktor = Soll-Norm / Ist-Norm")
+        log_messages.append(f"Faktor = {expected_norm:.1f} / {avg_anchor_norm:.1f} = {anchor_scale:.3f}x")
+        log_messages.append(f"\n=== ERGEBNIS ===")
+        log_messages.append(f"FESTER SKALIERUNGSFAKTOR FÜR GANZES VIDEO: {anchor_scale:.3f}x\n")
+
+        # Keypoints anpassen (auf die SCALED Posen anwenden)
+        for i, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            confs = getattr(meta, "kps_body_p", None)
+            
+            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx, False)]
+            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx, False)]
+                    
+            if not valid_y or not valid_x: continue
+            pivot_y, pivot_x = max(valid_y), np.mean(valid_x)
+            
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None and len(arr) > 0:
+                    for j in range(len(arr)):
+                        if len(arr[j]) >= 2 and arr[j][1] > 0:
+                            arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * anchor_scale
+                            arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * anchor_scale
+                            
+        log_messages.append("Erfolgreich: Skalierung auf alle Frames angewandt.")
+        return (pose_data_copy, "\n".join(log_messages))
+
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -8892,6 +9411,8 @@ NODE_CLASS_MAPPINGS = {
     "RetargetPoseCalibratorV9": RetargetPoseCalibratorV9,
     "PoseCalibrationV13": PoseCalibrationV13,
     "PoseGlobalPerspectiveScalerV26": PoseGlobalPerspectiveScalerV26,
+    "PoseCalibrationV15": PoseCalibrationV15,
+    "PoseGlobalPerspectiveScalerV28": PoseGlobalPerspectiveScalerV28,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -8946,6 +9467,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RetargetPoseCalibratorV9": "WanAnimate: Retarget Pose Calibrator (V9 Norm)",
     "PoseCalibrationV13": "WanAnimate: Pose Calibration (V13 Rechenvorgang)",
     "PoseGlobalPerspectiveScalerV26": "WanAnimate: Global Scaler (V26 Rechenvorgang)",
+    "PoseCalibrationV15": "WanAnimate: Pose Calibration (DYNAMIC FULL-BODY + UNSCALED DEPTH + PINHOLE)",
+    "PoseGlobalPerspectiveScalerV28": "WanAnimate: Global Scaler v28 (FULL-BODY + UNSCALED DEPTH + PINHOLE)",
 
 }
 
