@@ -7468,8 +7468,12 @@ class PoseDataToMaskV2:
                 "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1}),
                 "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1}),
                 "stick_width": ("INT", {
-                    "default": 10, "min": 1, "max": 300, "step": 1, 
-                    "display": "slider", "slider_max": 200
+                    "default": 10, 
+                    "min": 1, 
+                    "max": 300, 
+                    "step": 1,
+                    "display": "slider",
+                    "slider_max": 200 
                 }),
                 "head_circle_px": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0, "step": 1.0, "tooltip": "Fester Radius für den Kopfkreis in Pixeln."}),
                 "head_circle_norm": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Normierter Radius relativ zur Schulterbreite (passt sich pro Frame dynamisch an)."}),
@@ -7479,28 +7483,33 @@ class PoseDataToMaskV2:
     RETURN_TYPES = ("MASK",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "Erstellt Maske (V2). Füllt Körper & Stirn. Fügt optional einen Kreis für den Kopf hinzu."
+    DESCRIPTION = "Erstellt Maske (V2). Füllt Körper & Stirn. Fügt optional einen Kreis für den Kopf hinzu und zeichnet das Skelett (Bones)."
 
     def process(self, pose_data, width, height, stick_width, head_circle_px, head_circle_norm):
         pose_metas = pose_data["pose_metas"]
         mask_list = []
+
+        # Speicher für Fallback (falls eine Detection fehlschlägt)
         last_valid_mask = np.zeros((height, width), dtype=np.float32)
 
         for meta in pose_metas:
             kps = meta.kps_body
             scores = meta.kps_body_p
-
+            
             def get_pt(idx):
                 if idx < len(scores) and scores[idx] > 0.3:
                     return (int(kps[idx][0]), int(kps[idx][1]))
                 return None
 
+            # Schultern prüfen
             p_lsh, p_rsh = get_pt(5), get_pt(2)
+
             if p_lsh and p_rsh:
+                # === NEU ZEICHNEN ===
                 canvas = np.zeros((height, width, 3), dtype=np.uint8)
                 p_lhip, p_rhip = get_pt(11), get_pt(8)
-                
-                # 1. TORSO
+
+                # 1. TORSO (gefüllte Fläche)
                 if p_lhip and p_rhip:
                     pts_torso = np.array([p_lsh, p_rsh, p_rhip, p_lhip], np.int32)
                     cv2.fillPoly(canvas, [pts_torso], (255, 255, 255))
@@ -7513,39 +7522,33 @@ class PoseDataToMaskV2:
                 # 2. KOPF & STIRN (Basis-Polygon)
                 head_pts = []
                 p_nose = get_pt(0)
-                p_lear = get_pt(17) or get_pt(15)
-                p_rear = get_pt(16) or get_pt(14)
-                
+                p_lear = get_pt(17) or get_pt(15) 
+                p_rear = get_pt(16) or get_pt(14) 
+
                 if p_nose: head_pts.append(p_nose)
                 if p_lear: head_pts.append(p_lear)
                 head_pts.append(p_lsh)
                 head_pts.append(p_rsh)
                 if p_rear: head_pts.append(p_rear)
-
+                
                 if len(head_pts) >= 3:
                     pts_head = np.array(head_pts, np.int32)
                     cv2.fillPoly(canvas, [pts_head], (255, 255, 255))
 
-                # Stirn-Rechteck
-                if p_lear and p_rear:
-                    eye_y = (p_lear[1] + p_rear[1]) / 2
-                    shoulder_y = (p_lsh[1] + p_rsh[1]) / 2
-                    dist_head_shoulder = abs(shoulder_y - eye_y)
-                    forehead_height = int(dist_head_shoulder * 0.65)
-
-                    x_min = min(p_lear[0], p_rear[0])
-                    x_max = max(p_lear[0], p_rear[0])
-
-                    y_bottom = int(eye_y)
-                    y_top = int(eye_y - forehead_height)
-
-                    pt1 = (x_min, y_bottom)
-                    pt2 = (x_max, y_bottom)
-                    pt3 = (x_max, y_top)
-                    pt4 = (x_min, y_top)
-                    pts_forehead = np.array([pt1, pt2, pt3, pt4], np.int32)
-                    
-                    cv2.fillPoly(canvas, [pts_forehead], (255, 255, 255))
+                    # Stirn-Rechteck
+                    if p_lear and p_rear:
+                        eye_y = (p_lear[1] + p_rear[1]) / 2
+                        shoulder_y = (p_lsh[1] + p_rsh[1]) / 2
+                        dist_head_shoulder = abs(shoulder_y - eye_y)
+                        forehead_height = int(dist_head_shoulder * 0.65)
+                        x_min = min(p_lear[0], p_rear[0])
+                        x_max = max(p_lear[0], p_rear[0])
+                        y_bottom = int(eye_y)
+                        y_top = int(eye_y - forehead_height)
+                        pt1 = (x_min, y_bottom); pt2 = (x_max, y_bottom)
+                        pt3 = (x_max, y_top); pt4 = (x_min, y_top)
+                        pts_forehead = np.array([pt1, pt2, pt3, pt4], np.int32)
+                        cv2.fillPoly(canvas, [pts_forehead], (255, 255, 255))
 
                 # --- 3. KREIS FÜR DEN KOPF (V2 FEATURE) ---
                 if head_circle_px > 0 or head_circle_norm > 0:
@@ -7557,23 +7560,37 @@ class PoseDataToMaskV2:
                         center_x, center_y = p_nose
                     
                     if center_x is not None and center_y is not None:
-                        # Referenzgröße für die Normierung: Schulterbreite
-                        # So skaliert der Kreis wunderbar mit der Größe der Person mit im jeweiligen Frame
                         shoulder_width = abs(p_lsh[0] - p_rsh[0])
                         radius = int(head_circle_px + head_circle_norm * shoulder_width)
-                        
                         if radius > 0:
                             cv2.circle(canvas, (center_x, center_y), radius, (255, 255, 255), -1)
 
-                canvas_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
-                mask_tensor = torch.from_numpy(canvas_gray.astype(np.float32) / 255.0)
-                mask_list.append(mask_tensor)
+                # --- 4. SKELETT (DIE FEHLENDEN BONES) ---
+                skeleton_canvas = np.zeros_like(canvas)
+                skeleton_img = draw_aapose_by_meta_new(
+                    skeleton_canvas, 
+                    meta, 
+                    draw_hand=True, 
+                    draw_head=True,
+                    body_stick_width=stick_width,
+                    hand_stick_width=max(1, stick_width // 2)
+                )
+
+                # --- 5. MERGE ---
+                # Wandle beides in Graustufen um und kombiniere sie
+                filled_mask_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+                skeleton_mask_gray = cv2.cvtColor(skeleton_img, cv2.COLOR_RGB2GRAY)
+                final_mask_combined = cv2.bitwise_or(filled_mask_gray, skeleton_mask_gray)
                 
-                last_valid_mask = canvas_gray.astype(np.float32) / 255.0
+                # Update den Fallback-Speicher
+                last_valid_mask = (final_mask_combined > 0).astype(np.float32)
 
             else:
-                mask_tensor = torch.from_numpy(last_valid_mask)
-                mask_list.append(mask_tensor)
+                # FALLBACK (Wenn Schultern nicht erkannt werden -> nimm die Maske vom letzten Frame)
+                pass 
+
+            mask_tensor = torch.from_numpy(last_valid_mask)
+            mask_list.append(mask_tensor)
 
         return (torch.stack(mask_list, dim=0),)
 
