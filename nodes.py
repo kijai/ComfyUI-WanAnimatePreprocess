@@ -8603,100 +8603,134 @@ class PoseGlobalPerspectiveScalerV14:
         return (pose_data_copy, "\n".join(log_messages))
 
 # ======================================================================
-# 3. V17: GLOBAL PERSPECTIVE SCALER (scoring)
+# 3. V17: GLOBAL PERSPECTIVE SCALER (V14 INPUTS + SCORING LOGIC)
 # ======================================================================
-
-class PoseDataGlobalScalerV16:
+class PoseGlobalPerspectiveScalerV17:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "video_pose_data": ("POSEDATA",),
-                "video_nlf_data": ("NLFPRED",),
                 "calibration_data": ("POSE_CALIBRATION",),
-                "smoothing_window": ("INT", {"default": 5, "min": 1, "max": 15, "step": 1, "tooltip": "Anzahl der Frames für das Average Window um den Gewinner-Frame."}),
+                "video_depth_map": ("IMAGE",),
+                "include_head": ("BOOLEAN", {"default": True, "tooltip": "Prüft, ob der Kopf sichtbar ist."}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Ignoriert Punkte unter diesem Confidence-Wert."}),
+            },
+            "optional": {
+                "video_nlf_data": ("NLFPRED", {"tooltip": "Wird genutzt, um 3D-Schulter-Parallelität (Z-Achse) zu berechnen."}),
             }
         }
 
-    RETURN_TYPES = ("POSEDATA", "STRING")
-    RETURN_NAMES = ("scaled_pose_data", "log_output")
+    RETURN_TYPES = ("POSEDATA", "STRING",)
+    RETURN_NAMES = ("scaled_pose_data", "log_output",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V16: Intelligentes Scoring-System. Nutzt NLF 3D Z-Achse für Parallelitätsprüfung und ignoriert Arme/Hände bei der Länge."
+    DESCRIPTION = "V17: Nutzt V14-Skalierung, aber mit intelligentem Scoring-System für die Frame-Auswahl (Waden > Schenkel > Parallelität > Länge)."
 
-    def process(self, video_pose_data, video_nlf_data, calibration_data, smoothing_window):
+    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, video_nlf_data=None):
+        import copy
+        import numpy as np
+        import math
+        
         pose_data_copy = copy.deepcopy(video_pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
-        log_messages = ["=== V16 GLOBAL SCALER LOG (SCORING SYSTEM) ==="]
+        log_messages = ["=== V17 GLOBAL SCALER LOG (SCORING) ==="]
 
         if not pose_metas:
             return (pose_data_copy, "Fehler: Keine Pose-Daten gefunden.")
+        
+        # --- V14 Variablen laden ---
+        slope = calibration_data.get("perspective_slope", 0.0)
+        intercept = calibration_data.get("perspective_intercept", 1.0)
+        is_inverted = calibration_data.get("is_depth_inverted", False)
+        depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
+        
+        H, W = depth_np.shape[1], depth_np.shape[2]
+        EDGE_MARGIN = 2
+        
+        def is_valid_point(pt):
+            if pt is None or len(pt) < 2: return False
+            if len(pt) >= 3 and pt[2] < min_confidence: return False
+            if pt[0] <= 0 or pt[1] <= 0: return False
+            return (EDGE_MARGIN < pt[0] < W - EDGE_MARGIN) and (EDGE_MARGIN < pt[1] < H - EDGE_MARGIN)
 
-        # NLF 3D Daten entpacken
-        pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0] if isinstance(video_nlf_data, dict) else video_nlf_data
+        def get_torso_norm(kps):
+            if kps is None or len(kps) < 12: return 0.0
+            neck, r_hip, l_hip = kps[1], kps[8], kps[11]
+            if is_valid_point(neck) and is_valid_point(r_hip) and is_valid_point(l_hip):
+                return math.sqrt((neck[0] - (r_hip[0]+l_hip[0])/2.0)**2 + (neck[1] - (r_hip[1]+l_hip[1])/2.0)**2)
+            return 0.0
 
-        # --- DURCHLAUF 1: Maximale Körperlänge für den relativen Bonus ermitteln ---
+        # --- NLF 3D Daten entpacken ---
+        pose_input_3d = None
+        if video_nlf_data is not None:
+            pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0] if isinstance(video_nlf_data, dict) else video_nlf_data
+
+        # --- DURCHLAUF 1: Maximale Körperlänge ermitteln ---
         body_lengths = []
-        # Arme/Hände (3, 4, 6, 7) werden ignoriert. Beinhaltet Kopf, Rumpf, Beine, Füße.
-        valid_body_indices = [0, 1, 2, 5, 8, 11, 9, 12, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24] 
+        # Arme/Hände (3, 4, 6, 7) werden ignoriert!
+        valid_body_indices = [1, 2, 5, 8, 11, 9, 12, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24] 
+        if include_head:
+            valid_body_indices.append(0)
 
-        for i, meta in enumerate(pose_metas):
+        for meta in pose_metas:
             kps_2d = getattr(meta, "kps_body", None)
             if kps_2d is None or len(kps_2d) < 14:
                 body_lengths.append(0.0)
                 continue
             
-            valid_y = [kps_2d[idx][1] for idx in valid_body_indices if idx < len(kps_2d) and kps_2d[idx][1] > 0]
+            valid_y = [kps_2d[idx][1] for idx in valid_body_indices if idx < len(kps_2d) and is_valid_point(kps_2d[idx])]
             if valid_y:
                 body_lengths.append(max(valid_y) - min(valid_y))
             else:
                 body_lengths.append(0.0)
 
         max_body_length = max(body_lengths) if body_lengths else 1.0
-        if max_body_length == 0: max_body_length = 1.0
+        if max_body_length <= 0: max_body_length = 1.0
 
-        # --- DURCHLAUF 2: Scoring für jeden Frame ---
+        # --- DURCHLAUF 2: Scoring ---
         frame_scores = []
-
+        
         for i, meta in enumerate(pose_metas):
             score = 0.0
             kps_2d = getattr(meta, "kps_body", None)
-            scores_2d = getattr(meta, "kps_body_p", None)
             
-            if kps_2d is None or len(kps_2d) < 14 or i >= len(pose_input_3d):
-                frame_scores.append(0.0)
+            if kps_2d is None or len(kps_2d) < 14:
+                frame_scores.append(-1.0)
                 continue
 
-            pose_3d = pose_input_3d[i]
-            if pose_3d is None or len(pose_3d) == 0:
-                frame_scores.append(0.0)
-                continue
-            
-            person_3d = pose_3d[0] # Person 0
-
-            # 1. Waden/Schenkel Bonus
-            has_calves = (scores_2d[10] > 0.1) or (scores_2d[13] > 0.1)
-            has_thighs = (scores_2d[9] > 0.1) or (scores_2d[12] > 0.1)
+            # 1. Waden/Schenkel Bonus (Nutzt min_confidence über is_valid_point)
+            has_calves = is_valid_point(kps_2d[10]) or is_valid_point(kps_2d[13])
+            has_thighs = is_valid_point(kps_2d[9]) or is_valid_point(kps_2d[12])
             
             if has_calves:
                 score += 1000.0
             elif has_thighs:
-                score += 500.0 # Schenkel sind immerhin besser als seitlich ohne alles
+                score += 500.0
 
             # 2. Schulter-Frontal-Bonus (NLF 3D Z-Achse)
-            # Index 2 = Rechte Schulter, Index 5 = Linke Schulter
-            if len(person_3d) > 5:
-                z_right = person_3d[2][2]
-                z_left = person_3d[5][2]
-                z_diff = abs(z_left - z_right)
-                
-                # Mappt einen Z-Unterschied von 0.0 bis ~0.2 auf 100 bis 0 Punkte.
-                frontal_points = max(0.0, 100.0 - (z_diff * 500.0))
-                score += frontal_points
+            if pose_input_3d is not None and i < len(pose_input_3d):
+                pose_3d_frame = pose_input_3d[i]
+                if pose_3d_frame is not None and len(pose_3d_frame) > 0:
+                    person_3d = pose_3d_frame[0]
+                    if len(person_3d) > 5:
+                        # Z-Koordinaten der Schultern (Index 2 rechts, Index 5 links)
+                        z_right = person_3d[2][2]
+                        z_left = person_3d[5][2]
+                        z_diff = abs(z_left - z_right)
+                        
+                        # 0.0 Diff = 100 Punkte (Parallel). 0.2 Diff = 0 Punkte (Seitlich)
+                        frontal_points = max(0.0, 100.0 - (z_diff * 500.0))
+                        score += frontal_points
 
             # 3. Körperlängen-Bonus
             length_points = (body_lengths[i] / max_body_length) * 100.0
             score += length_points
+
+            # Sicherstellen, dass ungültige Frames (ohne validen Torso) nicht gewinnen können
+            if get_torso_norm(kps_2d) == 0.0:
+                score = -1.0
 
             frame_scores.append(score)
 
@@ -8704,60 +8738,76 @@ class PoseDataGlobalScalerV16:
         best_frame_idx = int(np.argmax(frame_scores))
         best_score = frame_scores[best_frame_idx]
 
-        log_messages.append(f"Scoring abgeschlossen! Frame {best_frame_idx} gewinnt mit {best_score:.1f} Punkten.")
-        log_messages.append(f"-> Physische Länge des Gewinners: {body_lengths[best_frame_idx]:.1f}px")
+        if best_score < 0:
+            return (pose_data_copy, "Fehler: Kein gültiger Frame für die Skalierung gefunden.")
 
-        # --- AVERAGE WINDOW BERECHNEN ---
-        half_window = smoothing_window // 2
-        start_idx = max(0, best_frame_idx - half_window)
-        end_idx = min(len(pose_metas), best_frame_idx + half_window + 1)
-        
-        log_messages.append(f"-> Average Window genutzt: Frame {start_idx} bis {end_idx-1} ({end_idx-start_idx} Frames)")
+        log_messages.append(f"Scoring abgeschlossen: Frame {best_frame_idx} gewinnt mit {best_score:.1f} Punkten!")
+        log_messages.append(f"-> Physische Y-Länge des Gewinners: {body_lengths[best_frame_idx]:.1f}px")
 
-        torso_lengths = []
-        for j in range(start_idx, end_idx):
-            kps = getattr(pose_metas[j], "kps_body", None)
-            if kps is not None and len(kps) > 11:
-                # Torso-Messung: Hals (1) zur Hüftmitte (8, 11)
-                if kps[1][1] > 0 and kps[8][1] > 0 and kps[11][1] > 0:
-                    hip_center_x = (kps[8][0] + kps[11][0]) / 2.0
-                    hip_center_y = (kps[8][1] + kps[11][1]) / 2.0
-                    dist = math.sqrt((kps[1][0] - hip_center_x)**2 + (kps[1][1] - hip_center_y)**2)
-                    torso_lengths.append(dist)
+        # --- AVERAGE WINDOW & SCALING (UNANGETASTETER V14 CODE) ---
+        start_idx = max(0, best_frame_idx - anchor_window)
+        end_idx = min(len(pose_metas) - 1, best_frame_idx + anchor_window)
         
-        ist_norm = np.mean(torso_lengths) if torso_lengths else 1.0
+        sum_norm, sum_depth, valid_frames_in_window = 0.0, 0.0, 0
         
-        # Soll-Norm aus der Kalibrierung holen (Fallback auf die Ist-Norm, falls nichts angeschlossen ist)
-        target_norm = calibration_data.get("ref_torso_dist_2d", ist_norm)
-        
-        fester_faktor = target_norm / ist_norm if ist_norm > 0 else 1.0
-        
-        log_messages.append(f"-> Durchschnittliche Torso-Norm (Ist): {ist_norm:.1f}px")
-        log_messages.append(f"-> Soll-Norm laut Kalibrierung: {target_norm:.1f}px")
-        log_messages.append(f"==> FESTER SKALIERUNGSFAKTOR FÜR GANZES VIDEO: {fester_faktor:.3f}x")
-
-        # --- FESTER SKALIERUNGSFAKTOR ANWENDEN ---
-        for meta in pose_metas:
-            kps_body = getattr(meta, "kps_body", None)
-            if kps_body is None: continue
+        for i in range(start_idx, end_idx + 1):
+            meta = pose_metas[i]
+            kps = getattr(meta, "kps_body", None)
+            norm = get_torso_norm(kps)
+            if norm == 0.0: continue
+                
+            valid_x = [kps[1][0], kps[8][0], kps[11][0]]
+            valid_y = [kps[1][1], kps[8][1], kps[11][1]]
+            v_idx = min(i, depth_np.shape[0] - 1)
             
-            valid_y = [kp[1] for kp in kps_body if len(kp) >= 2 and kp[1] > 0]
-            valid_x = [kp[0] for kp in kps_body if len(kp) >= 2 and kp[0] > 0]
-            if not valid_y: continue
+            min_x, max_x = int(max(0, min(valid_x))), int(min(W-1, max(valid_x)))
+            min_y, max_y = int(max(0, min(valid_y))), int(min(H-1, max(valid_y)))
             
-            pivot_y = max(valid_y) # Füße als Pivot-Punkt
-            pivot_x = np.mean(valid_x)
+            if max_x > min_x and max_y > min_y:
+                frame_depth = float(np.mean(depth_np[v_idx, min_y:max_y, min_x:max_x]))
+            else:
+                frame_depth = 0.5
+                
+            if is_inverted: frame_depth = 1.0 / max(frame_depth, 0.0001)
+                
+            sum_norm += norm
+            sum_depth += frame_depth
+            valid_frames_in_window += 1
+
+        if valid_frames_in_window == 0:
+            return (pose_data_copy, "Fehler: Im Anchor-Window konnte keine Tiefe/Norm ermittelt werden.")
+            
+        avg_anchor_norm = sum_norm / valid_frames_in_window
+        avg_anchor_depth = sum_depth / valid_frames_in_window
+
+        expected_norm = (avg_anchor_depth * slope) + intercept
+        anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
+        
+        log_messages.append(f"-> Average Window genutzt: Frame {start_idx} bis {end_idx} ({valid_frames_in_window} Frames)")
+        log_messages.append(f"-> Durchschnittliche Torso-Norm (Ist): {avg_anchor_norm:.1f}px")
+        log_messages.append(f"-> Durchschnittliche Tiefe (Depth): {avg_anchor_depth:.3f}m")
+        log_messages.append(f"-> Soll-Norm laut Kalibrierung: {expected_norm:.1f}px")
+        log_messages.append(f"\n==> FESTER SKALIERUNGSFAKTOR FÜR GANZES VIDEO: {anchor_scale:.3f}x\n")
+
+        # --- FAKTOR ANWENDEN ---
+        for i, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            valid_y = [kp[1] for kp in kps if len(kp) >= 2 and is_valid_point(kp)]
+            valid_x = [kp[0] for kp in kps if len(kp) >= 2 and is_valid_point(kp)]
+            
+            if not valid_y or not valid_x: continue
+                
+            pivot_y, pivot_x = max(valid_y), np.mean(valid_x)
             
             for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
                 arr = getattr(meta, attr_name, None)
-                if arr is not None:
+                if arr is not None and len(arr) > 0:
                     for j in range(len(arr)):
                         if len(arr[j]) >= 2 and arr[j][1] > 0:
-                            arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * fester_faktor
-                            arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * fester_faktor
-
-        log_messages.append("\nErfolgreich: Fester Skalierungsfaktor wurde auf alle Frames angewandt.")
-
+                            arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * anchor_scale
+                            arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * anchor_scale
+                            
+        log_messages.append("Erfolgreich: Fester Skalierungsfaktor wurde angewandt.")
         return (pose_data_copy, "\n".join(log_messages))
         
 NODE_CLASS_MAPPINGS = {
@@ -8811,7 +8861,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataLowerLegRemover": PoseDataLowerLegRemover,
     "RetargetPoseCalibratorV9": RetargetPoseCalibratorV9,
     "PoseGlobalPerspectiveScalerV14": PoseGlobalPerspectiveScalerV14,
-    "PoseDataGlobalScalerV16": PoseDataGlobalScalerV16,
+    "PoseGlobalPerspectiveScalerV17": PoseGlobalPerspectiveScalerV17,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -8865,7 +8915,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataLowerLegRemover": "Pose Data Lower Leg Remover",
     "RetargetPoseCalibratorV9": "WanAnimate: Retarget Pose Calibrator (V9 Norm)",
     "PoseGlobalPerspectiveScalerV14": "WanAnimate: Global Scaler (V14 Anchor Constant)",
-    "PoseDataGlobalScalerV16": "Global Pose Scaler (V16 Scoring)",
+    "PoseGlobalPerspectiveScalerV17": "WanAnimate: Global Scaler (V17 Scoring)",
 }
 
 
