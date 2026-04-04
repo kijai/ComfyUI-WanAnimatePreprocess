@@ -9669,7 +9669,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV21": "WanAnimate: Global Scaler (V21 Toggle + PassFilter)",
     "PoseGlobalPerspectiveScalerV23": "WanAnimate: Global Scaler (V23 True 3D Angle)",
 }
-}
+
 
 
 
