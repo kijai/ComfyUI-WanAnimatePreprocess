@@ -10493,7 +10493,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV25": "WanAnimate: Global Scaler (V25 Exact Depth)",
     "PoseCalibrationV13": "WanAnimate: Pose Calibration (V13 Rechenvorgang)",
     "PoseGlobalPerspectiveScalerV26": "WanAnimate: Global Scaler (V26 Rechenvorgang)",
-}
+
 }
 
 
