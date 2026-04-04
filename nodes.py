@@ -11535,113 +11535,128 @@ class PoseGlobalPerspectiveScalerV14:
                             
         log_messages.append("Erfolgreich: Fester Skalierungsfaktor wurde angewandt.")
         return (pose_data_copy, "\n".join(log_messages))
-
-class PoseGlobalPerspectiveScalerV16:
+# ======================================================================
+# 3. V17: GLOBAL PERSPECTIVE SCALER (scoring system)
+# ======================================================================
+class PoseGlobalPerspectiveScalerV17:
+    """
+    V17 Scaler: Nutzt NLF 3D-Z-Tiefendaten zur Bestimmung der Schulter-Parallelität 
+    sowie Beinerkennung (Waden), um den optimalen Referenz-Frame für den globalen Skalierungsfaktor zu finden.
+    Ignoriert V15/V16 2D-Breiten-Heuristiken.
+    """
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "video_pose_data": ("POSEDATA",),
-                "video_nlf_data": ("NLF_DATA",), # NLF Daten wieder da!
-                "depth_map": ("IMAGE",),         # Depth Map wieder da!
-                "calibration_data": ("POSE_CALIBRATION",),
+                "pose_data": ("POSEDATA",),
+                "target_torso_norm": ("FLOAT", {"default": 457.4, "min": 50.0, "max": 2000.0, "step": 0.1, "tooltip": "Ziel-Soll-Norm in Pixeln"}),
+                "parallel_tolerance": ("FLOAT", {"default": 0.15, "min": 0.01, "max": 1.0, "step": 0.01, "tooltip": "Max. Z-Tiefen-Differenz für Parallelität"}),
             }
         }
-        
-    RETURN_TYPES = ("POSEDATA", "STRING",)
-    RETURN_NAMES = ("scaled_pose_data", "log_output",)
+
+    RETURN_TYPES = ("POSEDATA", "FLOAT", "INT")
+    RETURN_NAMES = ("pose_data", "scale_factor", "best_frame_idx")
     FUNCTION = "process"
-    CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V17: NLF-3D-Parallelität, Waden-Zwang, NORM-Höhe und intakte DepthMap/Skalierungs-Inputs."
+    CATEGORY = "WanAnimatePreprocess/Scaling"
 
-    def process(self, video_pose_data, video_nlf_data, depth_map, calibration_data):
+    def process(self, pose_data, target_torso_norm, parallel_tolerance):
         import copy
-        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_data_copy = copy.deepcopy(pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
-        
-        log_messages = ["=== V17 GLOBAL SCALER LOG (NLF 3D-PARALLELITÄT & SCORING) ==="]
-        
-        if not pose_metas:
-            log_messages.append("Fehler: Keine Pose-Daten gefunden.")
-            return (pose_data_copy, "\n".join(log_messages))
 
-        HEAD_INDICES = [0, 1, 2, 3, 4]
-        HEEL_CALF_INDICES = [10, 13, 15, 16, 19, 20, 21, 22, 23, 24] 
-        
-        best_frame = -1
-        best_score = -9999.0
-        
+        if not pose_metas:
+            return (pose_data_copy, 1.0, -1)
+
+        best_frame_idx = -1
+        best_score = -float('inf')
+
+        # --- 1. Frame-Scoring via 3D/NLF und Waden-Erkennung ---
         for i, meta in enumerate(pose_metas):
             kps_2d = getattr(meta, "kps_body", [])
-            scores = getattr(meta, "kps_body_p", [])
-            height = getattr(meta, "height", 1.0)
-            if height == 0: height = 1.0
+            kps_p = getattr(meta, "kps_body_p", [])
             
-            if len(kps_2d) == 0 or len(scores) == 0:
-                continue
-                
-            frame_score = 0.0
-            
-            # --- 1. WADEN/HACKEN BONUS (+1000 Punkte) ---
-            has_calves = any(scores[idx] >= 0.3 for idx in HEEL_CALF_INDICES if idx < len(scores))
-            if has_calves:
-                frame_score += 1000.0
-                
-            # --- 2. ECHTE 3D PARALLELITÄT VIA NLF ---
-            # Wir holen uns die 3D-Schulterpunkte aus den NLF-Daten für diesen Frame.
-            # (HINWEIS: Bitte überprüfe, wie deine NLF-Daten exakt strukturiert sind. 
-            # In diesem Beispiel gehen wir von einer Liste aus, die pro Frame die 3D-Keypoints hält)
-            try:
-                nlf_frame = video_nlf_data[i]
-                # Annahme: Index 2 (Rechts) und 5 (Links) sind die Schultern in deinen 3D-Daten, 
-                # und sie haben das Format [X, Y, Z].
-                z_right_shoulder = nlf_frame[2][2] # Z-Koordinate rechte Schulter
-                z_left_shoulder = nlf_frame[5][2]  # Z-Koordinate linke Schulter
-                
-                # Wie groß ist der Tiefenunterschied? (in Metern/Normeinheiten)
-                z_diff = abs(z_left_shoulder - z_right_shoulder)
-                
-                # Je kleiner der Z-Unterschied, desto frontaler! 
-                # Bei 0 Diff gibt es die vollen 100 Punkte.
-                frontal_score = max(0.0, 100.0 - (z_diff * 500.0)) # Multiplikator ggf. an deine NLF-Scale anpassen
-                frame_score += frontal_score
-                
-            except Exception as e:
-                # Fallback, falls NLF für diesen Frame fehlt
-                pass
-            
-            # --- 3. KÖRPERLÄNGEN-BONUS (Y-Norm) ---
-            head_y_norm = 1.0
-            heel_y_norm = 0.0
-            valid_length = False
-            
-            for idx in HEAD_INDICES:
-                if idx < len(kps_2d) and scores[idx] >= 0.3:
-                    head_y_norm = min(head_y_norm, kps_2d[idx][1] / height)
-                    valid_length = True
-                    
-            for idx in HEEL_CALF_INDICES:
-                if idx < len(kps_2d) and scores[idx] >= 0.3:
-                    heel_y_norm = max(heel_y_norm, kps_2d[idx][1] / height)
-                    
-            if valid_length and has_calves:
-                full_body_norm = heel_y_norm - head_y_norm
-                frame_score += (full_body_norm * 100.0)
+            # Falls NLF die 3D Daten in einem anderen Key speichert, hier ggf. anpassen
+            kps_3d = getattr(meta, "kps_body_3d", None) 
+            if kps_3d is None:
+                kps_3d = getattr(meta, "nlf_kps", None)
 
-            # --- BESTEN FRAME SPEICHERN ---
-            if frame_score > best_score:
-                best_score = frame_score
-                best_frame = i
+            if not kps_2d or len(kps_2d) < 17:
+                continue
+
+            visible_points = sum(1 for idx in range(len(kps_2d)) if (kps_p[idx] if kps_p is not None else 1.0) >= 0.3)
+            leg_points = sum(1 for idx in [13, 14, 15, 16] if idx < len(kps_2d) and (kps_p[idx] if kps_p is not None else 1.0) >= 0.3)
+
+            z_diff = 999.0
+            is_parallel = False
+
+            # Z-Differenz für Schultern (Links: 5, Rechts: 6 in 3D) checken
+            if kps_3d is not None and len(kps_3d) > 6:
+                if kps_3d[5] is not None and kps_3d[6] is not None and len(kps_3d[5]) >= 3 and len(kps_3d[6]) >= 3:
+                    z_left = kps_3d[5][2]
+                    z_right = kps_3d[6][2]
+                    z_diff = abs(z_left - z_right)
+                    if z_diff < parallel_tolerance:
+                        is_parallel = True
+
+            # TIER SCORING
+            score = 0
+            if is_parallel and leg_points > 0:
+                score += 10000  # Tier 1 (Frame 0 Äquivalent)
+            elif leg_points > 0:
+                score += 5000   # Tier 2 (Frame 65 Äquivalent)
+            elif is_parallel:
+                score += 2000   # Tier 3
                 
-        log_messages.append(f"-> Frame {best_frame} gewinnt mit Score: {best_score:.2f} (3D-Parallelität berücksichtigt!)")
+            score += visible_points * 10.0
+            if z_diff != 999.0:
+                score -= z_diff * 100.0
+
+            if score > best_score:
+                best_score = score
+                best_frame_idx = i
+
+        if best_frame_idx == -1:
+            best_frame_idx = 0  # Fallback
+
+        # --- 2. Berechnung & Anwendung Skalierungsfaktor ---
+        best_meta = pose_metas[best_frame_idx]
+        kps_2d = getattr(best_meta, "kps_body", [])
         
-        # ====================================================================
-        # AB HIER: Deine originale DepthMap & Calibration Logik für den Scale
-        # ====================================================================
-        # best_frame ist jetzt 100% verlässlich anhand von 3D-NLF und Waden ermittelt.
-        # Jetzt kannst du depth_map[best_frame] und calibration_data nutzen.
-        
-        return (pose_data_copy, "\n".join(log_messages))
+        try:
+            shoulder_mid_y = (kps_2d[5][1] + kps_2d[6][1]) / 2.0
+            hip_mid_y = (kps_2d[11][1] + kps_2d[12][1]) / 2.0
+            current_torso_norm = abs(hip_mid_y - shoulder_mid_y)
+        except (IndexError, TypeError):
+            current_torso_norm = target_torso_norm
+
+        scale_factor = 1.0
+        if current_torso_norm > 0:
+            scale_factor = target_torso_norm / current_torso_norm
+
+            for meta in pose_metas:
+                body = getattr(meta, "kps_body", None)
+                if not body: continue
+                
+                try:
+                    pivot_y = (body[11][1] + body[12][1]) / 2.0
+                    pivot_x = (body[11][0] + body[12][0]) / 2.0
+                except:
+                    pivot_y, pivot_x = 0.0, 0.0
+
+                for index, kp in enumerate(body):
+                    if kp is None or len(kp) < 2: continue
+                    new_x = pivot_x + (kp[0] - pivot_x) * scale_factor
+                    new_y = pivot_y + (kp[1] - pivot_y) * scale_factor
+                    
+                    if isinstance(body[index], list):
+                        body[index][0], body[index][1] = float(new_x), float(new_y)
+                    else:
+                        mutable = list(body[index])
+                        mutable[0], mutable[1] = float(new_x), float(new_y)
+                        body[index] = mutable
+
+        pose_data_copy["pose_metas"] = pose_metas
+        return (pose_data_copy, float(scale_factor), int(best_frame_idx))
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -11718,7 +11733,7 @@ NODE_CLASS_MAPPINGS = {
     "RetargetPoseCalibratorV9": RetargetPoseCalibratorV9,
     "PoseGlobalPerspectiveScalerV13": PoseGlobalPerspectiveScalerV13,
     "PoseGlobalPerspectiveScalerV14": PoseGlobalPerspectiveScalerV14,
-    "PoseGlobalPerspectiveScalerV16": PoseGlobalPerspectiveScalerV16,
+    "PoseGlobalPerspectiveScalerV17": PoseGlobalPerspectiveScalerV17,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -11796,7 +11811,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RetargetPoseCalibratorV9": "WanAnimate: Retarget Pose Calibrator (V9 Norm)",
     "PoseGlobalPerspectiveScalerV13": "WanAnimate: Global Perspective Scaler (V13 Norm)",
     "PoseGlobalPerspectiveScalerV14": "WanAnimate: Global Scaler (V14 Anchor Constant)",
-    "PoseGlobalPerspectiveScalerV16": "Pose Global Perspective Scaler V16 (Auto-Scoring)",
+    "PoseGlobalPerspectiveScalerV17": "Pose Global Perspective Scaler V17 (Auto-Scoring)",
 }
 
 
