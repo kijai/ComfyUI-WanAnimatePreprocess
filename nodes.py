@@ -8694,24 +8694,24 @@ class PoseGlobalPerspectiveScalerV17:
 
             # 1. Beine (Strikt: Hacken/Knöchel mit höherer Confidence erforderlich)
             has_heels = False
-            # Check Knöchel (10, 13) und Hacken/Füße (20, 23 falls COCO-Wholebody)
             if len(kps_2d) > 23:
                 has_heels = is_valid_point(kps_2d[20], 0.4) or is_valid_point(kps_2d[23], 0.4)
             if not has_heels:
-                # Knöchel müssen sehr hohe Confidence haben, um nicht als Knie verwechselt zu werden
                 has_heels = is_valid_point(kps_2d[10], 0.4) or is_valid_point(kps_2d[13], 0.4)
 
             waden_pts = 1000.0 if has_heels else 0.0
             schenkel_pts = 500.0 if (waden_pts == 0 and (is_valid_point(kps_2d[9]) or is_valid_point(kps_2d[12]))) else 0.0
             bein_pts = max(waden_pts, schenkel_pts)
 
-            # 2. Frontal (Toleranter & Stärker gewichtet)
+            # 2. Frontal (Toleranter & Tensor-Sicher)
             frontal_pts = 0.0
-            if pose_input_3d is not None and i < len(pose_input_3d) and pose_input_3d[i] and len(pose_input_3d[i][0]) > 5:
-                z_right, z_left = pose_input_3d[i][0][2][2], pose_input_3d[i][0][5][2]
-                z_diff = abs(z_left - z_right)
-                # 500 Punkte Max, verzeiht leichte Abweichungen viel weicher
-                frontal_pts = max(0.0, 500.0 - (z_diff * 150.0))
+            if pose_input_3d is not None and i < len(pose_input_3d):
+                pose_3d_frame = pose_input_3d[i]
+                # FIX: Explizite Prüfung statt boolschem Array-Vergleich
+                if pose_3d_frame is not None and len(pose_3d_frame) > 0 and len(pose_3d_frame[0]) > 5:
+                    z_right, z_left = float(pose_3d_frame[0][2][2]), float(pose_3d_frame[0][5][2])
+                    z_diff = abs(z_left - z_right)
+                    frontal_pts = max(0.0, 500.0 - (z_diff * 150.0))
 
             # 3. Länge
             length_pts = (body_lengths[i] / max_body_length) * 100.0
