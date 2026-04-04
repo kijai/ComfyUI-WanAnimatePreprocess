@@ -11536,6 +11536,101 @@ class PoseGlobalPerspectiveScalerV14:
         log_messages.append("Erfolgreich: Fester Skalierungsfaktor wurde angewandt.")
         return (pose_data_copy, "\n".join(log_messages))
 
+class PoseGlobalPerspectiveScalerV16:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+            }
+        }
+        
+    RETURN_TYPES = ("POSEDATA", "STRING",)
+    RETURN_NAMES = ("scaled_pose_data", "log_output",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V16: Automatisches Scoring-System. Ignoriert Arme, priorisiert Waden absolut, bewertet Frontalität via Schulterdistanz."
+
+    def process(self, video_pose_data, calibration_data):
+        import copy
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        
+        log_messages = ["=== V16 GLOBAL SCALER LOG (AUTO-SCORING) ==="]
+        
+        if not pose_metas:
+            log_messages.append("Fehler: Keine Pose-Daten gefunden.")
+            return (pose_data_copy, "\n".join(log_messages))
+
+        # Relevante Indizes für die Höhe und Ausrichtung (OpenPose/DWPose)
+        HEAD_INDICES = [0, 1, 2, 3, 4] # Nase, Augen, Ohren für den höchsten Punkt
+        SHOULDER_INDICES = [2, 5]      # RShoulder, LShoulder
+        HEEL_CALF_INDICES = [10, 13, 15, 16, 19, 20, 21, 22, 23, 24] # Knie abwärts, Waden, Hacken
+        
+        best_frame = -1
+        best_score = -9999.0
+        
+        for i, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            scores = getattr(meta, "kps_body_p", [])
+            width = getattr(meta, "width", 1.0)
+            height = getattr(meta, "height", 1.0)
+            
+            if width == 0: width = 1.0
+            if height == 0: height = 1.0
+            
+            if len(kps) == 0 or len(scores) == 0:
+                continue
+                
+            frame_score = 0.0
+            
+            # --- 1. WADEN/HACKEN BONUS (Die absolute Priorität) ---
+            has_calves = any(scores[idx] >= 0.3 for idx in HEEL_CALF_INDICES if idx < len(scores))
+            if has_calves:
+                frame_score += 1000.0 # Frames mit Beinen gewinnen immer!
+                
+            # --- 2. FRONTAL-BONUS (Schulterabstand in X-Norm) ---
+            # Wenn beide Schultern da sind, berechne den Abstand
+            if len(kps) > 5 and scores[2] >= 0.3 and scores[5] >= 0.3:
+                shoulder_width_norm = abs(kps[2][0] - kps[5][0]) / width
+                # Gibt bis zu ~100 Punkte, je frontaler die Person steht
+                frame_score += (shoulder_width_norm * 100.0) 
+            
+            # --- 3. KÖRPERLÄNGEN-BONUS (Y-Norm) ---
+            head_y_norm = 1.0
+            heel_y_norm = 0.0
+            valid_length = False
+            
+            # Suche höchsten Kopf-Punkt
+            for idx in HEAD_INDICES:
+                if idx < len(kps) and scores[idx] >= 0.3:
+                    head_y_norm = min(head_y_norm, kps[idx][1] / height)
+                    valid_length = True
+                    
+            # Suche tiefsten Bein-Punkt
+            for idx in HEEL_CALF_INDICES:
+                if idx < len(kps) and scores[idx] >= 0.3:
+                    heel_y_norm = max(heel_y_norm, kps[idx][1] / height)
+                    
+            if valid_length and has_calves:
+                full_body_norm = heel_y_norm - head_y_norm
+                # Gibt bis zu ~100 Punkte, je ausgestreckter die Person ist
+                frame_score += (full_body_norm * 100.0)
+
+            # Frame vergleichen
+            if frame_score > best_score:
+                best_score = frame_score
+                best_frame = i
+                
+        log_messages.append(f"-> Frame {best_frame} gewinnt mit Score: {best_score:.2f}")
+        
+        # Ab hier: Wende deine Skalierungslogik mit best_frame an...
+        # ...
+        
+        return (pose_data_copy, "\n".join(log_messages))
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -11611,6 +11706,7 @@ NODE_CLASS_MAPPINGS = {
     "RetargetPoseCalibratorV9": RetargetPoseCalibratorV9,
     "PoseGlobalPerspectiveScalerV13": PoseGlobalPerspectiveScalerV13,
     "PoseGlobalPerspectiveScalerV14": PoseGlobalPerspectiveScalerV14,
+    "PoseGlobalPerspectiveScalerV16": PoseGlobalPerspectiveScalerV16,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -11688,6 +11784,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RetargetPoseCalibratorV9": "WanAnimate: Retarget Pose Calibrator (V9 Norm)",
     "PoseGlobalPerspectiveScalerV13": "WanAnimate: Global Perspective Scaler (V13 Norm)",
     "PoseGlobalPerspectiveScalerV14": "WanAnimate: Global Scaler (V14 Anchor Constant)",
+    "PoseGlobalPerspectiveScalerV16": "Pose Global Perspective Scaler V16 (Auto-Scoring)",
 }
 
 
