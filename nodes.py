@@ -9898,24 +9898,221 @@ class RenderNLFPosesDirect:
 
 
 # ======================================================================
-# Ersetze oder ergänze diese Einträge am Ende deiner nodes.py
+# 1. PoseCalibrationV17 (Mit NLF Nah & Fern für Durchschnitts-3D)
 # ======================================================================
+class PoseCalibrationV17:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_nah_scaled": ("POSEDATA", {"tooltip": "Skalierte Pose für Pixel-Größe"}),
+                "pose_nah_unscaled": ("POSEDATA", {"tooltip": "Originale Pose als Maske für Depth-Map"}),
+                "depth_nah": ("IMAGE",),
+                "pose_fern_scaled": ("POSEDATA", {"tooltip": "Skalierte Pose für Pixel-Größe"}),
+                "pose_fern_unscaled": ("POSEDATA", {"tooltip": "Originale Pose als Maske für Depth-Map"}),
+                "depth_fern": ("IMAGE",),
+                "norm_method": (["Dynamic Full-Body", "Torso (Neck-Hip)"], {"default": "Dynamic Full-Body"}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "invert_depth": ("BOOLEAN", {"default": False}),
+                "use_pinhole_math": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "intrinsics_json": ("STRING", {"forceInput": True, "tooltip": "Intrinsics JSON aus DA3"}),
+                "nlf_data_nah": ("NLFPRED", {"tooltip": "3D NLF Daten vom NAHEN Kalibrierungs-Frame"}),
+                "nlf_data_fern": ("NLFPRED", {"tooltip": "3D NLF Daten vom FERNEN Kalibrierungs-Frame"}),
+                "config_data": ("STRING", {"default": "{}", "tooltip": "JSON ConfigurationData (z.B. für 3D Längen)"}),
+            }
+        }
 
-# NODE_CLASS_MAPPINGS = {
-#     # ... deine anderen Nodes ...
-#     "PoseCalibrationV16": PoseCalibrationV16,
-#     "PoseGlobalPerspectiveScalerV29": PoseGlobalPerspectiveScalerV29,
-#     "NLFDataToPoseData": NLFDataToPoseData,
-#     "RenderNLFPosesDirect": RenderNLFPosesDirect,
-# }
+    RETURN_TYPES = ("POSE_CALIBRATION", "STRING",)
+    RETURN_NAMES = ("calibration_data", "log_output",)
+    FUNCTION = "calibrate"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
 
-# NODE_DISPLAY_NAME_MAPPINGS = {
-#     # ... deine anderen Namen ...
-#     "PoseCalibrationV16": "Pose Calibration V16 (with NLF 3D Extractor)",
-#     "PoseGlobalPerspectiveScalerV29": "Pose Global Perspective Scaler V29 (with 3D Scale)",
-#     "NLFDataToPoseData": "NLF Data to 2D Pose Data",
-#     "RenderNLFPosesDirect": "Render NLF Poses Direct",
-# }
+    def calibrate(self, pose_nah_scaled, pose_nah_unscaled, depth_nah, pose_fern_scaled, pose_fern_unscaled, depth_fern, norm_method, min_confidence, invert_depth, use_pinhole_math=True, intrinsics_json=None, nlf_data_nah=None, nlf_data_fern=None, config_data="{}"):
+        import numpy as np
+        import math
+        import json
+        
+        log_messages = ["=== V17 CALIBRATION LOG (UNSCALED DEPTH + PINHOLE + 3D AVG) ==="]
+        log_messages.append(f"Methode: {norm_method}")
+
+        # Parse Config Data
+        try:
+            config = json.loads(config_data)
+        except:
+            config = {}
+            log_messages.append("Warnung: config_data konnte nicht als JSON geparst werden.")
+
+        def get_body_metrics(pose_s, pose_u, depth_map):
+            meta_s = pose_s.get("pose_metas", [])[0]
+            meta_u = pose_u.get("pose_metas", [])[0]
+            
+            kps_s = getattr(meta_s, "kps_body", None)
+            confs_s = getattr(meta_s, "kps_body_p", None)
+            kps_u = getattr(meta_u, "kps_body", None)
+            confs_u = getattr(meta_u, "kps_body_p", None)
+            
+            depth_np = depth_map.cpu().numpy() if hasattr(depth_map, 'cpu') else depth_map
+            H, W = depth_np.shape[1], depth_np.shape[2]
+
+            def get_c_s(idx):
+                if confs_s is not None and idx < len(confs_s): return float(confs_s[idx])
+                if len(kps_s[idx]) >= 3: return float(kps_s[idx][2])
+                return 1.0
+                
+            def is_val_s(idx):
+                if kps_s is None or idx >= len(kps_s): return False
+                pt = kps_s[idx]
+                if pt is None or len(pt) < 2: return False
+                if get_c_s(idx) < min_confidence: return False
+                return True
+
+            def get_c_u(idx):
+                if confs_u is not None and idx < len(confs_u): return float(confs_u[idx])
+                if len(kps_u[idx]) >= 3: return float(kps_u[idx][2])
+                return 1.0
+                
+            def is_val_u(idx):
+                if kps_u is None or idx >= len(kps_u): return False
+                pt = kps_u[idx]
+                if pt is None or len(pt) < 2: return False
+                if get_c_u(idx) < min_confidence: return False
+                if pt[0] < 0 or pt[0] >= 1.0 or pt[1] < 0 or pt[1] >= 1.0: return False
+                return True
+
+            norm = 100.0 
+            if norm_method == "Torso (Neck-Hip)":
+                if is_val_s(1) and is_val_s(8) and is_val_s(11):
+                    mid_x = (kps_s[8][0] + kps_s[11][0]) / 2.0
+                    mid_y = (kps_s[8][1] + kps_s[11][1]) / 2.0
+                    norm = math.sqrt((kps_s[1][0] - mid_x)**2 + (kps_s[1][1] - mid_y)**2)
+            else:
+                valid_y = [kps_s[i][1] for i in range(len(kps_s)) if is_val_s(i)]
+                valid_x = [kps_s[i][0] for i in range(len(kps_s)) if is_val_s(i)]
+                if valid_y and valid_x:
+                    norm = math.sqrt((max(valid_x) - min(valid_x))**2 + (max(valid_y) - min(valid_y))**2)
+
+            depth = 0.5 
+            valid_u_x = []
+            valid_u_y = []
+            for idx in [1, 8, 11]:
+                if is_val_u(idx):
+                    valid_u_x.append(kps_u[idx][0])
+                    valid_u_y.append(kps_u[idx][1])
+            
+            if valid_u_x and valid_u_y:
+                min_x = int(max(0, min(valid_u_x) * W))
+                max_x = int(min(W-1, max(valid_u_x) * W))
+                min_y = int(max(0, min(valid_u_y) * H))
+                max_y = int(min(H-1, max(valid_u_y) * H))
+                
+                if max_x > min_x and max_y > min_y:
+                    depth = float(np.mean(depth_np[0, min_y:max_y, min_x:max_x]))
+
+            return {"norm": norm, "depth": depth}
+
+        data_nah = get_body_metrics(pose_nah_scaled, pose_nah_unscaled, depth_nah)
+        data_fern = get_body_metrics(pose_fern_scaled, pose_fern_unscaled, depth_fern)
+        
+        norm_nah = data_nah['norm']
+        norm_fern = data_fern['norm']
+        depth_c = data_nah['depth']
+        depth_f = data_fern['depth']
+
+        if invert_depth:
+            depth_c = 1.0 / max(depth_c, 0.0001)
+            depth_f = 1.0 / max(depth_f, 0.0001)
+
+        slope = 0.0
+        intercept = 1.0
+        depth_diff = abs(depth_f - depth_c)
+        if depth_diff > 0.05:
+            slope = (norm_fern - norm_nah) / (depth_f - depth_c)
+            intercept = norm_nah - (slope * depth_c)
+        else:
+            slope = -500.0 if invert_depth else 500.0
+            intercept = norm_nah - (slope * depth_c)
+
+        fx = 500.0
+        echte_groesse = 0.0
+        if use_pinhole_math:
+            if intrinsics_json:
+                try:
+                    intr_data = json.loads(intrinsics_json)
+                    if isinstance(intr_data, list) and len(intr_data) > 0:
+                        fx = float(intr_data[0][0])
+                except: pass
+            
+            delta_z = abs(data_fern['depth'] - data_nah['depth'])
+            if delta_z > 0.001 and abs(norm_nah - norm_fern) > 0.1:
+                echte_groesse = (norm_nah * norm_fern * delta_z) / (fx * abs(norm_nah - norm_fern))
+            else:
+                echte_groesse = (norm_nah * data_nah['depth']) / fx
+
+        # --- ADDITIV V17: 3D Längen aus NLF Nah UND Fern extrahieren & mitteln ---
+        true_3d_bones = {}
+        total_3d_height = 0.0
+
+        def extract_3d_bones(nlf_data):
+            if nlf_data is None: return None
+            try:
+                pose_input_3d = nlf_data.get('joints3d_nonparam', [nlf_data])[0]
+                if pose_input_3d is not None and len(pose_input_3d) > 0 and len(pose_input_3d[0]) > 0:
+                    pose_3d = pose_input_3d[0][0]
+                    def dist_3d(p1, p2):
+                        return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)
+
+                    torso = dist_3d(pose_3d[1], pose_3d[8]) if len(pose_3d) > 8 else 0
+                    thigh = dist_3d(pose_3d[8], pose_3d[9]) if len(pose_3d) > 9 else 0
+                    calf = dist_3d(pose_3d[9], pose_3d[10]) if len(pose_3d) > 10 else 0
+                    return {"torso": torso, "thigh": thigh, "calf": calf}
+            except: pass
+            return None
+
+        bones_nah = extract_3d_bones(nlf_data_nah)
+        bones_fern = extract_3d_bones(nlf_data_fern)
+
+        if bones_nah or bones_fern:
+            # Durchschnitt bilden, falls beide vorhanden
+            b_n = bones_nah if bones_nah else bones_fern
+            b_f = bones_fern if bones_fern else bones_nah
+            
+            torso_3d = (b_n["torso"] + b_f["torso"]) / 2.0
+            thigh_3d = (b_n["thigh"] + b_f["thigh"]) / 2.0
+            calf_3d = (b_n["calf"] + b_f["calf"]) / 2.0
+
+            true_3d_bones = {
+                "torso": torso_3d,
+                "thigh": thigh_3d,
+                "calf": calf_3d
+            }
+            
+            total_3d_height = torso_3d + thigh_3d + calf_3d
+            head_allowance = config.get("head_allowance_3d", 0.15) 
+            total_3d_height += head_allowance
+            
+            log_messages.append(f"NLF 3D-Analyse (Gemittelt) -> Torso: {torso_3d:.3f}, Bein: {thigh_3d+calf_3d:.3f}, Total: {total_3d_height:.3f}")
+        else:
+            log_messages.append("Keine NLF-Daten für 3D-Analyse geliefert oder Extraktion fehlgeschlagen.")
+
+        log_messages.append("\n=== ERGEBNIS ===")
+        log_messages.append(f"Echte Größe (aus 2D): {echte_groesse:.3f}m | fx: {fx:.2f}")
+
+        calib_data = {
+            "perspective_slope": slope,
+            "perspective_intercept": intercept,
+            "is_depth_inverted": invert_depth,
+            "norm_method": norm_method,
+            "use_pinhole_math": use_pinhole_math,
+            "focal_length_fx": fx,
+            "echte_groesse": echte_groesse,
+            "true_3d_bones": true_3d_bones,
+            "total_3d_height": total_3d_height,
+            "config": config
+        }
+        
+        return (calib_data, "\n".join(log_messages))
 
 
 
@@ -9977,6 +10174,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV29": PoseGlobalPerspectiveScalerV29,
     "NLFDataToPoseData": NLFDataToPoseData,
     "RenderNLFPosesDirect": RenderNLFPosesDirect,
+    "PoseCalibrationV17": PoseCalibrationV17,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -10037,6 +10235,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV29": "Pose Global Perspective Scaler V29 (with 3D Scale)",
     "NLFDataToPoseData": "NLF Data to 2D Pose Data",
     "RenderNLFPosesDirect": "Render NLF Poses Direct",
+    "PoseCalibrationV17": "Pose Calibration V17 (with 3D NLF Avg)",
 
 }
 
