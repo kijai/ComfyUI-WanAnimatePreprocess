@@ -9050,15 +9050,14 @@ class PoseCalibrationV15:
         return (calib_data, "\n".join(log_messages))
 
 # ======================================================================
-# V28: GLOBAL PERSPECTIVE SCALER (FULL-BODY + UNSCALED DEPTH + PINHOLE)
+# V28: GLOBAL PERSPECTIVE SCALER (FULL-BODY + PINHOLE MATH)
 # ======================================================================
 class PoseGlobalPerspectiveScalerV28:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "video_pose_scaled": ("POSEDATA", {"tooltip": "Skalierte Video-Posen (diese werden am Ende angepasst)"}),
-                "video_pose_unscaled": ("POSEDATA", {"tooltip": "Originale Video-Posen (nur als Maske für Depth-Auslesung)"}),
+                "video_pose_data": ("POSEDATA",),
                 "calibration_data": ("POSE_CALIBRATION",),
                 "video_depth_map": ("IMAGE",),
                 "include_head": ("BOOLEAN", {"default": True}),
@@ -9078,23 +9077,24 @@ class PoseGlobalPerspectiveScalerV28:
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
 
-    def process(self, video_pose_scaled, video_pose_unscaled, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method="3D_NLF", frontal_2d_threshold=0.65, frontal_3d_angle_tolerance=20.0, video_nlf_data=None):
+    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method="3D_NLF", frontal_2d_threshold=0.65, frontal_3d_angle_tolerance=20.0, video_nlf_data=None):
         import copy
         import numpy as np
         import math
         
-        pose_data_copy = copy.deepcopy(video_pose_scaled)
+        pose_data_copy = copy.deepcopy(video_pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
-        pose_metas_unscaled = video_pose_unscaled.get("pose_metas", [])
-        log_messages = ["=== V28 GLOBAL SCALER LOG (UNSCALED DEPTH + PINHOLE) ==="]
+        log_messages = ["=== V28 GLOBAL SCALER LOG (PINHOLE MATH) ==="]
 
-        if not pose_metas or not pose_metas_unscaled: return (pose_data_copy, "Fehler: Keine Pose-Daten.")
+        if not pose_metas: return (pose_data_copy, "Fehler: Keine Pose-Daten.")
         
+        # --- CALIBRATION DATEN ABRUFEN ---
         slope = calibration_data.get("perspective_slope", 0.0)
         intercept = calibration_data.get("perspective_intercept", 1.0)
         is_inverted = calibration_data.get("is_depth_inverted", False)
         norm_method = calibration_data.get("norm_method", "Dynamic Full-Body")
         
+        # Pinhole Daten
         use_pinhole_math = calibration_data.get("use_pinhole_math", False)
         fx = calibration_data.get("focal_length_fx", 512.0)
         echte_groesse = calibration_data.get("echte_groesse", 0.0)
@@ -9109,14 +9109,12 @@ class PoseGlobalPerspectiveScalerV28:
             if len(kps[idx]) >= 3: return float(kps[idx][2])
             return 1.0
 
-        def is_valid_point(kps, confs, idx, check_bounds=False):
+        def is_valid_point(kps, confs, idx):
             if kps is None or idx >= len(kps): return False
             pt = kps[idx]
             if pt is None or len(pt) < 2: return False
             if get_conf(kps, confs, idx) < min_confidence: return False
-            if check_bounds:
-                return (0 <= pt[0] < W) and (0 <= pt[1] < H)
-            return True
+            return (0 <= pt[0] < W) and (0 <= pt[1] < H)
 
         pose_input_3d = None
         if video_nlf_data is not None:
@@ -9130,30 +9128,26 @@ class PoseGlobalPerspectiveScalerV28:
         frame_data = []
         has_premium_frontal = False
         
-        for i, meta_s in enumerate(pose_metas):
-            kps_2d_s = getattr(meta_s, "kps_body", None)
-            confs_s = getattr(meta_s, "kps_body_p", None)
-            
-            meta_u = pose_metas_unscaled[i] if i < len(pose_metas_unscaled) else pose_metas_unscaled[-1]
-            kps_2d_u = getattr(meta_u, "kps_body", None)
-            confs_u = getattr(meta_u, "kps_body_p", None)
+        for i, meta in enumerate(pose_metas):
+            kps_2d = getattr(meta, "kps_body", None)
+            confs = getattr(meta, "kps_body_p", None)
             
             t_norm = 0.0
-            if is_valid_point(kps_2d_s, confs_s, 1) and is_valid_point(kps_2d_s, confs_s, 8) and is_valid_point(kps_2d_s, confs_s, 11):
-                t_norm = math.sqrt((kps_2d_s[1][0] - (kps_2d_s[8][0]+kps_2d_s[11][0])/2.0)**2 + (kps_2d_s[1][1] - (kps_2d_s[8][1]+kps_2d_s[11][1])/2.0)**2)
+            if is_valid_point(kps_2d, confs, 1) and is_valid_point(kps_2d, confs, 8) and is_valid_point(kps_2d, confs, 11):
+                t_norm = math.sqrt((kps_2d[1][0] - (kps_2d[8][0]+kps_2d[11][0])/2.0)**2 + (kps_2d[1][1] - (kps_2d[8][1]+kps_2d[11][1])/2.0)**2)
                 
-            if kps_2d_s is None or len(kps_2d_s) < 14 or t_norm == 0.0:
+            if kps_2d is None or len(kps_2d) < 14 or t_norm == 0.0:
                 frame_data.append({'valid': False})
                 body_lengths.append(0.0)
                 continue
                 
-            valid_y = [kps_2d_s[idx][1] for idx in valid_body_indices if is_valid_point(kps_2d_s, confs_s, idx)]
+            valid_y = [kps_2d[idx][1] for idx in valid_body_indices if is_valid_point(kps_2d, confs, idx)]
             length = max(valid_y) - min(valid_y) if valid_y else 0.0
             body_lengths.append(length)
 
-            has_feet = any(is_valid_point(kps_2d_s, confs_s, idx) for idx in [18, 19, 20, 21, 22, 23])
-            has_ankles = any(is_valid_point(kps_2d_s, confs_s, idx) for idx in [10, 13])
-            has_knees = any(is_valid_point(kps_2d_s, confs_s, idx) for idx in [9, 12])
+            has_feet = any(is_valid_point(kps_2d, confs, idx) for idx in [18, 19, 20, 21, 22, 23])
+            has_ankles = any(is_valid_point(kps_2d, confs, idx) for idx in [10, 13])
+            has_knees = any(is_valid_point(kps_2d, confs, idx) for idx in [9, 12])
             has_lower_body = has_feet or has_ankles or has_knees
             
             is_frontal = False
@@ -9161,8 +9155,8 @@ class PoseGlobalPerspectiveScalerV28:
             used_method_log = ""
             
             frontal_ratio_2d = 0.0
-            if is_valid_point(kps_2d_s, confs_s, 2) and is_valid_point(kps_2d_s, confs_s, 5):
-                shoulder_width = math.sqrt((kps_2d_s[2][0] - kps_2d_s[5][0])**2 + (kps_2d_s[2][1] - kps_2d_s[5][1])**2)
+            if is_valid_point(kps_2d, confs, 2) and is_valid_point(kps_2d, confs, 5):
+                shoulder_width = math.sqrt((kps_2d[2][0] - kps_2d[5][0])**2 + (kps_2d[2][1] - kps_2d[5][1])**2)
                 frontal_ratio_2d = shoulder_width / t_norm if t_norm > 0 else 0.0
 
             if frontal_method == "3D_NLF" and pose_input_3d is not None and i < len(pose_input_3d):
@@ -9207,8 +9201,7 @@ class PoseGlobalPerspectiveScalerV28:
                 
             frame_data.append({
                 'valid': True, 'has_feet': has_feet, 'has_ankles': has_ankles, 'has_knees': has_knees,
-                'is_frontal': is_frontal, 'frontal_pts': frontal_pts, 'used_method_log': used_method_log, 'length': length,
-                'kps_u': kps_2d_u, 'confs_u': confs_u, 'kps_s': kps_2d_s, 'confs_s': confs_s
+                'is_frontal': is_frontal, 'frontal_pts': frontal_pts, 'used_method_log': used_method_log, 'length': length
             })
 
         max_body_length = max(body_lengths) if body_lengths else 1.0
@@ -9234,68 +9227,50 @@ class PoseGlobalPerspectiveScalerV28:
         best_idx = int(np.argmax(frame_scores))
         if frame_scores[best_idx] < 0: return (pose_data_copy, "Fehler: Kein gültiger Frame gefunden.")
 
-        # --- SCALING BERECHNUNG ---
+        # --- SCALING ---
         start_idx = max(0, best_idx - anchor_window)
         end_idx = min(len(pose_metas) - 1, best_idx + anchor_window)
         sum_norm, sum_depth, valid_frames_in_window = 0.0, 0.0, 0
         
         for i in range(start_idx, end_idx + 1):
-            fd = frame_data[i]
-            if not fd['valid']: continue
-
-            kps_s = fd['kps_s']
-            confs_s = fd['confs_s']
-            kps_u = fd['kps_u']
-            confs_u = fd['confs_u']
+            kps = getattr(pose_metas[i], "kps_body", None)
+            confs = getattr(pose_metas[i], "kps_body_p", None)
             
             norm_val = 0.0
-            # NORM AUS SCALED BERECHNEN
+            valid_x, valid_y = [], []
+
             if norm_method == "Torso (Neck-Hip)":
-                if is_valid_point(kps_s, confs_s, 1) and is_valid_point(kps_s, confs_s, 8) and is_valid_point(kps_s, confs_s, 11):
-                    norm_val = math.sqrt((kps_s[1][0] - (kps_s[8][0]+kps_s[11][0])/2.0)**2 + (kps_s[1][1] - (kps_s[8][1]+kps_s[11][1])/2.0)**2)
+                if is_valid_point(kps, confs, 1) and is_valid_point(kps, confs, 8) and is_valid_point(kps, confs, 11):
+                    norm_val = math.sqrt((kps[1][0] - (kps[8][0]+kps[11][0])/2.0)**2 + (kps[1][1] - (kps[8][1]+kps[11][1])/2.0)**2)
+                    valid_x.extend([kps[1][0], kps[8][0], kps[11][0]])
+                    valid_y.extend([kps[1][1], kps[8][1], kps[11][1]])
             else:
                 top_y, bottom_y = None, None
-                if is_valid_point(kps_s, confs_s, 0): top_y = kps_s[0][1]
-                elif is_valid_point(kps_s, confs_s, 1): top_y = kps_s[1][1]
+                if is_valid_point(kps, confs, 0): top_y = kps[0][1]; valid_x.append(kps[0][0]); valid_y.append(kps[0][1])
+                elif is_valid_point(kps, confs, 1): top_y = kps[1][1]; valid_x.append(kps[1][0]); valid_y.append(kps[1][1])
 
-                heels = [idx for idx in [10, 13, 21, 24] if is_valid_point(kps_s, confs_s, idx)]
-                knees = [idx for idx in [9, 12] if is_valid_point(kps_s, confs_s, idx)]
-                hips = [idx for idx in [8, 11] if is_valid_point(kps_s, confs_s, idx)]
+                heels = [idx for idx in [10, 13, 21, 24] if is_valid_point(kps, confs, idx)]
+                knees = [idx for idx in [9, 12] if is_valid_point(kps, confs, idx)]
+                hips = [idx for idx in [8, 11] if is_valid_point(kps, confs, idx)]
 
-                if heels: bottom_y = max([kps_s[idx][1] for idx in heels])
-                elif knees: bottom_y = max([kps_s[idx][1] for idx in knees])
-                elif hips: bottom_y = max([kps_s[idx][1] for idx in hips])
+                if heels:
+                    bottom_y = max([kps[idx][1] for idx in heels])
+                    for idx in heels: valid_x.append(kps[idx][0]); valid_y.append(kps[idx][1])
+                elif knees:
+                    bottom_y = max([kps[idx][1] for idx in knees])
+                    for idx in knees: valid_x.append(kps[idx][0]); valid_y.append(kps[idx][1])
+                elif hips:
+                    bottom_y = max([kps[idx][1] for idx in hips])
+                    for idx in hips: valid_x.append(kps[idx][0]); valid_y.append(kps[idx][1])
 
                 if top_y is not None and bottom_y is not None and bottom_y > top_y:
                     norm_val = bottom_y - top_y
 
             if norm_val == 0.0: continue
 
-            # TIEFE AUS UNSCALED BERECHNEN
             depth_vals = []
             v_idx = min(i, depth_np.shape[0] - 1)
-            
-            unscaled_x, unscaled_y = [], []
-            if norm_method == "Torso (Neck-Hip)":
-                if is_valid_point(kps_u, confs_u, 1, True) and is_valid_point(kps_u, confs_u, 8, True) and is_valid_point(kps_u, confs_u, 11, True):
-                    unscaled_x.extend([kps_u[1][0], kps_u[8][0], kps_u[11][0]])
-                    unscaled_y.extend([kps_u[1][1], kps_u[8][1], kps_u[11][1]])
-            else:
-                if is_valid_point(kps_u, confs_u, 0, True): unscaled_x.append(kps_u[0][0]); unscaled_y.append(kps_u[0][1])
-                elif is_valid_point(kps_u, confs_u, 1, True): unscaled_x.append(kps_u[1][0]); unscaled_y.append(kps_u[1][1])
-
-                heels_u = [idx for idx in [10, 13, 21, 24] if is_valid_point(kps_u, confs_u, idx, True)]
-                knees_u = [idx for idx in [9, 12] if is_valid_point(kps_u, confs_u, idx, True)]
-                hips_u = [idx for idx in [8, 11] if is_valid_point(kps_u, confs_u, idx, True)]
-
-                if heels_u:
-                    for idx in heels_u: unscaled_x.append(kps_u[idx][0]); unscaled_y.append(kps_u[idx][1])
-                elif knees_u:
-                    for idx in knees_u: unscaled_x.append(kps_u[idx][0]); unscaled_y.append(kps_u[idx][1])
-                elif hips_u:
-                    for idx in hips_u: unscaled_x.append(kps_u[idx][0]); unscaled_y.append(kps_u[idx][1])
-
-            for px, py in zip(unscaled_x, unscaled_y):
+            for px, py in zip(valid_x, valid_y):
                 ix, iy = int(px), int(py)
                 if 0 <= ix < W and 0 <= iy < H:
                     depth_vals.append(depth_np[v_idx, iy, ix])
@@ -9312,13 +9287,13 @@ class PoseGlobalPerspectiveScalerV28:
 
         avg_anchor_norm = sum_norm / valid_frames_in_window
         avg_anchor_depth = sum_depth / valid_frames_in_window
-
+        
         log_messages.append(f"\n--- SKALIERUNG RECHENVORGANG ---")
         log_messages.append(f"Gewinner Frame: {best_idx}")
-        log_messages.append(f"Ist-Norm (Video via SCALED): {avg_anchor_norm:.1f} px")
-        log_messages.append(f"Ist-Tiefe (Video via UNSCALED): {avg_anchor_depth:.3f} m")
+        log_messages.append(f"Ist-Norm (Video): {avg_anchor_norm:.1f} px")
+        log_messages.append(f"Ist-Tiefe (Video): {avg_anchor_depth:.3f} m")
 
-        # NEUE FORMEL ODER FALLBACK
+        # --- DIE NEUE PINHOLE ODER LINEARE RECHNUNG ---
         if use_pinhole_math and echte_groesse > 0.0:
             log_messages.append("\n--> PINHOLE SKALIERUNG AKTIV")
             expected_norm = (echte_groesse * fx) / avg_anchor_depth
@@ -9332,16 +9307,16 @@ class PoseGlobalPerspectiveScalerV28:
         
         log_messages.append(f"\nFaktor = Soll-Norm / Ist-Norm")
         log_messages.append(f"Faktor = {expected_norm:.1f} / {avg_anchor_norm:.1f} = {anchor_scale:.3f}x")
+        
         log_messages.append(f"\n=== ERGEBNIS ===")
         log_messages.append(f"FESTER SKALIERUNGSFAKTOR FÜR GANZES VIDEO: {anchor_scale:.3f}x\n")
 
-        # Keypoints anpassen (auf die SCALED Posen anwenden)
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
             confs = getattr(meta, "kps_body_p", None)
             
-            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx, False)]
-            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx, False)]
+            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
                     
             if not valid_y or not valid_x: continue
             pivot_y, pivot_x = max(valid_y), np.mean(valid_x)
@@ -9354,9 +9329,8 @@ class PoseGlobalPerspectiveScalerV28:
                             arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * anchor_scale
                             arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * anchor_scale
                             
-        log_messages.append("Erfolgreich: Skalierung auf alle Frames angewandt.")
+        log_messages.append("Erfolgreich: Skalierung angewandt.")
         return (pose_data_copy, "\n".join(log_messages))
-
 
 
 NODE_CLASS_MAPPINGS = {
