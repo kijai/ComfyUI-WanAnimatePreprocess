@@ -10339,7 +10339,7 @@ class PoseCalibrationV18:
 
 
 # ======================================================================
-# 2. PoseGlobalPerspectiveScalerV30 (Versteht die reparierte 3D Config)
+# 2. PoseGlobalPerspectiveScalerV30 (Bugfix: Robuste NLF-Listen-Skalierung)
 # ======================================================================
 class PoseGlobalPerspectiveScalerV30:
     @classmethod
@@ -10367,6 +10367,11 @@ class PoseGlobalPerspectiveScalerV30:
     CATEGORY = "WanAnimatePreprocess/Ultimate"
 
     def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method="3D_NLF", frontal_2d_threshold=0.65, frontal_3d_angle_tolerance=20.0, video_nlf_data=None):
+        import copy
+        import numpy as np
+        import math
+        import torch
+
         pose_data_copy = copy.deepcopy(video_pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
         log_messages = ["=== V30 GLOBAL SCALER LOG ==="]
@@ -10530,19 +10535,31 @@ class PoseGlobalPerspectiveScalerV30:
                             arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * anchor_scale
                             arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * anchor_scale
 
-        # --- 3D NLF DATEN SKALIEREN & FÜSSE ANKNÜPFEN ---
+        # --- 3D NLF DATEN ROBUST SKALIEREN & FÜSSE ANKNÜPFEN ---
         nlf_data_scaled = None
         if video_nlf_data is not None:
             try:
-                is_dict = isinstance(video_nlf_data, dict)
-                pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0].clone() if is_dict else video_nlf_data.clone()
+                # Nutze deepcopy statt clone(), da es eine reine Python-Liste sein kann
+                nlf_data_scaled = copy.deepcopy(video_nlf_data)
+                is_dict = isinstance(nlf_data_scaled, dict)
+                pose_input_3d = nlf_data_scaled.get('joints3d_nonparam', [nlf_data_scaled])[0] if is_dict else nlf_data_scaled
                 
                 for frame_idx in range(len(pose_input_3d)):
                     if pose_input_3d[frame_idx] is None or len(pose_input_3d[frame_idx]) == 0:
                         continue
                     
-                    # 1. NLF komplett mit Anchor Scale multiplizieren (exakt gleiches Verhältnis wie 2D)
-                    pose_input_3d[frame_idx] *= anchor_scale
+                    # 1. NLF mit Anchor Scale multiplizieren (Liste oder Tensor robust handhaben)
+                    if isinstance(pose_input_3d[frame_idx], list):
+                        for i in range(len(pose_input_3d[frame_idx])):
+                            pose_input_3d[frame_idx][i] *= anchor_scale
+                        frame_data_ref = pose_input_3d[frame_idx][0]
+                    else:
+                        pose_input_3d[frame_idx] *= anchor_scale
+                        frame_data_ref = pose_input_3d[frame_idx][0] if len(pose_input_3d[frame_idx]) > 0 else pose_input_3d[frame_idx]
+
+                    # Daten für Tensorerstellung ermitteln (damit es nicht abstürzt)
+                    device_ref = frame_data_ref.device if hasattr(frame_data_ref, 'device') else torch.device('cpu')
+                    dtype_ref = frame_data_ref.dtype if hasattr(frame_data_ref, 'dtype') else torch.float32
                     
                     # 2. Füße aus den 2D Daten holen
                     if frame_idx < len(pose_metas):
@@ -10553,48 +10570,28 @@ class PoseGlobalPerspectiveScalerV30:
                         if len(kps_2d) > 20: 
                             # Linker Zeh (Index 18)
                             if (kps_2d[18][2] if len(kps_2d[18])>2 else 1) > min_confidence:
-                                z_left_ankle = pose_input_3d[frame_idx][0][13][2] if len(pose_input_3d[frame_idx][0]) > 13 else 0.0
+                                z_left_ankle = frame_data_ref[13][2] if len(frame_data_ref) > 13 else 0.0
                                 extra_feet.append([kps_2d[18][0], kps_2d[18][1], float(z_left_ankle)])
                             
                             # Rechter Zeh (Index 19)
                             if (kps_2d[19][2] if len(kps_2d[19])>2 else 1) > min_confidence:
-                                z_right_ankle = pose_input_3d[frame_idx][0][10][2] if len(pose_input_3d[frame_idx][0]) > 10 else 0.0
+                                z_right_ankle = frame_data_ref[10][2] if len(frame_data_ref) > 10 else 0.0
                                 extra_feet.append([kps_2d[19][0], kps_2d[19][1], float(z_right_ankle)])
                         
                         # Neue Füße ans 3D Array dranhängen
                         if extra_feet:
-                            feet_tensor = torch.tensor(extra_feet, dtype=pose_input_3d[frame_idx].dtype, device=pose_input_3d[frame_idx].device).unsqueeze(0)
-                            pose_input_3d[frame_idx] = torch.cat((pose_input_3d[frame_idx], feet_tensor), dim=1)
+                            feet_tensor = torch.tensor(extra_feet, dtype=dtype_ref, device=device_ref).unsqueeze(0)
+                            if isinstance(pose_input_3d[frame_idx], list):
+                                pose_input_3d[frame_idx][0] = torch.cat((pose_input_3d[frame_idx][0], feet_tensor), dim=1)
+                            else:
+                                pose_input_3d[frame_idx] = torch.cat((pose_input_3d[frame_idx], feet_tensor), dim=1)
 
-                if is_dict:
-                    nlf_data_scaled = copy.deepcopy(video_nlf_data)
-                    nlf_data_scaled['joints3d_nonparam'] = [pose_input_3d]
-                else:
-                    nlf_data_scaled = pose_input_3d
-                    
-                log_messages.append(f"Erfolgreich: 3D NLF Daten skaliert und Füße angeknüpft.")
+                log_messages.append(f"Erfolgreich: 3D NLF Daten fehlerfrei skaliert und Füße angeknüpft.")
             except Exception as e:
                 log_messages.append(f"Fehler bei der NLF 3D-Skalierung: {e}")
                 nlf_data_scaled = video_nlf_data
 
         return (pose_data_copy, "\n".join(log_messages), nlf_data_scaled)
-
-
-# ======================================================================
-# Vergiss nicht, die Mappings unten in deiner nodes.py anzupassen:
-# ======================================================================
-#
-# NODE_CLASS_MAPPINGS = {
-#     "PoseCalibrationV18": PoseCalibrationV18,
-#     "PoseGlobalPerspectiveScalerV30": PoseGlobalPerspectiveScalerV30,
-#     # ... (Hier stehen auch noch NLFDataToPoseData und RenderNLFPosesDirect, falls du sie nutzt)
-# }
-#
-# NODE_DISPLAY_NAME_MAPPINGS = {
-#     "PoseCalibrationV18": "Pose Calibration V18 (Smart Calf)",
-#     "PoseGlobalPerspectiveScalerV30": "Pose Global Perspective Scaler V30",
-#     # ... 
-# }
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
