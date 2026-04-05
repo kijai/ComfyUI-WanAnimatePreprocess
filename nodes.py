@@ -10593,8 +10593,9 @@ class PoseGlobalPerspectiveScalerV30:
 
         return (pose_data_copy, "\n".join(log_messages), nlf_data_scaled)
 
+
 # ======================================================================
-# 2. PoseGlobalPerspectiveScalerV31 (Mit extremem Logging & Fix für 3D-Skalierung)
+# 2. PoseGlobalPerspectiveScalerV31 (Fix: 3D Pivot Scaling & Neue Listen-Architektur)
 # ======================================================================
 class PoseGlobalPerspectiveScalerV31:
     @classmethod
@@ -10635,6 +10636,7 @@ class PoseGlobalPerspectiveScalerV31:
         if not pose_metas:
             return (pose_data_copy, "Fehler: Keine Pose-Daten.", video_nlf_data)
 
+        # --- V30 Lese Logik für reparierte 3D-Längen ---
         true_3d_bones = calibration_data.get("true_3d_bones", {})
         if "calf" in true_3d_bones:
             log_messages.append(f"V30 hat die reparierten 3D-Längen aus V18 erfolgreich verstanden.")
@@ -10667,8 +10669,7 @@ class PoseGlobalPerspectiveScalerV31:
                 shoulder_w = abs(kps[2][0] - kps[5][0])
                 hip_w = abs(kps[8][0] - kps[11][0])
                 if hip_w > 0:
-                    ratio = shoulder_w / hip_w
-                    return ratio > frontal_2d_threshold
+                    return (shoulder_w / hip_w) > frontal_2d_threshold
             return False
 
         def is_frontal_3d(frame_idx):
@@ -10678,16 +10679,12 @@ class PoseGlobalPerspectiveScalerV31:
                 return False
             pose_3d = pose_input_3d[frame_idx][0]
             if len(pose_3d) > 11:
-                l_hip = pose_3d[11]
-                r_hip = pose_3d[8]
-                dz = abs(l_hip[2] - r_hip[2])
-                dx = abs(l_hip[0] - r_hip[0])
-                angle = math.degrees(math.atan2(dz, dx)) if dx > 0 else 90.0
-                return angle < frontal_3d_angle_tolerance
+                l_hip, r_hip = pose_3d[11], pose_3d[8]
+                dz, dx = abs(l_hip[2] - r_hip[2]), abs(l_hip[0] - r_hip[0])
+                return (math.degrees(math.atan2(dz, dx)) if dx > 0 else 90.0) < frontal_3d_angle_tolerance
             return False
 
-        best_idx = 0
-        best_area = 0.0
+        best_idx, best_area = 0, 0.0
 
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
@@ -10696,26 +10693,16 @@ class PoseGlobalPerspectiveScalerV31:
             valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
             
             if not valid_y or not valid_x: continue
-            
-            is_front = False
-            if frontal_method == "3D_NLF" and video_nlf_data is not None:
-                is_front = is_frontal_3d(i)
-            else:
-                is_front = is_frontal_2d(meta)
-                
-            if not is_front: continue
+            if not (is_frontal_3d(i) if frontal_method == "3D_NLF" and video_nlf_data is not None else is_frontal_2d(meta)): continue
             
             area = (max(valid_x) - min(valid_x)) * (max(valid_y) - min(valid_y))
             if area > best_area:
-                best_area = area
-                best_idx = i
+                best_area, best_idx = area, i
 
         start_idx = max(0, best_idx - anchor_window)
         end_idx = min(len(pose_metas), best_idx + anchor_window + 1)
 
-        sum_norm = 0.0
-        sum_depth = 0.0
-        valid_frames_in_window = 0
+        sum_norm, sum_depth, valid_frames_in_window = 0.0, 0.0, 0
 
         for i in range(start_idx, end_idx):
             meta = pose_metas[i]
@@ -10740,12 +10727,7 @@ class PoseGlobalPerspectiveScalerV31:
             valid_x_d = [kps[idx][0] * W for idx in [1,8,11] if is_valid_point(kps, confs, idx)]
             valid_y_d = [kps[idx][1] * H for idx in [1,8,11] if is_valid_point(kps, confs, idx)]
             
-            depth_vals = []
-            for px, py in zip(valid_x_d, valid_y_d):
-                ix, iy = int(px), int(py)
-                if 0 <= ix < W and 0 <= iy < H:
-                    depth_vals.append(depth_np[v_idx, iy, ix])
-                    
+            depth_vals = [depth_np[v_idx, int(py), int(px)] for px, py in zip(valid_x_d, valid_y_d) if 0 <= int(px) < W and 0 <= int(py) < H]
             frame_depth = float(np.mean(depth_vals)) if depth_vals else 0.5
             if is_inverted: frame_depth = 1.0 / max(frame_depth, 0.0001)
 
@@ -10765,7 +10747,6 @@ class PoseGlobalPerspectiveScalerV31:
             expected_norm = (avg_anchor_depth * slope) + intercept
 
         anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
-
         log_messages.append(f"\nSkalierungs-Faktor = {expected_norm:.1f} / {avg_anchor_norm:.1f} = {anchor_scale:.3f}x")
 
         # 1. 2D Daten Skalieren
@@ -10775,7 +10756,6 @@ class PoseGlobalPerspectiveScalerV31:
             
             valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
             valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
-            
             if not valid_y or not valid_x: continue
             
             pivot_y, pivot_x = max(valid_y), np.mean(valid_x)
@@ -10788,110 +10768,81 @@ class PoseGlobalPerspectiveScalerV31:
                             arr[j][0] = pivot_x + (arr[j][0] - pivot_x) * anchor_scale
                             arr[j][1] = pivot_y + (arr[j][1] - pivot_y) * anchor_scale
 
-        # --- 3D NLF DATEN ROBUST SKALIEREN & FÜSSE ANKNÜPFEN ---
+        # --- 3D NLF DATEN ROBUST SKALIEREN (Mitte-Schwerpunkt-Methode) ---
         nlf_data_scaled = None
         log_messages.append("\n=== NLF 3D DATA SCALING DETAILED LOG ===")
+        log_messages.append("URSACHE GEFUNDEN: Das Projektions-Paradoxon! Skaliere nun um den 3D-Pivotpunkt der Füße, damit die Projektion tatsächlich wächst.")
+        
         if video_nlf_data is not None:
             try:
                 nlf_data_scaled = copy.deepcopy(video_nlf_data)
                 is_dict = isinstance(nlf_data_scaled, dict)
-                log_messages.append(f"NLF-Eingabetyp: {type(video_nlf_data)}")
                 
-                # Finde alle Keys, die Skalierung benötigen
-                keys_to_scale = []
-                if is_dict:
-                    log_messages.append(f"Gefundene Dictionary-Keys: {list(nlf_data_scaled.keys())}")
-                    keys_to_scale = [k for k in ['joints3d_nonparam', 'joints3d', 'joints', 'kps3d'] if k in nlf_data_scaled]
-                    log_messages.append(f"Skaliere folgende 3D-Keys: {keys_to_scale}")
-                else:
-                    keys_to_scale = [None] # Dummy-Key für direkte Listen/Tensoren
-                    log_messages.append("NLF Daten sind kein Dict, versuche direkte Skalierung.")
-
+                keys_to_scale = [k for k in ['joints3d_nonparam', 'joints3d', 'joints', 'kps3d'] if k in nlf_data_scaled] if is_dict else [None]
                 skalierte_frames_gesamt = 0
 
                 for key in keys_to_scale:
-                    if key is not None:
-                        target_list = nlf_data_scaled[key][0]
-                    else:
-                        target_list = nlf_data_scaled
-
-                    if target_list is None or len(target_list) == 0:
-                        continue
+                    target_list = nlf_data_scaled[key][0] if key is not None else nlf_data_scaled
+                    if target_list is None or len(target_list) == 0: continue
                         
                     log_messages.append(f"Verarbeite Key '{key}' mit {len(target_list)} Frames.")
+                    new_target_list = [] # Komplett neue Liste erzwingt Speicher-Aktualisierung
 
                     for frame_idx in range(len(target_list)):
                         frame_data = target_list[frame_idx]
                         if frame_data is None or len(frame_data) == 0:
+                            new_target_list.append(frame_data)
                             continue
                             
-                        is_tensor = isinstance(frame_data, torch.Tensor)
-                        
-                        # --- VORHER WERT MESSEN ---
-                        if is_tensor and frame_idx == 0:
-                            val_before = float(frame_data.flatten()[0])
-                            log_messages.append(f"Frame 0 ({key}) Check -> X-Wert VORHER: {val_before:.4f}")
-                        
-                        # --- EXAKTE SKALIERUNG (Neue Instanz erzwingen!) ---
-                        if is_tensor:
-                            scaled_frame = frame_data * anchor_scale
-                        elif isinstance(frame_data, list):
-                            scaled_frame = [item * anchor_scale if isinstance(item, torch.Tensor) else item for item in frame_data]
-                        else:
-                            scaled_frame = frame_data
+                        if isinstance(frame_data, torch.Tensor):
+                            dim = frame_data.dim()
+                            pts = frame_data[0] if dim == 3 else frame_data
                             
-                        # --- NACHHER WERT MESSEN ---
-                        if is_tensor and frame_idx == 0:
-                            val_after = float(scaled_frame.flatten()[0])
-                            log_messages.append(f"Frame 0 ({key}) Check -> X-Wert NACHHER: {val_after:.4f}")
-                        
-                        # --- FÜSSE ANKNÜPFEN ---
-                        if is_tensor:
-                            dim = scaled_frame.dim()
-                            # Sicherstellen, ob Shape [1, J, 3] oder [J, 3] ist
-                            j_data = scaled_frame[0] if dim == 3 else scaled_frame
+                            if len(pts) > 0:
+                                # PIVOT FINDEN (X-Mitte, Y-Füße, Z-Mitte)
+                                pivot_x = pts[:, 0].mean()
+                                pivot_y = pts[:, 1].max() # Max Y ist im Bildbereich meist unten (Füße)
+                                pivot_z = pts[:, 2].mean()
                                 
-                            if len(j_data) > 10 and frame_idx < len(pose_metas):
-                                meta = pose_metas[frame_idx]
-                                kps_2d = getattr(meta, "kps_body", [])
-                                extra_feet = []
+                                pivot_3d = torch.tensor([pivot_x, pivot_y, pivot_z], dtype=pts.dtype, device=pts.device)
                                 
-                                if len(kps_2d) > 20: 
-                                    if (kps_2d[18][2] if len(kps_2d[18])>2 else 1) > min_confidence:
-                                        z_left = float(j_data[13][2]) if len(j_data) > 13 else 0.0
-                                        extra_feet.append([kps_2d[18][0], kps_2d[18][1], z_left])
+                                # RELATIVE SKALIERUNG: Distanz zum Pivot * anchor_scale
+                                scaled_frame = pivot_3d + (frame_data - pivot_3d) * anchor_scale
+                                
+                                if frame_idx == 0:
+                                    log_messages.append(f"Frame 0 Pivot-Z: {pivot_z:.4f}")
+                                    log_messages.append(f"Frame 0 (Zentriert) -> Y-Wert vorher: {float(pts[1][1]):.4f} | nachher: {float((scaled_frame[0] if dim==3 else scaled_frame)[1][1]):.4f}")
                                     
-                                    if (kps_2d[19][2] if len(kps_2d[19])>2 else 1) > min_confidence:
-                                        z_right = float(j_data[10][2]) if len(j_data) > 10 else 0.0
-                                        extra_feet.append([kps_2d[19][0], kps_2d[19][1], z_right])
-                                        
-                                if extra_feet:
-                                    feet_t = torch.tensor(extra_feet, dtype=scaled_frame.dtype, device=scaled_frame.device)
-                                    if dim == 3:
-                                        feet_t = feet_t.unsqueeze(0) # Forme auf [1, 2, 3]
-                                        scaled_frame = torch.cat((scaled_frame, feet_t), dim=1)
-                                    elif dim == 2:
-                                        scaled_frame = torch.cat((scaled_frame, feet_t), dim=0)
-                                        
-                                    if frame_idx == 0:
-                                        log_messages.append(f"Frame 0: Füße erfolgreich mit Shape {feet_t.shape} angebaut.")
+                                # FÜSSE ANKNÜPFEN (Rein in 3D berechnet, ohne 2D Pixel zu vermischen)
+                                if len(pts) > 13:
+                                    r_ankle = scaled_frame[0][10] if dim == 3 else scaled_frame[10]
+                                    l_ankle = scaled_frame[0][13] if dim == 3 else scaled_frame[13]
+                                    
+                                    # Virtuelle Zehen (leicht nach unten und vorne)
+                                    r_toe, l_toe = r_ankle.clone(), l_ankle.clone()
+                                    r_toe[1] += 0.05 * anchor_scale; r_toe[2] -= 0.10 * anchor_scale
+                                    l_toe[1] += 0.05 * anchor_scale; l_toe[2] -= 0.10 * anchor_scale
+                                    
+                                    feet_t = torch.tensor([l_toe.tolist(), r_toe.tolist()], dtype=scaled_frame.dtype, device=scaled_frame.device)
+                                    scaled_frame = torch.cat((scaled_frame, feet_t.unsqueeze(0)), dim=1) if dim == 3 else torch.cat((scaled_frame, feet_t), dim=0)
 
-                        # --- LISTE EXPLIZIT ÜBERSCHREIBEN ---
-                        target_list[frame_idx] = scaled_frame
-                        skalierte_frames_gesamt += 1
-
-                    # --- DICT EXPLIZIT ÜBERSCHREIBEN ---
+                                new_target_list.append(scaled_frame)
+                                skalierte_frames_gesamt += 1
+                            else:
+                                new_target_list.append(frame_data.clone())
+                        else:
+                            new_target_list.append(frame_data)
+                            
+                    # Liste direkt im Dictionary überschreiben
                     if key is not None:
-                        nlf_data_scaled[key][0] = target_list
+                        nlf_data_scaled[key][0] = new_target_list
 
-                log_messages.append(f"ERFOLG: Insgesamt wurden {skalierte_frames_gesamt} 3D-Frames tiefenskalierend überschrieben.")
+                log_messages.append(f"ERFOLG: Insgesamt wurden {skalierte_frames_gesamt} 3D-Frames tiefenskalierend überschrieben (Pivot-Methode).")
 
             except Exception as e:
                 log_messages.append(f"KRITISCHER FEHLER BEI NLF SKALIERUNG: {e}")
-                log_messages.append("--- TRACEBACK ---")
                 log_messages.append(traceback.format_exc())
-                log_messages.append("-----------------")
-                nlf_data_scaled = video_nlf_data # Fallback zu unskalierten Daten
+                nlf_data_scaled = video_nlf_data
 
         return (pose_data_copy, "\n".join(log_messages), nlf_data_scaled)
 
