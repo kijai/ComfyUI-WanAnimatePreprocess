@@ -9094,7 +9094,7 @@ class PoseGlobalPerspectiveScalerV28:
         is_inverted = calibration_data.get("is_depth_inverted", False)
         norm_method = calibration_data.get("norm_method", "Dynamic Full-Body")
         
-        # NEU: Pinhole Daten
+        # NEU: Pinhole Daten abrufen
         use_pinhole_math = calibration_data.get("use_pinhole_math", False)
         fx = calibration_data.get("focal_length_fx", 512.0)
         echte_groesse = calibration_data.get("echte_groesse", 0.0)
