@@ -12411,10 +12411,7 @@ class RenderNLFPosesDirect3:
             return (empty_img, empty_mask, "\n".join(log_messages))
 
 
-# ======================================================================
-# 3. RenderNLFPosesDirect (Bugfix: Absolute vs. Normalisierte Pixel)
-# ======================================================================
-class RenderNLFPosesDirect:
+class RenderNLFPosesDirect4:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -12434,7 +12431,7 @@ class RenderNLFPosesDirect:
     RETURN_NAMES = ("image", "mask", "log_output")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Rendert NLF-Daten und wendet smarte Kamera-Zooms an."
+    DESCRIPTION = "V4: Rendert NLF-Daten mit smarten Kamera-Zooms UND skaliert das 3D-Volumen, um überdicke Zylinder zu verhindern."
 
     def process(self, nlf_poses, width, height, render_backend="taichi", dw_poses_fallback=None, nlf_render_config="{}"):
         import copy
@@ -12443,8 +12440,8 @@ class RenderNLFPosesDirect:
         import numpy as np
         import traceback
         from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
-        
-        log_messages = ["=== RENDER NLF POSES DIRECT LOG ==="]
+
+        log_messages = ["=== RENDER NLF POSES DIRECT V4 LOG ==="]
 
         if render_backend == "taichi":
             try:
@@ -12460,7 +12457,7 @@ class RenderNLFPosesDirect:
         try:
             pose_input = nlf_poses['joints3d_nonparam'][0] if isinstance(nlf_poses, dict) else nlf_poses
             dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
-            
+
             if len(pose_input) > 0 and pose_input[0] is not None:
                 log_messages.append(f"Erfolgreich geladen: {len(pose_input)} Frames.")
             else:
@@ -12469,20 +12466,30 @@ class RenderNLFPosesDirect:
             # 1. Standard Kamera Matrix erstellen
             intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
             log_messages.append(f"\nOriginal Intrinsic Matrix:\n{intrinsic_matrix.round(2)}")
-            
+
+            # Pose Clone für In-Place Modifikationen (verhindert, dass wir die globalen Daten zerstören)
+            pose_input_cloned = []
+            if pose_input is not None:
+                for frame in pose_input:
+                    if frame is not None:
+                        pose_input_cloned.append(frame.clone())
+                    else:
+                        pose_input_cloned.append(None)
+            pose_input = pose_input_cloned
+
             # 2. DEN KLUGEN KAMERA ZOOM ANWENDEN (aus Config)
             try:
                 config = json.loads(nlf_render_config)
                 log_messages.append(f"\nEmpfangene Config: {config}")
-                
+
                 if "anchor_scale" in config:
                     scale_y = float(config["anchor_scale"])
                     scale_x = float(config.get("scale_x_factor", scale_y))
-                    
+
                     # Pivot-Punkte auslesen
                     p_x = float(config["pivot_x"])
                     p_y = float(config["pivot_y"])
-                    
+
                     # BUGFIX: Prüfen ob Werte normalisiert (0.0 - 1.0) oder bereits absolute Pixel sind!
                     if p_x <= 2.0 and p_y <= 2.0:
                         p_x = p_x * width
@@ -12490,23 +12497,39 @@ class RenderNLFPosesDirect:
                         log_messages.append("Info: Pivot-Werte waren normalisiert, in Pixel umgerechnet.")
                     else:
                         log_messages.append("Info: Pivot-Werte sind bereits absolute Pixel (Keine Multiplikation nötig).")
-                    
+
                     log_messages.append(f"Kamera Zoom X: {scale_x:.3f} | Zoom Y: {scale_y:.3f}")
                     log_messages.append(f"Kamera Fokus-Punkt (Pixel): X={p_x:.1f}, Y={p_y:.1f}")
+
+                    # ==========================================================
+                    # NEUER FIX FÜR DAS ZYLINDER-DICKEN-PROBLEM (V4):
+                    # ==========================================================
+                    # Wenn wir nur den Kamera-Zoom (focal length) erhöhen, projiziert die Kamera 
+                    # die 3D-Zylinder viel dicker, weil das Objekt im 3D-Raum am selben Platz bleibt.
+                    # Lösung: Wir skalieren das physische 3D-Skelett um den Faktor 'scale_y'. 
+                    # Dadurch rutscht es im Z-Raum weiter weg, was die Zylinder relativ zur Kamera 
+                    # wieder dünner macht! Der Kamera-Zoom gleicht die Entfernung dann auf 2D-Pixelebene
+                    # wieder exakt aus. Die 3D-Volumina und die Dicke sind gerettet!
+                    for frame_idx in range(len(pose_input)):
+                        if pose_input[frame_idx] is not None:
+                            pose_input[frame_idx] = pose_input[frame_idx] * scale_y
                     
+                    log_messages.append(f"ERFOLG: 3D-Volumen und Z-Tiefe wurden um {scale_y:.3f}x skaliert, um übergroße Zylinder zu verhindern!")
+
                     cx_alt = intrinsic_matrix[0, 2]
                     cy_alt = intrinsic_matrix[1, 2]
-                    
+
                     # KAMERA MAGIE: Wir verändern die Brennweite (Zoom) und verschieben die Linse!
-                    intrinsic_matrix[0, 0] *= scale_x  
-                    intrinsic_matrix[1, 1] *= scale_y  
-                    intrinsic_matrix[0, 2] = cx_alt * scale_x + p_x * (1.0 - scale_x) 
-                    intrinsic_matrix[1, 2] = cy_alt * scale_y + p_y * (1.0 - scale_y) 
-                    
+                    intrinsic_matrix[0, 0] *= scale_x
+                    intrinsic_matrix[1, 1] *= scale_y
+                    intrinsic_matrix[0, 2] = cx_alt * scale_x + p_x * (1.0 - scale_x)
+                    intrinsic_matrix[1, 2] = cy_alt * scale_y + p_y * (1.0 - scale_y)
+
                     log_messages.append(f"Center X verschoben: {cx_alt:.1f} -> {intrinsic_matrix[0, 2]:.1f}")
                     log_messages.append(f"Center Y verschoben: {cy_alt:.1f} -> {intrinsic_matrix[1, 2]:.1f}")
                 else:
                     log_messages.append("Kein 'anchor_scale' in Config. Rendere in Standard-Größe.")
+
             except Exception as e:
                 log_messages.append(f"Fehler beim Lesen der Config (Rendere Standard): {e}")
 
@@ -12527,7 +12550,7 @@ class RenderNLFPosesDirect:
             # Prüfe auf schwarze Bilder
             black_frames = 0
             for frame in frames_np:
-                if np.max(frame) < 5: 
+                if np.max(frame) < 5:
                     black_frames += 1
             
             if black_frames > 0:
@@ -12537,7 +12560,7 @@ class RenderNLFPosesDirect:
 
             frames_tensor = torch.from_numpy(np.stack(frames_np, axis=0)).contiguous() / 255.0
             frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
-            
+
             return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages))
 
         except Exception as e:
