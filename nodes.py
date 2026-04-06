@@ -11970,8 +11970,250 @@ class PoseGlobalPerspectiveScalerV37:
 
         return (pose_data_copy, "\n".join(log_messages), nlf_data_scaled)
 
-# MAPPINGS
-# "PoseGlobalPerspectiveScalerV37": PoseGlobalPerspectiveScalerV37,
+# ======================================================================
+# 2. PoseGlobalPerspectiveScalerV38 (Der geniale Architektur-Fix)
+# ======================================================================
+class PoseGlobalPerspectiveScalerV38:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_depth_map": ("IMAGE",),
+                "include_head": ("BOOLEAN", {"default": True}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "frontal_method": (["3D_NLF", "2D_Ratio"], {"default": "3D_NLF"}),
+                "frontal_2d_threshold": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 90.0, "step": 1.0}),
+                "scale_2d_axes": (["X and Y (Uniform)", "Only Y (Height)"], {"default": "X and Y (Uniform)"}),
+            },
+            "optional": {
+                "video_nlf_data": ("NLFPRED",),
+            }
+        }
+
+    # NEU: Wir geben einen neuen STRING namens nlf_render_config aus!
+    RETURN_TYPES = ("POSEDATA", "STRING", "NLFPRED", "STRING")
+    RETURN_NAMES = ("scaled_pose_data", "log_output", "nlf_data", "nlf_render_config")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+
+    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method="3D_NLF", frontal_2d_threshold=0.65, frontal_3d_angle_tolerance=20.0, scale_2d_axes="X and Y (Uniform)", video_nlf_data=None):
+        import copy
+        import numpy as np
+        import math
+        import json
+
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        log_messages = ["=== V38 GLOBAL SCALER LOG ==="]
+
+        if not pose_metas: 
+            return (pose_data_copy, "Fehler: Keine Pose-Daten.", video_nlf_data, "{}")
+
+        slope = calibration_data.get("perspective_slope", 0.0)
+        intercept = calibration_data.get("perspective_intercept", 1.0)
+        is_inverted = calibration_data.get("is_depth_inverted", False)
+        norm_method = calibration_data.get("norm_method", "Dynamic Full-Body")
+        use_pinhole_math = calibration_data.get("use_pinhole_math", True)
+        echte_groesse = calibration_data.get("echte_groesse", 1.75)
+        fx_calib = calibration_data.get("focal_length_fx", 500.0)
+        
+        depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
+        H, W = depth_np.shape[1], depth_np.shape[2]
+
+        def is_valid_point(kps, confs, idx):
+            if kps is None or idx >= len(kps): return False
+            pt = kps[idx]
+            if pt is None or len(pt) < 2: return False
+            c = float(confs[idx]) if (confs is not None and idx < len(confs)) else (float(pt[2]) if len(pt)>=3 else 1.0)
+            return c >= min_confidence
+
+        def is_frontal_3d(frame_idx):
+            if video_nlf_data is None: return False
+            pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0]
+            if pose_input_3d is None or len(pose_input_3d) <= frame_idx or pose_input_3d[frame_idx] is None or len(pose_input_3d[frame_idx]) == 0: return False
+            pose_3d = pose_input_3d[frame_idx][0]
+            if len(pose_3d) > 11:
+                l_hip, r_hip = pose_3d[11], pose_3d[8]
+                dz, dx = abs(l_hip[2] - r_hip[2]), abs(l_hip[0] - r_hip[0])
+                return (math.degrees(math.atan2(dz, dx)) if dx > 0 else 90.0) < frontal_3d_angle_tolerance
+            return False
+
+        # --- Frame Evaluierung ---
+        best_idx, best_area = 0, 0.0
+        for i, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            confs = getattr(meta, "kps_body_p", None)
+            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            if not valid_y or not valid_x: continue
+            if frontal_method == "3D_NLF" and video_nlf_data is not None and not is_frontal_3d(i): continue
+            
+            area = (max(valid_x) - min(valid_x)) * (max(valid_y) - min(valid_y))
+            if area > best_area:
+                best_area, best_idx = area, i
+
+        start_idx = max(0, best_idx - anchor_window)
+        end_idx = min(len(pose_metas), best_idx + anchor_window + 1)
+        sum_norm, sum_depth, valid_frames_in_window = 0.0, 0.0, 0
+
+        for i in range(start_idx, end_idx):
+            meta = pose_metas[i]
+            kps = getattr(meta, "kps_body", [])
+            confs = getattr(meta, "kps_body_p", None)
+            
+            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            if not valid_y or not valid_x: continue
+            norm_val = math.sqrt((max(valid_x) - min(valid_x))**2 + (max(valid_y) - min(valid_y))**2)
+            
+            v_idx = min(i, depth_np.shape[0]-1)
+            valid_x_d = [kps[idx][0] * W for idx in [1,8,11] if is_valid_point(kps, confs, idx)]
+            valid_y_d = [kps[idx][1] * H for idx in [1,8,11] if is_valid_point(kps, confs, idx)]
+            depth_vals = [depth_np[v_idx, int(py), int(px)] for px, py in zip(valid_x_d, valid_y_d) if 0 <= int(px) < W and 0 <= int(py) < H]
+            
+            frame_depth = float(np.mean(depth_vals)) if depth_vals else 0.5
+            if is_inverted: frame_depth = 1.0 / max(frame_depth, 0.0001)
+
+            sum_norm += norm_val
+            sum_depth += frame_depth
+            valid_frames_in_window += 1
+
+        if valid_frames_in_window == 0: 
+            return (pose_data_copy, "Fehler: Anchor-Window ungültig.", video_nlf_data, "{}")
+
+        avg_anchor_norm = sum_norm / valid_frames_in_window
+        avg_anchor_depth = sum_depth / valid_frames_in_window
+
+        if use_pinhole_math and echte_groesse > 0.0:
+            expected_norm = (echte_groesse * fx_calib) / avg_anchor_depth
+        else:
+            expected_norm = (avg_anchor_depth * slope) + intercept
+
+        anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
+        scale_x_factor = anchor_scale if scale_2d_axes == "X and Y (Uniform)" else 1.0
+        log_messages.append(f"Skalierungs-Faktor = {anchor_scale:.3f}x")
+
+        # --- Wir berechnen den GLOBALEN KAMERA PIVOT aus dem Anchor Frame ---
+        global_pivot_x, global_pivot_y = 0.5, 0.5
+        if best_idx < len(pose_metas):
+            kps_best = getattr(pose_metas[best_idx], "kps_body", [])
+            c_best = getattr(pose_metas[best_idx], "kps_body_p", None)
+            val_y = [kps_best[idx][1] for idx in range(len(kps_best)) if is_valid_point(kps_best, c_best, idx)]
+            val_x = [kps_best[idx][0] for idx in range(len(kps_best)) if is_valid_point(kps_best, c_best, idx)]
+            if val_y and val_x:
+                global_pivot_x = np.mean(val_x)
+                global_pivot_y = max(val_y) # Füße im Anchor Frame
+
+        # --- 1. 2D Daten Skalieren (relativ zum globalen Kamera Pivot) ---
+        for i, meta in enumerate(pose_metas):
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None and len(arr) > 0:
+                    for j in range(len(arr)):
+                        if len(arr[j]) >= 2 and arr[j][1] > 0:
+                            arr[j][0] = global_pivot_x + (arr[j][0] - global_pivot_x) * scale_x_factor
+                            arr[j][1] = global_pivot_y + (arr[j][1] - global_pivot_y) * anchor_scale
+
+        # --- 2. CONFIGURATION DATA BAUEN ---
+        nlf_render_config = {
+            "anchor_scale": float(anchor_scale),
+            "scale_x_factor": float(scale_x_factor),
+            "pivot_x": float(global_pivot_x),
+            "pivot_y": float(global_pivot_y)
+        }
+        config_str = json.dumps(nlf_render_config)
+        
+        log_messages.append("\n=== NLF 3D DATA DELEGATION LOG ===")
+        log_messages.append("Genialer Plan aktiv: 3D-Daten bleiben UNVERÄNDERT. Die Kamera-Anweisungen wurden in nlf_render_config verpackt!")
+
+        # Wir reichen die originalen, unbeschädigten NLF-Daten weiter!
+        return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
+
+
+# ======================================================================
+# 3. RenderNLFPosesDirect (Akzeptiert Config und modifiziert Kamera-Linse)
+# ======================================================================
+class RenderNLFPosesDirect2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "nlf_poses": ("NLFPRED", {"tooltip": "Die NLF Daten"}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "render_backend": (["taichi", "torch"], {"default": "taichi"}),
+            },
+            "optional": {
+                "dw_poses_fallback": ("DWPOSES", {"tooltip": "Für Hände/Gesicht"}),
+                "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus der Scaler-Node"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/SCAIL"
+    DESCRIPTION = "Rendert NLF-Daten und wendet smarte Kamera-Zooms an."
+
+    def process(self, nlf_poses, width, height, render_backend="taichi", dw_poses_fallback=None, nlf_render_config="{}"):
+        import copy
+        import json
+        import torch
+        import numpy as np
+        from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
+        
+        if render_backend == "taichi":
+            try:
+                import taichi as ti
+                ti.init(arch=ti.gpu)
+            except:
+                render_backend = "torch"
+
+        pose_input = nlf_poses['joints3d_nonparam'][0] if isinstance(nlf_poses, dict) else nlf_poses
+        dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
+        
+        # 1. Standard Kamera Matrix erstellen
+        intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
+        
+        # 2. DEN KLUGE KAMERA ZOOM ANWENDEN (aus Config)
+        try:
+            config = json.loads(nlf_render_config)
+            if "anchor_scale" in config:
+                scale_y = config["anchor_scale"]
+                scale_x = config.get("scale_x_factor", scale_y)
+                
+                # Pivot-Punkte in absolute Pixel umrechnen
+                p_x = config["pivot_x"] * width
+                p_y = config["pivot_y"] * height
+                
+                # KAMERA MAGIE: Wir verändern die Brennweite (Zoom) und verschieben die Linse zum Pivot-Punkt!
+                intrinsic_matrix[0, 0] *= scale_x  # Zoom X
+                intrinsic_matrix[1, 1] *= scale_y  # Zoom Y
+                intrinsic_matrix[0, 2] = intrinsic_matrix[0, 2] * scale_x + p_x * (1.0 - scale_x) # Center X verschieben
+                intrinsic_matrix[1, 2] = intrinsic_matrix[1, 2] * scale_y + p_y * (1.0 - scale_y) # Center Y verschieben
+                
+                print(f"[RenderNLFPosesDirect] Smart Camera Zoom applied: {scale_y:.3f}x")
+        except:
+            pass # Wenn keine Config anliegt, rendert er einfach ganz normal!
+
+        if pose_input[0].shape[0] > 1:
+            frames_np = render_multi_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=True, draw_hands=True, render_backend=render_backend)
+        else:
+            frames_np = render_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=True, draw_hands=True, render_backend=render_backend)
+
+        frames_tensor = torch.from_numpy(np.stack(frames_np, axis=0)).contiguous() / 255.0
+        frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
+        
+        return (frames_tensor.cpu().float(), mask.cpu().float())
+
+# MAPPINGS FÜR DIE NODES:
+# "PoseGlobalPerspectiveScalerV38": PoseGlobalPerspectiveScalerV38,
+# "RenderNLFPosesDirect": RenderNLFPosesDirect,
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -12039,6 +12281,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV34": PoseGlobalPerspectiveScalerV34,
     "PoseGlobalPerspectiveScalerV35": PoseGlobalPerspectiveScalerV35,
     "PoseGlobalPerspectiveScalerV37": PoseGlobalPerspectiveScalerV37,
+    "PoseGlobalPerspectiveScalerV38": PoseGlobalPerspectiveScalerV38,
+    "RenderNLFPosesDirect2": RenderNLFPosesDirect2,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -12108,6 +12352,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV34": "Pose Global Perspective Scaler V34",
     "PoseGlobalPerspectiveScalerV35": "Pose Global Perspective Scaler V35",
     "PoseGlobalPerspectiveScalerV37": "Pose Global Perspective Scaler V37",
+    "PoseGlobalPerspectiveScalerV38": "Pose Global Perspective Scaler V38 (Smart Camera Zoom)",
+    "RenderNLFPosesDirect2": "Render NLF Poses Direct 2",
 
 }
 
