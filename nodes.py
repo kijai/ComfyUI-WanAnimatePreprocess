@@ -13387,8 +13387,15 @@ class NLFProportionalRetargeterV4:
             return (video_nlf_data, "\n".join(log_messages))
 
         is_dict = isinstance(video_nlf_data, dict)
-        pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0].clone() if is_dict else video_nlf_data.clone()
-        nlf_data_retargeted = copy.deepcopy(video_nlf_data) if is_dict else pose_input_3d.clone()
+        
+        # Sicher kopieren: Löst das 'clone()'-Listen-Problem!
+        nlf_data_retargeted = copy.deepcopy(video_nlf_data)
+        
+        # Auf die eigentliche Liste von Posen zugreifen
+        if is_dict:
+            raw_poses = nlf_data_retargeted.get('joints3d_nonparam', [nlf_data_retargeted])[0]
+        else:
+            raw_poses = nlf_data_retargeted
 
         # 2. Prüfen, ob wir die perfekten, normalisierten V22 Daten haben
         # (Wenn der Torso exakt 100.0 ist, sind es Prozentwerte)
@@ -13410,13 +13417,19 @@ class NLFProportionalRetargeterV4:
         frames_processed = 0
 
         # 3. Jeden Frame durchlaufen und anpassen
-        for frame_idx in range(len(pose_input_3d)):
-            if pose_input_3d[frame_idx] is None or len(pose_input_3d[frame_idx]) == 0:
+        for frame_idx in range(len(raw_poses)):
+            frame_data = raw_poses[frame_idx]
+            if frame_data is None or len(frame_data) == 0:
                 continue
                 
-            # Extrahiere die Punkte für den aktuellen Frame als Numpy-Array
-            # Annahme: Shape ist (1, Num_Joints, 3) oder (Num_Joints, 3)
-            pts = pose_input_3d[frame_idx][0].cpu().numpy() if pose_input_3d[frame_idx].dim() == 3 else pose_input_3d[frame_idx].cpu().numpy()
+            is_tensor = isinstance(frame_data, torch.Tensor)
+            
+            # Extrahiere die Punkte für den aktuellen Frame sicher (egal ob Liste, Array oder Tensor)
+            if is_tensor:
+                pts = frame_data[0].cpu().numpy() if frame_data.dim() == 3 else frame_data.cpu().numpy()
+            else:
+                arr = np.array(frame_data)
+                pts = arr[0] if arr.ndim == 3 else arr
             
             pts_new = pts.copy()
 
@@ -13436,17 +13449,15 @@ class NLFProportionalRetargeterV4:
                 continue # Kaputter Frame, überspringen
 
             # 4. Knochen skalieren
-            # Hier definieren wir, welche Indizes miteinander verbunden sind (Start -> End)
-            # und wie der entsprechende Knochen im Config-Dictionary heißt
             bone_mappings = [
-                ("r_arm", 2, 3),      # R-Shoulder to R-Elbow
-                ("r_forearm", 3, 4),  # R-Elbow to R-Wrist
-                ("l_arm", 5, 6),      # L-Shoulder to L-Elbow
-                ("l_forearm", 6, 7),  # L-Elbow to L-Wrist
-                ("r_thigh", 8, 9),    # R-Hip to R-Knee
-                ("r_calf", 9, 10),    # R-Knee to R-Ankle
-                ("l_thigh", 11, 12),  # L-Hip to L-Knee
-                ("l_calf", 12, 13)    # L-Knee to L-Ankle
+                ("r_arm", 2, 3),      
+                ("r_forearm", 3, 4),  
+                ("l_arm", 5, 6),      
+                ("l_forearm", 6, 7),  
+                ("r_thigh", 8, 9),    
+                ("r_calf", 9, 10),    
+                ("l_thigh", 11, 12),  
+                ("l_calf", 12, 13)    
             ]
 
             for bone_name, start_idx, end_idx in bone_mappings:
@@ -13465,21 +13476,23 @@ class NLFProportionalRetargeterV4:
                         # Neuen Endpunkt setzen
                         pts_new[end_idx] = pts_new[start_idx] + (direction * target_len)
 
-            # Änderungen zurück in den Tensor schreiben
-            if pose_input_3d[frame_idx].dim() == 3:
-                pose_input_3d[frame_idx][0] = torch.from_numpy(pts_new).to(pose_input_3d[frame_idx].device)
+            # Änderungen zurück schreiben (egal ob es als Tensor oder Liste kam)
+            if is_tensor:
+                if frame_data.dim() == 3:
+                    raw_poses[frame_idx][0] = torch.from_numpy(pts_new).to(frame_data.device)
+                else:
+                    raw_poses[frame_idx] = torch.from_numpy(pts_new).to(frame_data.device)
             else:
-                pose_input_3d[frame_idx] = torch.from_numpy(pts_new).to(pose_input_3d[frame_idx].device)
+                arr_new = np.array(frame_data)
+                if arr_new.ndim == 3:
+                    arr_new[0] = pts_new
+                    raw_poses[frame_idx] = arr_new.tolist()
+                else:
+                    raw_poses[frame_idx] = pts_new.tolist()
                 
             frames_processed += 1
 
         log_messages.append(f"Erfolgreich skaliert: {frames_processed} Frames.")
-
-        # Tensor wieder in das NLF Dictionary verpacken
-        if is_dict:
-            nlf_data_retargeted['joints3d_nonparam'] = [pose_input_3d]
-        else:
-            nlf_data_retargeted = pose_input_3d
 
         return (nlf_data_retargeted, "\n".join(log_messages))
         
