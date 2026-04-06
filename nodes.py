@@ -12645,6 +12645,7 @@ NODE_CLASS_MAPPINGS = {
     "RenderNLFPosesDirect2": RenderNLFPosesDirect2,
     "RenderNLFPosesDirect3": RenderNLFPosesDirect3,
     "RenderNLFPosesDirect4": RenderNLFPosesDirect4,
+}
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": "Pose and Face Detection V7 (No Warp)",
