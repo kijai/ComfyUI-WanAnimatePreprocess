@@ -13356,6 +13356,193 @@ class PoseCalibrationV22:
         return (calib_data, "\n".join(log_messages))
 
 
+class NLFProportionalRetargeterV4:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_nlf_data": ("NLFPRED", {"tooltip": "Die originalen 3D NLF Daten"}),
+                "calibration_data": ("POSE_CALIBRATION", {"tooltip": "Die Referenz-Daten aus V20/V22"}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 90.0, "step": 1.0, "tooltip": "Toleranz für die Frontal-Suche (Fallback)"}),
+            }
+        }
+
+    RETURN_TYPES = ("NLFPRED", "STRING")
+    RETURN_NAMES = ("nlf_data_retargeted", "log_output")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V4: Echter Kinematic Tree! Baut das komplette Skelett vom Hals abwärts proportional neu auf."
+
+    def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance):
+        import copy
+        import math
+        import torch
+
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V4 LOG (KINEMATIC TREE) ==="]
+
+        if video_nlf_data is None:
+            return (video_nlf_data, "FEHLER: Keine NLF-Daten.")
+
+        is_dict = isinstance(video_nlf_data, dict)
+        nlf_data_retargeted = copy.deepcopy(video_nlf_data)
+        pose_input_3d = nlf_data_retargeted.get('joints3d_nonparam', [nlf_data_retargeted])[0] if is_dict else nlf_data_retargeted
+
+        target_bones = calibration_data.get("true_3d_bones", {})
+        if not target_bones:
+            log_messages.append("WARNUNG: Keine Knochenlängen in Calibration_data gefunden. Gebe Original zurück.")
+            return (video_nlf_data, "\n".join(log_messages))
+
+        def get_dist(p1, p2):
+            return float(torch.norm(p1 - p2))
+
+        def safe_normalize(vec):
+            norm = torch.norm(vec)
+            return vec / norm if norm > 1e-6 else vec
+
+        # ==========================================
+        # 1. REFERENZ-PROPORTIONEN BERECHNEN
+        # ==========================================
+        ref_torso = target_bones.get("torso", 1.0)
+        if ref_torso <= 0: ref_torso = 1.0
+
+        target_props = {}
+        for bone_name, length in target_bones.items():
+            target_props[bone_name] = length / ref_torso
+
+        log_messages.append(f"Referenz-Proportionen (Torso = 100%):")
+        for k, v in target_props.items():
+            if k != "factor_nah_fern":
+                log_messages.append(f"  {k}: {v*100:.1f}%")
+
+        # ==========================================
+        # 2. BESTEN NLF-FRAME FINDEN (Als Richtungs-Fallback)
+        # ==========================================
+        best_idx = 0
+        max_leg_proportion = 0.0
+        for i, frame_data in enumerate(pose_input_3d):
+            if frame_data is None or len(frame_data) == 0: continue
+            pose_3d = frame_data[0]
+            if len(pose_3d) < 14: continue
+
+            # Frontal prüfen
+            l_hip, r_hip = pose_3d[11], pose_3d[8]
+            dz, dx = abs(l_hip[2] - r_hip[2]), abs(l_hip[0] - r_hip[0])
+            angle = math.degrees(math.atan2(dz, dx)) if dx > 0 else 90.0
+            if angle > frontal_3d_angle_tolerance: continue
+
+            mid_hip = (pose_3d[8] + pose_3d[11]) / 2.0
+            torso_len = get_dist(pose_3d[1], mid_hip)
+            if torso_len == 0: continue
+
+            r_leg_len = get_dist(pose_3d[8], pose_3d[9]) + get_dist(pose_3d[9], pose_3d[10])
+            l_leg_len = get_dist(pose_3d[11], pose_3d[12]) + get_dist(pose_3d[12], pose_3d[13])
+            
+            current_leg_prop = max(r_leg_len, l_leg_len) / torso_len
+            if current_leg_prop > max_leg_proportion:
+                max_leg_proportion = current_leg_prop
+                best_idx = i
+
+        log_messages.append(f"\n---> Richtungs-Fallback Frame: {best_idx}")
+        best_pose_3d = pose_input_3d[best_idx][0]
+
+        # ==========================================
+        # 3. ECHTER KINEMATIC TREE AUFBAU (Jeden Frame)
+        # ==========================================
+        frames_retargeted = 0
+        for i in range(len(pose_input_3d)):
+            frame_data = pose_input_3d[i]
+            if frame_data is None or len(frame_data) == 0: continue
+
+            pts_orig = frame_data[0].clone()
+            pts_new = frame_data[0].clone()
+            
+            if len(pts_orig) < 14: continue
+
+            # Basis ist die reale Torso-Länge des aktuellen Frames (für Z-Perspektive wichtig!)
+            mid_hip_orig = (pts_orig[8] + pts_orig[11]) / 2.0
+            base_len = get_dist(pts_orig[1], mid_hip_orig)
+            if base_len == 0: base_len = 1.0
+
+            def get_dir(p_from, p_to, fallback_from, fallback_to):
+                vec = p_to - p_from
+                if torch.norm(vec) < 1e-3:
+                    vec = fallback_to - fallback_from
+                return safe_normalize(vec)
+
+            # --- ANKERPUNKT: Neck (1) bleibt fix ---
+            
+            # --- 1. TORSO ---
+            torso_dir = get_dir(pts_orig[1], mid_hip_orig, best_pose_3d[1], (best_pose_3d[8] + best_pose_3d[11])/2.0)
+            mid_hip_new = pts_new[1] + (torso_dir * base_len) # Torso bleibt unsere 100% Basis
+
+            # --- 2. HÜFTEN (Links & Rechts von der neuen Mitte) ---
+            hip_half_len = (base_len * target_props.get("hip_width", 0.2)) / 2.0
+            r_hip_dir = get_dir(mid_hip_orig, pts_orig[8], (best_pose_3d[8] + best_pose_3d[11])/2.0, best_pose_3d[8])
+            l_hip_dir = get_dir(mid_hip_orig, pts_orig[11], (best_pose_3d[8] + best_pose_3d[11])/2.0, best_pose_3d[11])
+            pts_new[8] = mid_hip_new + (r_hip_dir * hip_half_len)
+            pts_new[11] = mid_hip_new + (l_hip_dir * hip_half_len)
+
+            # --- 3. SCHULTERN (Links & Rechts vom Neck) ---
+            shoulder_half_len = (base_len * target_props.get("shoulder_width", 0.4)) / 2.0
+            r_sh_dir = get_dir(pts_orig[1], pts_orig[2], best_pose_3d[1], best_pose_3d[2])
+            l_sh_dir = get_dir(pts_orig[1], pts_orig[5], best_pose_3d[1], best_pose_3d[5])
+            pts_new[2] = pts_new[1] + (r_sh_dir * shoulder_half_len)
+            pts_new[5] = pts_new[1] + (l_sh_dir * shoulder_half_len)
+
+            # --- 4. BEINE (Hängen exakt an den neuen Hüften) ---
+            r_thigh_len = base_len * target_props.get("r_thigh", 0.4)
+            r_thigh_dir = get_dir(pts_orig[8], pts_orig[9], best_pose_3d[8], best_pose_3d[9])
+            pts_new[9] = pts_new[8] + (r_thigh_dir * r_thigh_len)
+
+            r_calf_len = base_len * target_props.get("r_calf", 0.4)
+            r_calf_dir = get_dir(pts_orig[9], pts_orig[10], best_pose_3d[9], best_pose_3d[10])
+            pts_new[10] = pts_new[9] + (r_calf_dir * r_calf_len)
+
+            l_thigh_len = base_len * target_props.get("l_thigh", 0.4)
+            l_thigh_dir = get_dir(pts_orig[11], pts_orig[12], best_pose_3d[11], best_pose_3d[12])
+            pts_new[12] = pts_new[11] + (l_thigh_dir * l_thigh_len)
+
+            l_calf_len = base_len * target_props.get("l_calf", 0.4)
+            l_calf_dir = get_dir(pts_orig[12], pts_orig[13], best_pose_3d[12], best_pose_3d[13])
+            pts_new[13] = pts_new[12] + (l_calf_dir * l_calf_len)
+
+            # --- 5. ARME (Hängen an den neuen Schultern) ---
+            r_arm_len = base_len * target_props.get("r_arm", 0.3)
+            r_arm_dir = get_dir(pts_orig[2], pts_orig[3], best_pose_3d[2], best_pose_3d[3])
+            pts_new[3] = pts_new[2] + (r_arm_dir * r_arm_len)
+
+            r_forearm_len = base_len * target_props.get("r_forearm", 0.3)
+            r_forearm_dir = get_dir(pts_orig[3], pts_orig[4], best_pose_3d[3], best_pose_3d[4])
+            pts_new[4] = pts_new[3] + (r_forearm_dir * r_forearm_len)
+
+            l_arm_len = base_len * target_props.get("l_arm", 0.3)
+            l_arm_dir = get_dir(pts_orig[5], pts_orig[6], best_pose_3d[5], best_pose_3d[6])
+            pts_new[6] = pts_new[5] + (l_arm_dir * l_arm_len)
+
+            l_forearm_len = base_len * target_props.get("l_forearm", 0.3)
+            l_forearm_dir = get_dir(pts_orig[6], pts_orig[7], best_pose_3d[6], best_pose_3d[7])
+            pts_new[7] = pts_new[6] + (l_forearm_dir * l_forearm_len)
+
+            # --- 6. EXTRAS (Kopf, Füße ziehen nach) ---
+            pts_new[0] = pts_new[1] + (pts_orig[0] - pts_orig[1]) # Nase zieht mit Hals mit
+            if len(pts_orig) > 18:
+                pts_new[18] = pts_new[13] + (pts_orig[18] - pts_orig[13]) # L_Toe zieht mit Knöchel
+            if len(pts_orig) > 19:
+                pts_new[19] = pts_new[10] + (pts_orig[19] - pts_orig[10]) # R_Toe
+
+            pose_input_3d[i][0] = pts_new
+            frames_retargeted += 1
+
+        log_messages.append(f"\nErfolg: {frames_retargeted} Frames als perfekten Baum umgebaut.")
+        
+        if is_dict:
+            nlf_data_retargeted['joints3d_nonparam'] = [pose_input_3d]
+        else:
+            nlf_data_retargeted = pose_input_3d
+
+        return (nlf_data_retargeted, "\n".join(log_messages))
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -13431,6 +13618,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFProportionalRetargeterV3": NLFProportionalRetargeterV3,
     "PoseCalibrationV21": PoseCalibrationV21,
     "PoseCalibrationV22": PoseCalibrationV22,
+    "NLFProportionalRetargeterV4": NLFProportionalRetargeterV4,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -13508,6 +13696,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFProportionalRetargeterV3": "NLF Proportional Retargeter V3 (Best Frame Fallback)",
     "PoseCalibrationV21": "Pose Calibration V21 (Symmetric Auto-Fix)",
     "PoseCalibrationV22": "Pose Calibration V22",
+    "NLFProportionalRetargeterV4": "NLF Proportional Retargeter V4",
 
 }
 
