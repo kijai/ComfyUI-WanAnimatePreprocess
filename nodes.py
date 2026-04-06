@@ -13363,218 +13363,126 @@ class NLFProportionalRetargeterV4:
             "required": {
                 "video_nlf_data": ("NLFPRED", {"tooltip": "Die originalen 3D NLF Daten"}),
                 "calibration_data": ("POSE_CALIBRATION", {"tooltip": "Die Referenz-Daten aus V20/V22"}),
-                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 90.0, "step": 1.0, "tooltip": "Toleranz für die Frontal-Suche (Fallback)"}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 90.0, "step": 1.0, "tooltip": "Toleranz für die Frontal-Suche"}),
             }
         }
 
     RETURN_TYPES = ("NLFPRED", "STRING")
     RETURN_NAMES = ("nlf_data_retargeted", "log_output")
     FUNCTION = "process"
-    CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V4: Echter Kinematic Tree! SMPL (24) kompatibel mit V22!"
+    CATEGORY = "WanAnimatePreprocess/Retargeting"
 
     def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance):
         import copy
+        import numpy as np
         import math
         import torch
 
-        log_messages = ["=== NLF PROPORTIONAL RETARGETER V4 LOG ==="]
-
-        if video_nlf_data is None:
-            return (video_nlf_data, "FEHLER: Keine NLF-Daten.")
-
-        is_dict = isinstance(video_nlf_data, dict)
-        nlf_data_retargeted = copy.deepcopy(video_nlf_data)
-        pose_input_3d = nlf_data_retargeted.get('joints3d_nonparam', [nlf_data_retargeted])[0] if is_dict else nlf_data_retargeted
-
-        target_bones = calibration_data.get("true_3d_bones", {})
-        if not target_bones:
-            log_messages.append("WARNUNG: Keine Knochenlängen gefunden. Gebe Original zurück.")
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V4 ==="]
+        
+        # 1. Daten extrahieren
+        true_3d_bones = calibration_data.get("true_3d_bones", {})
+        if not true_3d_bones:
+            log_messages.append("FEHLER: Keine true_3d_bones in calibration_data gefunden.")
             return (video_nlf_data, "\n".join(log_messages))
 
-        def get_dist(p1, p2):
-            return float(torch.norm(p1 - p2))
+        is_dict = isinstance(video_nlf_data, dict)
+        pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0].clone() if is_dict else video_nlf_data.clone()
+        nlf_data_retargeted = copy.deepcopy(video_nlf_data) if is_dict else pose_input_3d.clone()
 
-        def safe_normalize(vec):
-            norm = torch.norm(vec)
-            return vec / norm if norm > 1e-6 else vec
-
-        # 1. REFERENZ-PROPORTIONEN (Von V22)
-        ref_torso = target_bones.get("torso", 1.0)
-        if ref_torso <= 0: ref_torso = 1.0
-
-        target_props = {}
-        for bone_name, length in target_bones.items():
-            target_props[bone_name] = length / ref_torso
-
-        # 2. INDIZES CHECKEN (DER WICHTIGE FIX FÜR SMPL 24!)
-        first_valid = next((f for f in pose_input_3d if f is not None and len(f) > 0), None)
-        if first_valid is None:
-            return (video_nlf_data, "FEHLER: NLF Daten leer.")
+        # 2. Prüfen, ob wir die perfekten, normalisierten V22 Daten haben
+        # (Wenn der Torso exakt 100.0 ist, sind es Prozentwerte)
+        is_normalized = math.isclose(true_3d_bones.get("torso", 0.0), 100.0, abs_tol=1e-3)
         
-        num_joints = len(first_valid[0])
-        is_h36m = (num_joints == 17)
-        is_smpl = (num_joints >= 24)
-
-        if is_smpl:
-            idx_mid_hip, idx_neck, idx_head = 0, 12, 15
-            idx_r_sh, idx_r_el, idx_r_wr = 16, 18, 20
-            idx_l_sh, idx_l_el, idx_l_wr = 17, 19, 21
-            idx_r_hip, idx_r_knee, idx_r_ankle = 1, 4, 7
-            idx_l_hip, idx_l_knee, idx_l_ankle = 2, 5, 8
-            log_messages.append("--> Format erkannt: SMPL (24 Keypoints)")
-        elif is_h36m:
-            idx_mid_hip, idx_neck, idx_head = 0, 8, 9
-            idx_r_hip, idx_r_knee, idx_r_ankle = 1, 2, 3
-            idx_l_hip, idx_l_knee, idx_l_ankle = 4, 5, 6
-            idx_l_sh, idx_l_el, idx_l_wr = 11, 12, 13
-            idx_r_sh, idx_r_el, idx_r_wr = 14, 15, 16
-            log_messages.append("--> Format erkannt: H36M (17 Keypoints)")
+        if is_normalized:
+            log_messages.append("Modus: NORMALISIERT (Prozentual basierend auf Torso=100%).")
         else:
-            idx_neck, idx_head = 1, 0
-            idx_r_sh, idx_r_el, idx_r_wr = 2, 3, 4
-            idx_l_sh, idx_l_el, idx_l_wr = 5, 6, 7
-            idx_r_hip, idx_r_knee, idx_r_ankle = 8, 9, 10
-            idx_l_hip, idx_l_knee, idx_l_ankle = 11, 12, 13
-            log_messages.append(f"--> Format erkannt: OpenPose ({num_joints} Keypoints)")
+            log_messages.append("Modus: ABSOLUT (Alte V20 Logik, absolute Längenwerte).")
 
-        def get_mid_hip(pts):
-            if is_smpl or is_h36m: return pts[idx_mid_hip]
-            return (pts[idx_r_hip] + pts[idx_l_hip]) / 2.0
+        # Helper-Funktion um Richtungsvektor und aktuelle Länge zu bekommen
+        def get_dir_and_len(p1, p2):
+            vec = p2 - p1
+            length = np.linalg.norm(vec)
+            if length > 1e-6:
+                return vec / length, length
+            return np.zeros_like(vec), 0.0
 
-        # 3. BESTEN FRAME FINDEN
-        best_idx = 0
-        max_leg_prop = 0.0
-        for i, frame_data in enumerate(pose_input_3d):
-            if frame_data is None or len(frame_data) == 0: continue
-            pose_3d = frame_data[0]
+        frames_processed = 0
+
+        # 3. Jeden Frame durchlaufen und anpassen
+        for frame_idx in range(len(pose_input_3d)):
+            if pose_input_3d[frame_idx] is None or len(pose_input_3d[frame_idx]) == 0:
+                continue
+                
+            # Extrahiere die Punkte für den aktuellen Frame als Numpy-Array
+            # Annahme: Shape ist (1, Num_Joints, 3) oder (Num_Joints, 3)
+            pts = pose_input_3d[frame_idx][0].cpu().numpy() if pose_input_3d[frame_idx].dim() == 3 else pose_input_3d[frame_idx].cpu().numpy()
             
-            if len(pose_3d) < max(idx_l_ankle, idx_r_ankle): continue
+            pts_new = pts.copy()
 
-            l_hip, r_hip = pose_3d[idx_l_hip], pose_3d[idx_r_hip]
-            dz, dx = abs(l_hip[2] - r_hip[2]), abs(l_hip[0] - r_hip[0])
-            angle = math.degrees(math.atan2(dz, dx)) if dx > 0 else 90.0
-            if angle > frontal_3d_angle_tolerance: continue
-
-            m_hip = get_mid_hip(pose_3d)
-            torso_len = get_dist(pose_3d[idx_neck], m_hip)
-            if torso_len == 0: continue
-
-            r_leg = get_dist(pose_3d[idx_r_hip], pose_3d[idx_r_knee]) + get_dist(pose_3d[idx_r_knee], pose_3d[idx_r_ankle])
-            l_leg = get_dist(pose_3d[idx_l_hip], pose_3d[idx_l_knee]) + get_dist(pose_3d[idx_l_knee], pose_3d[idx_l_ankle])
+            # Mapping NLF Indizes
+            # 1: Neck, 2: R-Shoulder, 3: R-Elbow, 4: R-Wrist
+            # 5: L-Shoulder, 6: L-Elbow, 7: L-Wrist
+            # 8: R-Hip, 9: R-Knee, 10: R-Ankle
+            # 11: L-Hip, 12: L-Knee, 13: L-Ankle
+            idx_neck = 1
+            idx_r_hip, idx_l_hip = 8, 11
             
-            current_leg_prop = max(r_leg, l_leg) / torso_len
-            if current_leg_prop > max_leg_prop:
-                max_leg_prop = current_leg_prop
-                best_idx = i
-
-        best_pose_3d = pose_input_3d[best_idx][0]
-        best_mid_hip = get_mid_hip(best_pose_3d)
-        log_messages.append(f"Bester Frame für Fallbacks: {best_idx}")
-
-        # 4. KINEMATIC TREE AUFBAU
-        frames_retargeted = 0
-        for i in range(len(pose_input_3d)):
-            frame_data = pose_input_3d[i]
-            if frame_data is None or len(frame_data) == 0: continue
-
-            pts_orig = frame_data[0].clone()
-            pts_new = frame_data[0].clone()
+            # Torso-Länge im AKTUELLEN Frame messen
+            mid_hip = (pts[idx_r_hip] + pts[idx_l_hip]) / 2.0
+            current_torso_length = np.linalg.norm(pts[idx_neck] - mid_hip)
             
-            mid_hip_orig = get_mid_hip(pts_orig)
-            base_len = get_dist(pts_orig[idx_neck], mid_hip_orig)
-            if base_len == 0: base_len = 1.0
+            if current_torso_length < 1e-5:
+                continue # Kaputter Frame, überspringen
 
-            def get_dir(p_from, p_to, fallback_from, fallback_to):
-                vec = p_to - p_from
-                if torch.norm(vec) < 1e-3:
-                    vec = fallback_to - fallback_from
-                return safe_normalize(vec)
+            # 4. Knochen skalieren
+            # Hier definieren wir, welche Indizes miteinander verbunden sind (Start -> End)
+            # und wie der entsprechende Knochen im Config-Dictionary heißt
+            bone_mappings = [
+                ("r_arm", 2, 3),      # R-Shoulder to R-Elbow
+                ("r_forearm", 3, 4),  # R-Elbow to R-Wrist
+                ("l_arm", 5, 6),      # L-Shoulder to L-Elbow
+                ("l_forearm", 6, 7),  # L-Elbow to L-Wrist
+                ("r_thigh", 8, 9),    # R-Hip to R-Knee
+                ("r_calf", 9, 10),    # R-Knee to R-Ankle
+                ("l_thigh", 11, 12),  # L-Hip to L-Knee
+                ("l_calf", 12, 13)    # L-Knee to L-Ankle
+            ]
 
-            # 1. TORSO (Neck = Anker)
-            torso_dir = get_dir(pts_orig[idx_neck], mid_hip_orig, best_pose_3d[idx_neck], best_mid_hip)
-            mid_hip_new = pts_new[idx_neck] + (torso_dir * base_len)
-            if is_smpl or is_h36m: pts_new[idx_mid_hip] = mid_hip_new
+            for bone_name, start_idx, end_idx in bone_mappings:
+                if bone_name in true_3d_bones and start_idx < len(pts) and end_idx < len(pts):
+                    
+                    direction, curr_len = get_dir_and_len(pts_new[start_idx], pts[end_idx])
+                    
+                    if curr_len > 0:
+                        if is_normalized:
+                            # Ziel-Länge = (Prozentwert / 100) * Aktuelle Torso-Länge
+                            target_len = (true_3d_bones[bone_name] / 100.0) * current_torso_length
+                        else:
+                            # Alte Logik: Absoluter Wert aus V20
+                            target_len = true_3d_bones[bone_name]
+                        
+                        # Neuen Endpunkt setzen
+                        pts_new[end_idx] = pts_new[start_idx] + (direction * target_len)
 
-            # Falls SMPL: Wirbelsäule (Spine) interpolieren, damit der Rücken nicht kaputt geht
-            if is_smpl:
-                for spine_idx in [3, 6, 9]:
-                    if spine_idx < len(pts_orig):
-                        ratio = get_dist(pts_orig[idx_neck], pts_orig[spine_idx]) / base_len
-                        pts_new[spine_idx] = pts_new[idx_neck] + (mid_hip_new - pts_new[idx_neck]) * ratio
+            # Änderungen zurück in den Tensor schreiben
+            if pose_input_3d[frame_idx].dim() == 3:
+                pose_input_3d[frame_idx][0] = torch.from_numpy(pts_new).to(pose_input_3d[frame_idx].device)
+            else:
+                pose_input_3d[frame_idx] = torch.from_numpy(pts_new).to(pose_input_3d[frame_idx].device)
+                
+            frames_processed += 1
 
-            # 2. HÜFTEN
-            hip_half_len = (base_len * target_props.get("hip_width", 0.2)) / 2.0
-            r_hip_dir = get_dir(mid_hip_orig, pts_orig[idx_r_hip], best_mid_hip, best_pose_3d[idx_r_hip])
-            l_hip_dir = get_dir(mid_hip_orig, pts_orig[idx_l_hip], best_mid_hip, best_pose_3d[idx_l_hip])
-            pts_new[idx_r_hip] = mid_hip_new + (r_hip_dir * hip_half_len)
-            pts_new[idx_l_hip] = mid_hip_new + (l_hip_dir * hip_half_len)
+        log_messages.append(f"Erfolgreich skaliert: {frames_processed} Frames.")
 
-            # 3. SCHULTERN
-            shoulder_half_len = (base_len * target_props.get("shoulder_width", 0.4)) / 2.0
-            r_sh_dir = get_dir(pts_orig[idx_neck], pts_orig[idx_r_sh], best_pose_3d[idx_neck], best_pose_3d[idx_r_sh])
-            l_sh_dir = get_dir(pts_orig[idx_neck], pts_orig[idx_l_sh], best_pose_3d[idx_neck], best_pose_3d[idx_l_sh])
-            pts_new[idx_r_sh] = pts_new[idx_neck] + (r_sh_dir * shoulder_half_len)
-            pts_new[idx_l_sh] = pts_new[idx_neck] + (l_sh_dir * shoulder_half_len)
-            
-            # Falls SMPL: Kragenbeine (Collar) interpolieren
-            if is_smpl:
-                for col_idx, sh_idx in [(13, idx_r_sh), (12, idx_l_sh)]:
-                    if col_idx < len(pts_orig):
-                        pts_new[col_idx] = pts_new[idx_neck] + (pts_new[sh_idx] - pts_new[idx_neck]) * 0.5
-
-            # 4. BEINE
-            r_thigh_len = base_len * target_props.get("r_thigh", 0.4)
-            r_thigh_dir = get_dir(pts_orig[idx_r_hip], pts_orig[idx_r_knee], best_pose_3d[idx_r_hip], best_pose_3d[idx_r_knee])
-            pts_new[idx_r_knee] = pts_new[idx_r_hip] + (r_thigh_dir * r_thigh_len)
-
-            r_calf_len = base_len * target_props.get("r_calf", 0.4)
-            r_calf_dir = get_dir(pts_orig[idx_r_knee], pts_orig[idx_r_ankle], best_pose_3d[idx_r_knee], best_pose_3d[idx_r_ankle])
-            pts_new[idx_r_ankle] = pts_new[idx_r_knee] + (r_calf_dir * r_calf_len)
-
-            l_thigh_len = base_len * target_props.get("l_thigh", 0.4)
-            l_thigh_dir = get_dir(pts_orig[idx_l_hip], pts_orig[idx_l_knee], best_pose_3d[idx_l_hip], best_pose_3d[idx_l_knee])
-            pts_new[idx_l_knee] = pts_new[idx_l_hip] + (l_thigh_dir * l_thigh_len)
-
-            l_calf_len = base_len * target_props.get("l_calf", 0.4)
-            l_calf_dir = get_dir(pts_orig[idx_l_knee], pts_orig[idx_l_ankle], best_pose_3d[idx_l_knee], best_pose_3d[idx_l_ankle])
-            pts_new[idx_l_ankle] = pts_new[idx_l_knee] + (l_calf_dir * l_calf_len)
-
-            # 5. ARME
-            r_arm_len = base_len * target_props.get("r_arm", 0.3)
-            r_arm_dir = get_dir(pts_orig[idx_r_sh], pts_orig[idx_r_el], best_pose_3d[idx_r_sh], best_pose_3d[idx_r_el])
-            pts_new[idx_r_el] = pts_new[idx_r_sh] + (r_arm_dir * r_arm_len)
-
-            r_forearm_len = base_len * target_props.get("r_forearm", 0.3)
-            r_forearm_dir = get_dir(pts_orig[idx_r_el], pts_orig[idx_r_wr], best_pose_3d[idx_r_el], best_pose_3d[idx_r_wr])
-            pts_new[idx_r_wr] = pts_new[idx_r_el] + (r_forearm_dir * r_forearm_len)
-
-            l_arm_len = base_len * target_props.get("l_arm", 0.3)
-            l_arm_dir = get_dir(pts_orig[idx_l_sh], pts_orig[idx_l_el], best_pose_3d[idx_l_sh], best_pose_3d[idx_l_el])
-            pts_new[idx_l_el] = pts_new[idx_l_sh] + (l_arm_dir * l_arm_len)
-
-            l_forearm_len = base_len * target_props.get("l_forearm", 0.3)
-            l_forearm_dir = get_dir(pts_orig[idx_l_el], pts_orig[idx_l_wr], best_pose_3d[idx_l_el], best_pose_3d[idx_l_wr])
-            pts_new[idx_l_wr] = pts_new[idx_l_el] + (l_forearm_dir * l_forearm_len)
-
-            # 6. KOPF & EXTRAS
-            pts_new[idx_head] = pts_new[idx_neck] + (pts_orig[idx_head] - pts_orig[idx_neck])
-
-            if not is_h36m and not is_smpl:
-                if len(pts_orig) > 18: pts_new[18] = pts_new[idx_l_ankle] + (pts_orig[18] - pts_orig[idx_l_ankle])
-                if len(pts_orig) > 19: pts_new[19] = pts_new[idx_r_ankle] + (pts_orig[19] - pts_orig[idx_r_ankle])
-
-            pose_input_3d[i][0] = pts_new
-            frames_retargeted += 1
-
-        log_messages.append(f"\nErfolg: {frames_retargeted} Frames umgebaut.")
-        
+        # Tensor wieder in das NLF Dictionary verpacken
         if is_dict:
             nlf_data_retargeted['joints3d_nonparam'] = [pose_input_3d]
         else:
             nlf_data_retargeted = pose_input_3d
 
         return (nlf_data_retargeted, "\n".join(log_messages))
+        
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
