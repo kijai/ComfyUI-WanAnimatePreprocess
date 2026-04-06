@@ -12930,6 +12930,218 @@ class NLFProportionalRetargeterV3:
 
         return (nlf_data_retargeted, "\n".join(log_messages))
 
+class PoseCalibrationV21:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_nah_scaled": ("POSEDATA", {"tooltip": "Skalierte Pose für Pixel-Größe"}),
+                "pose_nah_unscaled": ("POSEDATA", {"tooltip": "Originale Pose als Maske für Depth-Map"}),
+                "depth_nah": ("IMAGE",),
+                "pose_fern_scaled": ("POSEDATA", {"tooltip": "Skalierte Pose für Pixel-Größe"}),
+                "pose_fern_unscaled": ("POSEDATA", {"tooltip": "Originale Pose als Maske für Depth-Map"}),
+                "depth_fern": ("IMAGE",),
+                "norm_method": (["Dynamic Full-Body", "Torso (Neck-Hip)"], {"default": "Dynamic Full-Body"}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "invert_depth": ("BOOLEAN", {"default": False}),
+                "use_pinhole_math": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "intrinsics_json": ("STRING", {"forceInput": True, "tooltip": "Intrinsics JSON"}),
+                "nlf_data_nah": ("NLFPRED", {"tooltip": "3D NLF Daten Nah"}),
+                "nlf_data_fern": ("NLFPRED", {"tooltip": "3D NLF Daten Fern"}),
+                "config_data": ("STRING", {"default": "{}", "tooltip": "JSON Config"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION", "STRING",)
+    RETURN_NAMES = ("calibration_data", "log_output",)
+    FUNCTION = "calibrate"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+
+    def calibrate(self, pose_nah_scaled, pose_nah_unscaled, depth_nah, pose_fern_scaled, pose_fern_unscaled, depth_fern, norm_method, min_confidence, invert_depth, use_pinhole_math=True, intrinsics_json=None, nlf_data_nah=None, nlf_data_fern=None, config_data="{}"):
+        log_messages = ["=== V21 CALIBRATION LOG (H36M/OPENPOSE AUTO-FIX & SYMMETRIE) ==="]
+        
+        try:
+            config = json.loads(config_data)
+        except:
+            config = {}
+
+        # ---------------------------------------------------------
+        # 1. BERECHNUNG VON NORM & TIEFE (Unverändert)
+        # ---------------------------------------------------------
+        def get_body_metrics(pose_s, pose_u, depth_map):
+            meta_s = pose_s.get("pose_metas", [])[0]
+            meta_u = pose_u.get("pose_metas", [])[0]
+            kps_s = getattr(meta_s, "kps_body", None)
+            confs_s = getattr(meta_s, "kps_body_p", None)
+            kps_u = getattr(meta_u, "kps_body", None)
+            confs_u = getattr(meta_u, "kps_body_p", None)
+            
+            depth_np = depth_map.cpu().numpy() if hasattr(depth_map, 'cpu') else depth_map
+            H, W = depth_np.shape[1], depth_np.shape[2]
+
+            def is_val(kps, confs, idx):
+                if kps is None or idx >= len(kps): return False
+                pt = kps[idx]
+                if pt is None or len(pt) < 2: return False
+                c = float(confs[idx]) if confs is not None and idx < len(confs) else 1.0
+                return c >= min_confidence
+
+            norm = 100.0
+            if norm_method == "Torso (Neck-Hip)":
+                if is_val(kps_s, confs_s, 1) and is_val(kps_s, confs_s, 8) and is_val(kps_s, confs_s, 11):
+                    mid_x = (kps_s[8][0] + kps_s[11][0]) / 2.0
+                    mid_y = (kps_s[8][1] + kps_s[11][1]) / 2.0
+                    norm = math.sqrt((kps_s[1][0] - mid_x)**2 + (kps_s[1][1] - mid_y)**2)
+            else:
+                valid_y = [kps_s[i][1] for i in range(len(kps_s)) if is_val(kps_s, confs_s, i)]
+                valid_x = [kps_s[i][0] for i in range(len(kps_s)) if is_val(kps_s, confs_s, i)]
+                if valid_y and valid_x:
+                    norm = math.sqrt((max(valid_x) - min(valid_x))**2 + (max(valid_y) - min(valid_y))**2)
+            
+            depth = 0.5
+            valid_u_x = [kps_u[idx][0] for idx in [1, 8, 11] if is_val(kps_u, confs_u, idx)]
+            valid_u_y = [kps_u[idx][1] for idx in [1, 8, 11] if is_val(kps_u, confs_u, idx)]
+            if valid_u_x and valid_u_y:
+                min_x = int(max(0, min(valid_u_x) * W))
+                max_x = int(min(W-1, max(valid_u_x) * W))
+                min_y = int(max(0, min(valid_u_y) * H))
+                max_y = int(min(H-1, max(valid_u_y) * H))
+                if max_x > min_x and max_y > min_y:
+                    depth = float(np.mean(depth_np[0, min_y:max_y, min_x:max_x]))
+                    
+            return {"norm": norm, "depth": depth}
+
+        data_nah = get_body_metrics(pose_nah_scaled, pose_nah_unscaled, depth_nah)
+        data_fern = get_body_metrics(pose_fern_scaled, pose_fern_unscaled, depth_fern)
+        norm_nah, norm_fern = data_nah['norm'], data_fern['norm']
+        depth_c, depth_f = data_nah['depth'], data_fern['depth']
+
+        if invert_depth:
+            depth_c = 1.0 / max(depth_c, 0.0001)
+            depth_f = 1.0 / max(depth_f, 0.0001)
+
+        slope, intercept = 0.0, 1.0
+        depth_diff = abs(depth_f - depth_c)
+        if depth_diff > 0.05:
+            slope = (norm_fern - norm_nah) / (depth_f - depth_c)
+            intercept = norm_nah - (slope * depth_c)
+        else:
+            slope = -500.0 if invert_depth else 500.0
+            intercept = norm_nah - (slope * depth_c)
+
+        fx, echte_groesse = 500.0, 0.0
+        if use_pinhole_math:
+            delta_z = abs(data_fern['depth'] - data_nah['depth'])
+            if delta_z > 0.001 and abs(norm_nah - norm_fern) > 0.1:
+                echte_groesse = (norm_nah * norm_fern * delta_z) / (fx * abs(norm_nah - norm_fern))
+            else:
+                echte_groesse = (norm_nah * data_nah['depth']) / fx
+
+        # ---------------------------------------------------------
+        # 2. 3D BONES BERECHNEN (DER FIX FÜR DIE INDIZES!)
+        # ---------------------------------------------------------
+        def extract_all_3d_bones(nlf_data):
+            if nlf_data is None: return None
+            try:
+                pose_input_3d = nlf_data.get('joints3d_nonparam', [nlf_data])[0]
+                if pose_input_3d is not None and len(pose_input_3d) > 0 and len(pose_input_3d[0]) > 0:
+                    pose_3d = pose_input_3d[0][0]
+                    num_joints = len(pose_3d)
+
+                    def dist_3d(p1, p2):
+                        return math.sqrt(sum((a-b)**2 for a, b in zip(p1, p2)))
+
+                    # Wenn 17 Keypoints -> H36M Format (NLF Daten Standard)
+                    if num_joints == 17:
+                        mid_hip = pose_3d[0] # 0 = Pelvis/Mid-Hip in H36M
+                        raw_bones = {
+                            "torso": dist_3d(pose_3d[8], mid_hip), # 8 = Neck
+                            "shoulder_width": dist_3d(pose_3d[14], pose_3d[11]), # 14 = RShoulder, 11 = LShoulder
+                            "hip_width": dist_3d(pose_3d[1], pose_3d[4]), # 1 = RHip, 4 = LHip
+                            "r_arm": dist_3d(pose_3d[14], pose_3d[15]), # RShoulder -> RElbow
+                            "r_forearm": dist_3d(pose_3d[15], pose_3d[16]), # RElbow -> RWrist
+                            "l_arm": dist_3d(pose_3d[11], pose_3d[12]), # LShoulder -> LElbow
+                            "l_forearm": dist_3d(pose_3d[12], pose_3d[13]), # LElbow -> LWrist
+                            "r_thigh": dist_3d(pose_3d[1], pose_3d[2]), # RHip -> RKnee
+                            "r_calf": dist_3d(pose_3d[2], pose_3d[3]), # RKnee -> RAnkle
+                            "l_thigh": dist_3d(pose_3d[4], pose_3d[5]), # LHip -> LKnee
+                            "l_calf": dist_3d(pose_3d[5], pose_3d[6]) # LKnee -> LAnkle
+                        }
+                    else:
+                        # Fallback auf Standard OpenPose Format
+                        mid_hip = [(pose_3d[8][i] + pose_3d[11][i]) / 2.0 for i in range(3)]
+                        raw_bones = {
+                            "torso": dist_3d(pose_3d[1], mid_hip),
+                            "shoulder_width": dist_3d(pose_3d[2], pose_3d[5]),
+                            "hip_width": dist_3d(pose_3d[8], pose_3d[11]),
+                            "r_arm": dist_3d(pose_3d[2], pose_3d[3]),
+                            "r_forearm": dist_3d(pose_3d[3], pose_3d[4]),
+                            "l_arm": dist_3d(pose_3d[5], pose_3d[6]),
+                            "l_forearm": dist_3d(pose_3d[6], pose_3d[7]),
+                            "r_thigh": dist_3d(pose_3d[8], pose_3d[9]),
+                            "r_calf": dist_3d(pose_3d[9], pose_3d[10]),
+                            "l_thigh": dist_3d(pose_3d[11], pose_3d[12]),
+                            "l_calf": dist_3d(pose_3d[12], pose_3d[13])
+                        }
+                    
+                    # SYMMETRIE ERZWINGEN (Beide Seiten mitteln)
+                    sym_bones = {
+                        "torso": raw_bones["torso"],
+                        "shoulder_width": raw_bones["shoulder_width"],
+                        "hip_width": raw_bones["hip_width"],
+                        "r_arm": (raw_bones["r_arm"] + raw_bones["l_arm"]) / 2.0,
+                        "l_arm": (raw_bones["r_arm"] + raw_bones["l_arm"]) / 2.0,
+                        "r_forearm": (raw_bones["r_forearm"] + raw_bones["l_forearm"]) / 2.0,
+                        "l_forearm": (raw_bones["r_forearm"] + raw_bones["l_forearm"]) / 2.0,
+                        "r_thigh": (raw_bones["r_thigh"] + raw_bones["l_thigh"]) / 2.0,
+                        "l_thigh": (raw_bones["r_thigh"] + raw_bones["l_thigh"]) / 2.0,
+                        "r_calf": (raw_bones["r_calf"] + raw_bones["l_calf"]) / 2.0,
+                        "l_calf": (raw_bones["r_calf"] + raw_bones["l_calf"]) / 2.0
+                    }
+                    return sym_bones
+            except Exception as e:
+                log_messages.append(f"Fehler in extract_all_3d_bones: {e}")
+            return None
+
+        bones_nah = extract_all_3d_bones(nlf_data_nah)
+        bones_fern = extract_all_3d_bones(nlf_data_fern)
+
+        true_3d_bones = {}
+        total_3d_height = 0.0
+
+        if bones_nah and bones_fern:
+            # Wir nehmen den Durchschnitt beider Kalibrierungs-Frames für maximale Genauigkeit
+            for key in bones_nah.keys():
+                true_3d_bones[key] = (bones_nah[key] + bones_fern[key]) / 2.0
+                
+            total_3d_height = true_3d_bones["torso"] + true_3d_bones["r_thigh"] + true_3d_bones["r_calf"]
+            head_allowance = config.get("head_allowance_3d", 0.15)
+            total_3d_height += head_allowance
+            log_messages.append("Erfolg: true_3d_bones symmetrisch berechnet (H36M & OpenPose Support)!")
+        elif bones_nah:
+            true_3d_bones = bones_nah
+        elif bones_fern:
+            true_3d_bones = bones_fern
+        else:
+            log_messages.append("Fehler: Konnte keine 3D-Bones extrahieren.")
+
+        calib_data = {
+            "perspective_slope": slope,
+            "perspective_intercept": intercept,
+            "is_depth_inverted": invert_depth,
+            "norm_method": norm_method,
+            "use_pinhole_math": use_pinhole_math,
+            "focal_length_fx": fx,
+            "echte_groesse": echte_groesse,
+            "true_3d_bones": true_3d_bones,
+            "total_3d_height": total_3d_height,
+            "config": config
+        }
+
+        return (calib_data, "\n".join(log_messages))
+
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -13004,6 +13216,7 @@ NODE_CLASS_MAPPINGS = {
     "RenderNLFPosesDirect4": RenderNLFPosesDirect4,
     "PoseCalibrationV20": PoseCalibrationV20,
     "NLFProportionalRetargeterV3": NLFProportionalRetargeterV3,
+    "PoseCalibrationV21": PoseCalibrationV21,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -13079,6 +13292,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RenderNLFPosesDirect4": "Render NLF Poses Direct 4",
     "PoseCalibrationV20": "Pose Calibration V20 (Full 3D & Smart Calf)",
     "NLFProportionalRetargeterV3": "NLF Proportional Retargeter V3 (Best Frame Fallback)",
+    "PoseCalibrationV21": "Pose Calibration V21 (Symmetric Auto-Fix)",
 
 }
 
