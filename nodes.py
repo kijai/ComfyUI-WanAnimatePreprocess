@@ -13371,7 +13371,7 @@ class NLFProportionalRetargeterV4:
     RETURN_NAMES = ("nlf_data_retargeted", "log_output")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V4: Echter Kinematic Tree! H36M/OpenPose kompatibel."
+    DESCRIPTION = "V4: Echter Kinematic Tree! SMPL (24) kompatibel mit V22!"
 
     def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance):
         import copy
@@ -13399,9 +13399,7 @@ class NLFProportionalRetargeterV4:
             norm = torch.norm(vec)
             return vec / norm if norm > 1e-6 else vec
 
-        # ==========================================
         # 1. REFERENZ-PROPORTIONEN (Von V22)
-        # ==========================================
         ref_torso = target_bones.get("torso", 1.0)
         if ref_torso <= 0: ref_torso = 1.0
 
@@ -13409,42 +13407,50 @@ class NLFProportionalRetargeterV4:
         for bone_name, length in target_bones.items():
             target_props[bone_name] = length / ref_torso
 
-        # ==========================================
-        # 2. INDIZES CHECKEN (Der Fix!)
-        # ==========================================
+        # 2. INDIZES CHECKEN (DER WICHTIGE FIX FÜR SMPL 24!)
         first_valid = next((f for f in pose_input_3d if f is not None and len(f) > 0), None)
         if first_valid is None:
             return (video_nlf_data, "FEHLER: NLF Daten leer.")
         
         num_joints = len(first_valid[0])
         is_h36m = (num_joints == 17)
+        is_smpl = (num_joints >= 24)
 
-        if is_h36m:
+        if is_smpl:
+            idx_mid_hip, idx_neck, idx_head = 0, 12, 15
+            idx_r_sh, idx_r_el, idx_r_wr = 16, 18, 20
+            idx_l_sh, idx_l_el, idx_l_wr = 17, 19, 21
+            idx_r_hip, idx_r_knee, idx_r_ankle = 1, 4, 7
+            idx_l_hip, idx_l_knee, idx_l_ankle = 2, 5, 8
+            log_messages.append("--> Format erkannt: SMPL (24 Keypoints)")
+        elif is_h36m:
             idx_mid_hip, idx_neck, idx_head = 0, 8, 9
             idx_r_hip, idx_r_knee, idx_r_ankle = 1, 2, 3
             idx_l_hip, idx_l_knee, idx_l_ankle = 4, 5, 6
             idx_l_sh, idx_l_el, idx_l_wr = 11, 12, 13
             idx_r_sh, idx_r_el, idx_r_wr = 14, 15, 16
+            log_messages.append("--> Format erkannt: H36M (17 Keypoints)")
         else:
             idx_neck, idx_head = 1, 0
             idx_r_sh, idx_r_el, idx_r_wr = 2, 3, 4
             idx_l_sh, idx_l_el, idx_l_wr = 5, 6, 7
             idx_r_hip, idx_r_knee, idx_r_ankle = 8, 9, 10
             idx_l_hip, idx_l_knee, idx_l_ankle = 11, 12, 13
+            log_messages.append(f"--> Format erkannt: OpenPose ({num_joints} Keypoints)")
 
         def get_mid_hip(pts):
-            if is_h36m: return pts[idx_mid_hip]
+            if is_smpl or is_h36m: return pts[idx_mid_hip]
             return (pts[idx_r_hip] + pts[idx_l_hip]) / 2.0
 
-        # ==========================================
-        # 3. BESTEN FRAME FINDEN (Fallback-Richtung)
-        # ==========================================
+        # 3. BESTEN FRAME FINDEN
         best_idx = 0
         max_leg_prop = 0.0
         for i, frame_data in enumerate(pose_input_3d):
             if frame_data is None or len(frame_data) == 0: continue
             pose_3d = frame_data[0]
             
+            if len(pose_3d) < max(idx_l_ankle, idx_r_ankle): continue
+
             l_hip, r_hip = pose_3d[idx_l_hip], pose_3d[idx_r_hip]
             dz, dx = abs(l_hip[2] - r_hip[2]), abs(l_hip[0] - r_hip[0])
             angle = math.degrees(math.atan2(dz, dx)) if dx > 0 else 90.0
@@ -13464,10 +13470,9 @@ class NLFProportionalRetargeterV4:
 
         best_pose_3d = pose_input_3d[best_idx][0]
         best_mid_hip = get_mid_hip(best_pose_3d)
+        log_messages.append(f"Bester Frame für Fallbacks: {best_idx}")
 
-        # ==========================================
         # 4. KINEMATIC TREE AUFBAU
-        # ==========================================
         frames_retargeted = 0
         for i in range(len(pose_input_3d)):
             frame_data = pose_input_3d[i]
@@ -13489,7 +13494,14 @@ class NLFProportionalRetargeterV4:
             # 1. TORSO (Neck = Anker)
             torso_dir = get_dir(pts_orig[idx_neck], mid_hip_orig, best_pose_3d[idx_neck], best_mid_hip)
             mid_hip_new = pts_new[idx_neck] + (torso_dir * base_len)
-            if is_h36m: pts_new[idx_mid_hip] = mid_hip_new
+            if is_smpl or is_h36m: pts_new[idx_mid_hip] = mid_hip_new
+
+            # Falls SMPL: Wirbelsäule (Spine) interpolieren, damit der Rücken nicht kaputt geht
+            if is_smpl:
+                for spine_idx in [3, 6, 9]:
+                    if spine_idx < len(pts_orig):
+                        ratio = get_dist(pts_orig[idx_neck], pts_orig[spine_idx]) / base_len
+                        pts_new[spine_idx] = pts_new[idx_neck] + (mid_hip_new - pts_new[idx_neck]) * ratio
 
             # 2. HÜFTEN
             hip_half_len = (base_len * target_props.get("hip_width", 0.2)) / 2.0
@@ -13504,6 +13516,12 @@ class NLFProportionalRetargeterV4:
             l_sh_dir = get_dir(pts_orig[idx_neck], pts_orig[idx_l_sh], best_pose_3d[idx_neck], best_pose_3d[idx_l_sh])
             pts_new[idx_r_sh] = pts_new[idx_neck] + (r_sh_dir * shoulder_half_len)
             pts_new[idx_l_sh] = pts_new[idx_neck] + (l_sh_dir * shoulder_half_len)
+            
+            # Falls SMPL: Kragenbeine (Collar) interpolieren
+            if is_smpl:
+                for col_idx, sh_idx in [(13, idx_r_sh), (12, idx_l_sh)]:
+                    if col_idx < len(pts_orig):
+                        pts_new[col_idx] = pts_new[idx_neck] + (pts_new[sh_idx] - pts_new[idx_neck]) * 0.5
 
             # 4. BEINE
             r_thigh_len = base_len * target_props.get("r_thigh", 0.4)
@@ -13542,7 +13560,7 @@ class NLFProportionalRetargeterV4:
             # 6. KOPF & EXTRAS
             pts_new[idx_head] = pts_new[idx_neck] + (pts_orig[idx_head] - pts_orig[idx_neck])
 
-            if not is_h36m:
+            if not is_h36m and not is_smpl:
                 if len(pts_orig) > 18: pts_new[18] = pts_new[idx_l_ankle] + (pts_orig[18] - pts_orig[idx_l_ankle])
                 if len(pts_orig) > 19: pts_new[19] = pts_new[idx_r_ankle] + (pts_orig[19] - pts_orig[idx_r_ankle])
 
@@ -13557,7 +13575,6 @@ class NLFProportionalRetargeterV4:
             nlf_data_retargeted = pose_input_3d
 
         return (nlf_data_retargeted, "\n".join(log_messages))
-
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
