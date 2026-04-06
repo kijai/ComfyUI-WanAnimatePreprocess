@@ -12135,7 +12135,7 @@ class PoseGlobalPerspectiveScalerV38:
 
 
 # ======================================================================
-# 3. RenderNLFPosesDirect (Akzeptiert Config und modifiziert Kamera-Linse)
+# 3. RenderNLFPosesDirect (Mit detailliertem Kamera-Debugging & Log-Ausgang)
 # ======================================================================
 class RenderNLFPosesDirect2:
     @classmethod
@@ -12153,8 +12153,9 @@ class RenderNLFPosesDirect2:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("image", "mask")
+    # NEU: Ein String-Output für das Logging!
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("image", "mask", "log_output")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
     DESCRIPTION = "Rendert NLF-Daten und wendet smarte Kamera-Zooms an."
@@ -12164,55 +12165,111 @@ class RenderNLFPosesDirect2:
         import json
         import torch
         import numpy as np
+        import traceback
         from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
         
+        log_messages = ["=== RENDER NLF POSES DIRECT LOG ==="]
+
         if render_backend == "taichi":
             try:
                 import taichi as ti
                 ti.init(arch=ti.gpu)
-            except:
+                log_messages.append("Render-Backend: Taichi GPU initialisiert.")
+            except Exception as e:
                 render_backend = "torch"
-
-        pose_input = nlf_poses['joints3d_nonparam'][0] if isinstance(nlf_poses, dict) else nlf_poses
-        dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
-        
-        # 1. Standard Kamera Matrix erstellen
-        intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
-        
-        # 2. DEN KLUGE KAMERA ZOOM ANWENDEN (aus Config)
-        try:
-            config = json.loads(nlf_render_config)
-            if "anchor_scale" in config:
-                scale_y = config["anchor_scale"]
-                scale_x = config.get("scale_x_factor", scale_y)
-                
-                # Pivot-Punkte in absolute Pixel umrechnen
-                p_x = config["pivot_x"] * width
-                p_y = config["pivot_y"] * height
-                
-                # KAMERA MAGIE: Wir verändern die Brennweite (Zoom) und verschieben die Linse zum Pivot-Punkt!
-                intrinsic_matrix[0, 0] *= scale_x  # Zoom X
-                intrinsic_matrix[1, 1] *= scale_y  # Zoom Y
-                intrinsic_matrix[0, 2] = intrinsic_matrix[0, 2] * scale_x + p_x * (1.0 - scale_x) # Center X verschieben
-                intrinsic_matrix[1, 2] = intrinsic_matrix[1, 2] * scale_y + p_y * (1.0 - scale_y) # Center Y verschieben
-                
-                print(f"[RenderNLFPosesDirect] Smart Camera Zoom applied: {scale_y:.3f}x")
-        except:
-            pass # Wenn keine Config anliegt, rendert er einfach ganz normal!
-
-        if pose_input[0].shape[0] > 1:
-            frames_np = render_multi_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=True, draw_hands=True, render_backend=render_backend)
+                log_messages.append(f"WARNUNG: Taichi GPU fehlgeschlagen. Nutze Torch. Fehler: {e}")
         else:
-            frames_np = render_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=True, draw_hands=True, render_backend=render_backend)
+            log_messages.append("Render-Backend: Torch.")
 
-        frames_tensor = torch.from_numpy(np.stack(frames_np, axis=0)).contiguous() / 255.0
-        frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
-        
-        return (frames_tensor.cpu().float(), mask.cpu().float())
+        try:
+            pose_input = nlf_poses['joints3d_nonparam'][0] if isinstance(nlf_poses, dict) else nlf_poses
+            dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
+            
+            if len(pose_input) > 0 and pose_input[0] is not None:
+                log_messages.append(f"Erfolgreich geladen: {len(pose_input)} Frames.")
+            else:
+                log_messages.append("WARNUNG: pose_input ist leer!")
 
-# MAPPINGS FÜR DIE NODES:
-# "PoseGlobalPerspectiveScalerV38": PoseGlobalPerspectiveScalerV38,
-# "RenderNLFPosesDirect": RenderNLFPosesDirect,
+            # 1. Standard Kamera Matrix erstellen
+            intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
+            log_messages.append(f"\nOriginal Intrinsic Matrix:\n{intrinsic_matrix.round(2)}")
+            
+            # 2. DEN KLUGE KAMERA ZOOM ANWENDEN (aus Config)
+            try:
+                config = json.loads(nlf_render_config)
+                log_messages.append(f"\nEmpfangene Config: {config}")
+                
+                if "anchor_scale" in config:
+                    scale_y = float(config["anchor_scale"])
+                    scale_x = float(config.get("scale_x_factor", scale_y))
+                    
+                    # Pivot-Punkte (sollten normalisiert 0.0 - 1.0 sein)
+                    pivot_x_norm = float(config["pivot_x"])
+                    pivot_y_norm = float(config["pivot_y"])
+                    
+                    # In absolute Pixel umrechnen
+                    p_x = pivot_x_norm * width
+                    p_y = pivot_y_norm * height
+                    
+                    log_messages.append(f"Kamera Zoom X: {scale_x:.3f} | Zoom Y: {scale_y:.3f}")
+                    log_messages.append(f"Kamera Fokus-Punkt (Pixel): X={p_x:.1f}, Y={p_y:.1f}")
+                    
+                    cx_alt = intrinsic_matrix[0, 2]
+                    cy_alt = intrinsic_matrix[1, 2]
+                    
+                    # KAMERA MAGIE: Wir verändern die Brennweite (Zoom) und verschieben die Linse!
+                    intrinsic_matrix[0, 0] *= scale_x  
+                    intrinsic_matrix[1, 1] *= scale_y  
+                    intrinsic_matrix[0, 2] = cx_alt * scale_x + p_x * (1.0 - scale_x) 
+                    intrinsic_matrix[1, 2] = cy_alt * scale_y + p_y * (1.0 - scale_y) 
+                    
+                    log_messages.append(f"Center X verschoben: {cx_alt:.1f} -> {intrinsic_matrix[0, 2]:.1f}")
+                    log_messages.append(f"Center Y verschoben: {cy_alt:.1f} -> {intrinsic_matrix[1, 2]:.1f}")
+                    log_messages.append(f"\nModifizierte Intrinsic Matrix:\n{intrinsic_matrix.round(2)}")
+                else:
+                    log_messages.append("Kein 'anchor_scale' in Config. Rendere in Standard-Größe.")
+            except Exception as e:
+                log_messages.append(f"Fehler beim Lesen der Config (Rendere Standard): {e}")
+
+            # 3. Rendern
+            log_messages.append("\nStarte Render-Prozess...")
+            is_multi = False
+            if len(pose_input) > 0:
+                if isinstance(pose_input[0], list):
+                    is_multi = len(pose_input[0]) > 1
+                elif isinstance(pose_input[0], torch.Tensor) and pose_input[0].dim() == 3:
+                    is_multi = pose_input[0].shape[0] > 1
+
+            if is_multi:
+                frames_np = render_multi_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=True, draw_hands=True, render_backend=render_backend)
+            else:
+                frames_np = render_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=True, draw_hands=True, render_backend=render_backend)
+
+            # Prüfe auf schwarze Bilder
+            black_frames = 0
+            for frame in frames_np:
+                if np.max(frame) < 5: # Wenn der hellste Pixel fast schwarz ist
+                    black_frames += 1
+            
+            if black_frames > 0:
+                log_messages.append(f"KRITISCH: {black_frames} von {len(frames_np)} generierten Frames sind komplett SCHWARZ! Die Kamera hat die Person vermutlich aus dem Bildbereich geschoben.")
+            else:
+                log_messages.append("Rendering abgeschlossen. Bilder enthalten Pixel-Daten (nicht schwarz).")
+
+            frames_tensor = torch.from_numpy(np.stack(frames_np, axis=0)).contiguous() / 255.0
+            frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
+            
+            return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages))
+
+        except Exception as e:
+            log_messages.append(f"FATALER ABSTURZ BEIM RENDERN: {e}")
+            log_messages.append("--- TRACEBACK ---")
+            log_messages.append(traceback.format_exc())
+            log_messages.append("-----------------")
+            
+            empty_img = torch.zeros((1, height, width, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((1, height, width), dtype=torch.float32)
+            return (empty_img, empty_mask, "\n".join(log_messages))
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
