@@ -13773,79 +13773,6 @@ class NLFConfigScaler3DBones:
         return (data,)
         
 
-class RenderNLFPosesDirectV5:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "nlf_data": ("NLFPRED", {"tooltip": "Die skalierten 3D NLF Daten vom Retargeter"}),
-                "width": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 8, "tooltip": "Breite der Ausgabe"}),
-                "height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 8, "tooltip": "Höhe der Ausgabe"}),
-                "render_backend": (["torch", "taichi"], {"default": "torch", "tooltip": "Taichi ist schneller, Torch ist kompatibler"}),
-                "draw_2d": ("BOOLEAN", {"default": False, "tooltip": "Zeichne 2D DW Posen darüber (falls vorhanden)"}),
-            },
-            "optional": {
-                "dw_poses": ("POSE_KEYPOINT", {"tooltip": "Optional für 2D Gesichts/Hand-Details"}),
-            }
-        }
-
-    RETURN_TYPES = ("IMAGE", "NLFPRED",)
-    RETURN_NAMES = ("images", "nlf_data_scaled",)
-    FUNCTION = "process"
-    CATEGORY = "WanAnimatePreprocess/Render"
-
-    def process(self, nlf_data, width, height, render_backend, draw_2d, dw_poses=None):
-        import torch
-        import numpy as np
-        from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images
-        
-        # 1. Posen sicher extrahieren (unterstützt verschiedene NLF-Formate)
-        smpl_poses = None
-        if isinstance(nlf_data, dict):
-            smpl_poses = nlf_data.get('joints3d_nonparam', [nlf_data])[0]
-        elif isinstance(nlf_data, list):
-            if len(nlf_data) > 0 and isinstance(nlf_data[0], dict) and 'nlfpose' in nlf_data[0]:
-                from .NLFPoseExtract.nlf_render import collect_smpl_poses
-                smpl_poses = collect_smpl_poses(nlf_data)
-            else:
-                smpl_poses = nlf_data
-        else:
-            smpl_poses = nlf_data
-
-        video_length = len(smpl_poses)
-
-        # 2. Rendern der NLF 3D Posen (mit den neuen skalierten Knochen)
-        frames_np_rgba = render_multi_nlf_as_images(
-            smpl_poses, 
-            dw_poses if draw_2d else None, 
-            height, 
-            width, 
-            video_length, 
-            intrinsic_matrix=None, 
-            draw_2d=draw_2d, 
-            draw_face=True, 
-            draw_hands=True, 
-            render_backend=render_backend
-        )
-
-        # 3. RGBA zu RGB Konvertierung und Tensor Format für ComfyUI
-        out_frames = []
-        for img in frames_np_rgba:
-            # RGB extrahieren falls RGBA
-            rgb_img = img[..., :3] if img.shape[-1] == 4 else img
-            
-            # Normalisieren auf 0.0 - 1.0 für ComfyUI
-            if rgb_img.max() > 1.0:
-                rgb_img = rgb_img.astype(np.float32) / 255.0
-                
-            out_frames.append(torch.from_numpy(rgb_img))
-
-        # (N, H, W, C) Stack für ComfyUI Images
-        result_images = torch.stack(out_frames)
-
-        # 4. Bilder ausgeben UND die skalierten Daten durchschleifen!
-        return (result_images, nlf_data)
-
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -13925,7 +13852,6 @@ NODE_CLASS_MAPPINGS = {
     "NLFProportionalRetargeterV4": NLFProportionalRetargeterV4,
     "NLFProportionalRetargeterV5": NLFProportionalRetargeterV5,
     "NLFConfigScaler3DBones": NLFConfigScaler3DBones,
-    "RenderNLFPosesDirectV5": RenderNLFPosesDirectV5,
     
 }
 
@@ -14007,7 +13933,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFProportionalRetargeterV4": "NLF Proportional Retargeter V4",
     "NLFProportionalRetargeterV5": "NLF Proportional Retargeter V5",
     "NLFConfigScaler3DBones": "NLF Config caler 3D Bones",
-    "RenderNLFPosesDirectV5": "Render NLF Poses Direct V5",
 
 
 }
