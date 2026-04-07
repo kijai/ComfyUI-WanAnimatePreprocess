@@ -13705,6 +13705,147 @@ class NLFProportionalRetargeterV5:
         
         return (nlf_data_retargeted, "\n".join(log_messages))
 
+class NLFConfigScaler3DBones:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "calibration_data": ("POSE_CALIBRATION", {"tooltip": "Die originalen Konfigurationsdaten (aus V22 JSON)"}),
+                "torso_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.05, "tooltip": "1.0 = keine Änderung"}),
+                "shoulder_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.05}),
+                "hip_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.05}),
+                "arm_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.05, "tooltip": "Oberarme (Links & Rechts gekoppelt)"}),
+                "forearm_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.05, "tooltip": "Unterarme (Links & Rechts gekoppelt)"}),
+                "thigh_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.05, "tooltip": "Oberschenkel (Links & Rechts gekoppelt)"}),
+                "calf_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.05, "tooltip": "Waden/Unterschenkel (Links & Rechts gekoppelt)"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION",)
+    RETURN_NAMES = ("scaled_calibration_data",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Retargeting"
+
+    def process(self, calibration_data, torso_scale, shoulder_scale, hip_scale, arm_scale, forearm_scale, thigh_scale, calf_scale):
+        import copy
+        import math
+        
+        # Tiefe Kopie, damit wir die originalen Daten nicht überschreiben
+        data = copy.deepcopy(calibration_data)
+        bones = data.get("true_3d_bones", {})
+        
+        if not bones:
+            return (data,)
+            
+        # Prüfen, ob wir mit den 100% Prozentdaten (V22) arbeiten
+        is_normalized = math.isclose(bones.get("torso", 0.0), 100.0, abs_tol=1e-3)
+
+        # 1. Gekoppeltes Skalieren der einzelnen "Pakete"
+        if "shoulder_width" in bones: bones["shoulder_width"] *= shoulder_scale
+        if "hip_width" in bones: bones["hip_width"] *= hip_scale
+        
+        if "r_arm" in bones: bones["r_arm"] *= arm_scale
+        if "l_arm" in bones: bones["l_arm"] *= arm_scale
+        
+        if "r_forearm" in bones: bones["r_forearm"] *= forearm_scale
+        if "l_forearm" in bones: bones["l_forearm"] *= forearm_scale
+        
+        if "r_thigh" in bones: bones["r_thigh"] *= thigh_scale
+        if "l_thigh" in bones: bones["l_thigh"] *= thigh_scale
+        
+        if "r_calf" in bones: bones["r_calf"] *= calf_scale
+        if "l_calf" in bones: bones["l_calf"] *= calf_scale
+
+        # 2. Smart Torso Scale
+        # Wenn der Torso der 100% Anker ist, skalieren wir alle anderen Knochen invers, 
+        # anstatt den Torso-Wert zu verändern. Das hält die Mathematik sauber!
+        if torso_scale != 1.0:
+            if is_normalized:
+                for k in bones.keys():
+                    if k != "torso":
+                        bones[k] /= torso_scale
+            else:
+                # Fallback für unsaubere/alte V20 Daten
+                bones["torso"] *= torso_scale
+
+        data["true_3d_bones"] = bones
+        
+        return (data,)
+        
+
+class RenderNLFPosesDirectV5:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "nlf_data": ("NLFPRED", {"tooltip": "Die skalierten 3D NLF Daten vom Retargeter"}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 8, "tooltip": "Breite der Ausgabe"}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 8, "tooltip": "Höhe der Ausgabe"}),
+                "render_backend": (["torch", "taichi"], {"default": "torch", "tooltip": "Taichi ist schneller, Torch ist kompatibler"}),
+                "draw_2d": ("BOOLEAN", {"default": False, "tooltip": "Zeichne 2D DW Posen darüber (falls vorhanden)"}),
+            },
+            "optional": {
+                "dw_poses": ("POSE_KEYPOINT", {"tooltip": "Optional für 2D Gesichts/Hand-Details"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "NLFPRED",)
+    RETURN_NAMES = ("images", "nlf_data_scaled",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Render"
+
+    def process(self, nlf_data, width, height, render_backend, draw_2d, dw_poses=None):
+        import torch
+        import numpy as np
+        from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images
+        
+        # 1. Posen sicher extrahieren (unterstützt verschiedene NLF-Formate)
+        smpl_poses = None
+        if isinstance(nlf_data, dict):
+            smpl_poses = nlf_data.get('joints3d_nonparam', [nlf_data])[0]
+        elif isinstance(nlf_data, list):
+            if len(nlf_data) > 0 and isinstance(nlf_data[0], dict) and 'nlfpose' in nlf_data[0]:
+                from .NLFPoseExtract.nlf_render import collect_smpl_poses
+                smpl_poses = collect_smpl_poses(nlf_data)
+            else:
+                smpl_poses = nlf_data
+        else:
+            smpl_poses = nlf_data
+
+        video_length = len(smpl_poses)
+
+        # 2. Rendern der NLF 3D Posen (mit den neuen skalierten Knochen)
+        frames_np_rgba = render_multi_nlf_as_images(
+            smpl_poses, 
+            dw_poses if draw_2d else None, 
+            height, 
+            width, 
+            video_length, 
+            intrinsic_matrix=None, 
+            draw_2d=draw_2d, 
+            draw_face=True, 
+            draw_hands=True, 
+            render_backend=render_backend
+        )
+
+        # 3. RGBA zu RGB Konvertierung und Tensor Format für ComfyUI
+        out_frames = []
+        for img in frames_np_rgba:
+            # RGB extrahieren falls RGBA
+            rgb_img = img[..., :3] if img.shape[-1] == 4 else img
+            
+            # Normalisieren auf 0.0 - 1.0 für ComfyUI
+            if rgb_img.max() > 1.0:
+                rgb_img = rgb_img.astype(np.float32) / 255.0
+                
+            out_frames.append(torch.from_numpy(rgb_img))
+
+        # (N, H, W, C) Stack für ComfyUI Images
+        result_images = torch.stack(out_frames)
+
+        # 4. Bilder ausgeben UND die skalierten Daten durchschleifen!
+        return (result_images, nlf_data)
+
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -13783,6 +13924,9 @@ NODE_CLASS_MAPPINGS = {
     "PoseCalibrationV22": PoseCalibrationV22,
     "NLFProportionalRetargeterV4": NLFProportionalRetargeterV4,
     "NLFProportionalRetargeterV5": NLFProportionalRetargeterV5,
+    "NLFConfigScaler3DBones": NLFConfigScaler3DBones,
+    "RenderNLFPosesDirect5": RenderNLFPosesDirect5,
+    
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -13862,6 +14006,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseCalibrationV22": "Pose Calibration V22",
     "NLFProportionalRetargeterV4": "NLF Proportional Retargeter V4",
     "NLFProportionalRetargeterV5": "NLF Proportional Retargeter V5",
+    "NLFConfigScaler3DBones": "NLF Config caler 3D Bones",
+    "RenderNLFPosesDirect5": "Render NLF Poses Direct 5",
 
 
 }
