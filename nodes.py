@@ -13378,7 +13378,7 @@ class NLFProportionalRetargeterV4:
         import math
         import torch
 
-        log_messages = ["=== NLF PROPORTIONAL RETARGETER V4 (KINEMATIC TREE) ==="]
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V4 (VEKTOR KINEMATIK) ==="]
         
         true_3d_bones = calibration_data.get("true_3d_bones", {})
         if not true_3d_bones:
@@ -13388,38 +13388,38 @@ class NLFProportionalRetargeterV4:
         is_dict = isinstance(video_nlf_data, dict)
         nlf_data_retargeted = copy.deepcopy(video_nlf_data)
         
-        raw_poses = nlf_data_retargeted.get('joints3d_nonparam', [nlf_data_retargeted])[0] if is_dict else nlf_data_retargeted
-
-        # Check für V22 (Prozentuales Torso-System)
-        is_normalized = math.isclose(true_3d_bones.get("torso", 0.0), 100.0, abs_tol=1e-3)
-        if is_normalized:
-            log_messages.append("Modus: NORMALISIERT V22 (Prozentual + Kinematischer Baum).")
+        # Sicheres extrahieren der Posen
+        if is_dict:
+            raw_poses = nlf_data_retargeted.get('joints3d_nonparam', [nlf_data_retargeted])[0]
         else:
-            log_messages.append("Modus: ABSOLUT V20 (Absolute Werte + Kinematischer Baum).")
+            raw_poses = nlf_data_retargeted
 
-        # Definition des Skelett-Baums (Wer ist wessen Kind?)
-        # Wichtig: Wenn sich das Parent bewegt, MÜSSEN die Kinder mit!
-        tree_children = {
-            1: [0, 2, 5, 8, 11], # Neck -> Kopf, Schultern, Hüften
-            2: [3],              # R Shoulder -> R Elbow
-            3: [4],              # R Elbow -> R Wrist
-            5: [6],              # L Shoulder -> L Elbow
-            6: [7],              # L Elbow -> L Wrist
-            8: [9],              # R Hip -> R Knee
-            9: [10],             # R Knee -> R Ankle
-            11: [12],            # L Hip -> L Knee
-            12: [13]             # L Knee -> L Ankle
+        # Check: Sind es V22 Prozent-Werte?
+        is_normalized = math.isclose(true_3d_bones.get("torso", 0.0), 100.0, abs_tol=1e-3)
+
+        # --- SMPL 3D KINEMATISCHER BAUM ---
+        # Definiert, wer an wem hängt. Wenn sich ein Parent verschiebt, wandern alle Kinder mit!
+        # 0: Pelvis, 12: Neck
+        # 16: L_Shoulder, 18: L_Elbow, 20: L_Wrist
+        # 17: R_Shoulder, 19: R_Elbow, 21: R_Wrist
+        # 1: L_Hip, 4: L_Knee, 7: L_Ankle
+        # 2: R_Hip, 5: R_Knee, 8: R_Ankle
+        tree = {
+            0: [1, 2, 3],
+            1: [4], 4: [7], 7: [10],           # Linkes Bein
+            2: [5], 5: [8], 8: [11],           # Rechtes Bein
+            3: [6], 6: [9], 9: [12, 13, 14],   # Wirbelsäule
+            12: [15],                          # Kopf
+            13: [16], 16: [18], 18: [20], 20: [22], # Linker Arm
+            14: [17], 17: [19], 19: [21], 21: [23]  # Rechter Arm
         }
 
-        # Rekursive Funktion: Findet alle Anhängsel, die mitverschoben werden müssen
-        def get_all_descendants(joint_idx, tree, anchors_map):
+        def get_all_descendants(node, tree_map):
             desc = []
-            if joint_idx in anchors_map:
-                desc.extend(anchors_map[joint_idx])
-            if joint_idx in tree:
-                for child in tree[joint_idx]:
+            if node in tree_map:
+                for child in tree_map[node]:
                     desc.append(child)
-                    desc.extend(get_all_descendants(child, tree, anchors_map))
+                    desc.extend(get_all_descendants(child, tree_map))
             return desc
 
         frames_processed = 0
@@ -13429,90 +13429,91 @@ class NLFProportionalRetargeterV4:
             if frame_data is None or len(frame_data) == 0:
                 continue
                 
+            # Sicherstellen, dass wir ein Numpy-Array haben (kompatibel mit Tensor/Listen)
             is_tensor = isinstance(frame_data, torch.Tensor)
             if is_tensor:
-                pts = frame_data[0].cpu().numpy() if frame_data.dim() == 3 else frame_data.cpu().numpy()
+                pts = frame_data[0].cpu().numpy().copy() if frame_data.dim() == 3 else frame_data.cpu().numpy().copy()
             else:
                 arr = np.array(frame_data)
-                pts = arr[0] if arr.ndim == 3 else arr
+                pts = arr[0].copy() if arr.ndim == 3 else arr.copy()
             
             pts_new = pts.copy()
 
-            # 1. Torso-Länge im aktuellen Frame messen
-            mid_hip = (pts[8] + pts[11]) / 2.0
-            current_torso_length = np.linalg.norm(pts[1] - mid_hip)
+            # 1. Torso-Länge als Vektor zwischen Hals [12] und Becken [0] messen
+            vec_torso = pts[12] - pts[0]
+            current_torso_length = np.linalg.norm(vec_torso)
+            
             if current_torso_length < 1e-5:
-                continue 
+                continue
 
-            # 2. V22 Ziel-Längen für diesen Frame absolut ausrechnen
+            # 2. Ziel-Längen berechnen (Einheiten anhand des Torsos)
             targets = {}
             for k, v in true_3d_bones.items():
-                if is_normalized:
-                    targets[k] = (v / 100.0) * current_torso_length
-                else:
-                    targets[k] = v
+                targets[k] = (v / 100.0) * current_torso_length if is_normalized else v
 
-            # 3. ANKERPUNKTE: Falls das Skelett Gesichts/Hand-Punkte hat (>14 Punkte)
-            # Hängen wir diese dynamisch an das nächstgelegene Hauptgelenk!
-            num_base_joints = min(14, len(pts))
-            anchors = {i: [] for i in range(num_base_joints)}
-            if len(pts) > num_base_joints:
-                for i in range(num_base_joints, len(pts)):
-                    distances = [np.linalg.norm(pts[i] - pts[j]) for j in range(num_base_joints)]
-                    closest_j = int(np.argmin(distances))
-                    anchors[closest_j].append(i)
-
-            # 4. SKALIERUNG (Operationen müssen in dieser Reihenfolge von innen nach außen ablaufen!)
+            # 3. KINEMATISCHE OPERATIONEN (Reihenfolge wichtig: Zuerst Körpermitte, dann Extremitäten)
             operations = [
-                ('shoulder_width', 1, 2),     # R Shoulder
-                ('shoulder_width', 1, 5),     # L Shoulder
-                ('hip_width', 'mid_hip', 8),  # R Hip
-                ('hip_width', 'mid_hip', 11), # L Hip
-                ('r_arm', 2, 3),              # Oberarm rechts
-                ('r_forearm', 3, 4),          # Unterarm rechts
-                ('l_arm', 5, 6),              # Oberarm links
-                ('l_forearm', 6, 7),          # Unterarm links
-                ('r_thigh', 8, 9),            # Oberschenkel rechts
-                ('r_calf', 9, 10),            # Unterschenkel rechts
-                ('l_thigh', 11, 12),          # Oberschenkel links
-                ('l_calf', 12, 13)            # Unterschenkel links
+                # Virtuelle Vektoren (Hals zu Schultern, Becken zu Hüften)
+                ('shoulder_width', 12, 17), # Hals -> R Schulter
+                ('shoulder_width', 12, 16), # Hals -> L Schulter
+                ('hip_width', 0, 2),        # Becken -> R Hüfte
+                ('hip_width', 0, 1),        # Becken -> L Hüfte
+                
+                # Arm Vektoren
+                ('r_arm', 17, 19),          # R Schulter -> R Ellbogen
+                ('r_forearm', 19, 21),      # R Ellbogen -> R Handgelenk
+                ('l_arm', 16, 18),          # L Schulter -> L Ellbogen
+                ('l_forearm', 18, 20),      # L Ellbogen -> L Handgelenk
+                
+                # Bein Vektoren
+                ('r_thigh', 2, 5),          # R Hüfte -> R Knie
+                ('r_calf', 5, 8),           # R Knie -> R Knöchel
+                ('l_thigh', 1, 4),          # L Hüfte -> L Knie
+                ('l_calf', 4, 7)            # L Knie -> L Knöchel
             ]
 
-            # Feste Basis-Hüfte für Symmetrie beim Hip-Width Skalieren
-            fixed_mid_hip = (pts_new[8] + pts_new[11]) / 2.0
-
-            for bone_key, parent, child in operations:
+            for bone_key, p_idx, c_idx in operations:
                 if bone_key not in targets: continue
-                if child >= len(pts_new): continue
+                if c_idx >= len(pts_new) or p_idx >= len(pts_new): continue
                 
                 target_len = targets[bone_key]
-                # Schulter/Hüftbreite in der Config sind Gesamtbreiten, wir brauchen nur die Hälfte pro Seite
+                # Breite halbieren, da wir vom Zentrum (Hals/Becken) nach außen messen
                 if bone_key in ['shoulder_width', 'hip_width']:
                     target_len = target_len / 2.0
-                    
-                p_pos = fixed_mid_hip if parent == 'mid_hip' else pts_new[parent]
-                c_pos = pts_new[child]
                 
+                # Wir holen uns die *aktuellen* Positionen (falls das Parent sich schon verschoben hat!)
+                p_pos = pts_new[p_idx]
+                c_pos = pts_new[c_idx]
+                
+                # Schutz gegen nicht erkannte [0,0,0] Gelenke
+                if np.linalg.norm(p_pos) < 1e-5 or np.linalg.norm(c_pos) < 1e-5:
+                    continue
+
+                # Den Vektor bilden
                 vec = c_pos - p_pos
                 curr_len = np.linalg.norm(vec)
+                
                 if curr_len < 1e-5: continue
                 
-                # Zielposition berechnen
+                # Den Vektor auf die Ziel-Länge ausrichten/skalieren
                 dir_vec = vec / curr_len
                 new_c_pos = p_pos + (dir_vec * target_len)
                 
-                # Der "Shift": Um wie viel muss das Gelenk wandern?
+                # Die Vektor-Verschiebung (Delta)
                 delta = new_c_pos - c_pos
                 
-                # KINEMATIK: Wir verschieben das Gelenk UND alle seine Kinder!
-                pts_new[child] += delta
+                # 1. Das Gelenk auf die neue Position setzen
+                pts_new[c_idx] += delta
                 
-                descendants = get_all_descendants(child, tree_children, anchors)
+                # 2. Den "Arm/das Bein" einfach komplett an der Kette mitwandern lassen!
+                descendants = get_all_descendants(c_idx, tree)
                 for d in descendants:
                     if d < len(pts_new):
-                        pts_new[d] += delta
+                        # Nur mitnehmen, wenn der Punkt kein [0,0,0]-Fehler ist
+                        if np.linalg.norm(pts_new[d]) > 1e-5:
+                            pts_new[d] += delta
 
-            # Zurück in Tensor/Array packen
+            # Die berechneten Daten wieder verpacken
             if is_tensor:
                 if frame_data.dim() == 3:
                     raw_poses[frame_idx][0] = torch.from_numpy(pts_new).to(frame_data.device)
@@ -13528,7 +13529,7 @@ class NLFProportionalRetargeterV4:
                 
             frames_processed += 1
 
-        log_messages.append(f"Erfolgreich kinematisch skaliert: {frames_processed} Frames.")
+        log_messages.append(f"Vektor-Retargeting erfolgreich abgeschlossen: {frames_processed} Frames skaliert.")
         return (nlf_data_retargeted, "\n".join(log_messages))
         
 
