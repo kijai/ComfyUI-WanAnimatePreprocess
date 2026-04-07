@@ -13933,204 +13933,6 @@ class RenderNLFPosesDirect5:
             
             return (empty_img, empty_mask, "\n".join(log_messages), nlf_poses, "{}")
 
-class RenderNLFPosesDirect_platzhalter:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "nlf_poses": ("NLFPRED", {"tooltip": "Die NLF Daten (3D Skelett)"}),
-                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
-                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
-            },
-            "optional": {
-                "dw_poses": ("DWPOSES", {"tooltip": "Die 2D DWPose Daten"}),
-                "ref_dw_pose": ("DWPOSES", {"tooltip": "Optionale Referenz-Pose für das Alignment"}),
-                "draw_face": ("BOOLEAN", {"default": True}),
-                "draw_hand": ("BOOLEAN", {"default": True}),
-                "draw_body": ("BOOLEAN", {"default": True}),
-                "render_device": (["gpu", "cpu", "opengl", "cuda", "vulkan", "metal"], {"default": "gpu"}),
-                "scale_hands": ("BOOLEAN", {"default": True}),
-                "render_backend": (["taichi", "torch"], {"default": "taichi"}),
-                "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus der Scaler-Node"}),
-            }
-        }
-
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "NLFPRED", "STRING")
-    RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
-    FUNCTION = "process"
-    CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "V5: Vereint alle Settings aus WithData (Alignment, Render Devices, Part-Toggles) mit dem Smart-Camera Zoom und Volumen-Scaling aus Direct4."
-
-    def process(self, nlf_poses, width, height, dw_poses=None, ref_dw_pose=None, draw_face=True, draw_hand=True, draw_body=True, render_device="gpu", scale_hands=True, render_backend="taichi", nlf_render_config="{}"):
-        import copy
-        import json
-        import torch
-        import numpy as np
-        import traceback
-        from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, shift_dwpose_according_to_nlf, process_data_to_COCO_format, intrinsic_matrix_from_field_of_view
-        from .NLFPoseExtract.align3d import solve_new_camera_params_central, solve_new_camera_params_down
-        
-        log_messages = ["=== RENDER NLF POSES DIRECT V5 LOG ==="]
-        
-        # 1. Backend initialisieren
-        if render_backend == "taichi":
-            try:
-                import taichi as ti
-                device_map = {
-                    "cpu": ti.cpu, "gpu": ti.gpu, "opengl": ti.opengl,
-                    "cuda": ti.cuda, "vulkan": ti.vulkan, "metal": ti.metal,
-                }
-                ti.init(arch=device_map.get(render_device.lower(), ti.gpu))
-                log_messages.append(f"Render-Backend: Taichi {render_device.upper()} initialisiert.")
-            except Exception as e:
-                render_backend = "torch"
-                log_messages.append(f"WARNUNG: Taichi initialisierung fehlgeschlagen. Nutze Torch. Fehler: {e}")
-        else:
-            log_messages.append("Render-Backend: Torch.")
-
-        # 2. Daten kopieren, um das Original in ComfyUI nicht zu verändern
-        scaled_nlf_poses = copy.deepcopy(nlf_poses)
-            
-        try:
-            pose_input = scaled_nlf_poses['joints3d_nonparam'][0] if isinstance(scaled_nlf_poses, dict) else scaled_nlf_poses
-            dw_pose_input = copy.deepcopy(dw_poses["poses"]) if dw_poses is not None else None
-            swap_hands = dw_poses.get("swap_hands", False) if dw_poses is not None else False
-            
-            if len(pose_input) > 0 and pose_input[0] is not None:
-                log_messages.append(f"Erfolgreich geladen: {len(pose_input)} Frames.")
-            else:
-                log_messages.append("WARNUNG: pose_input ist leer!")
-
-            # 3. Standard Kamera Matrix berechnen
-            intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
-            log_messages.append(f"\nOriginal Intrinsic Matrix:\n{intrinsic_matrix.round(2)}")
-
-            # 4. ALIGNMENT (aus RenderNLFPosesWithData)
-            num_people = dw_pose_input[0]['bodies']['candidate'].shape[0] if dw_pose_input is not None else 0
-            if dw_poses is not None and ref_dw_pose is not None and num_people == 1:
-                try:
-                    ref_dw_pose_input = copy.deepcopy(ref_dw_pose["poses"])
-                    pose_3d_first_driving_frame = None
-                    for pose in pose_input:
-                        if pose.shape[0] == 0:
-                            continue
-                        candidate = pose[0].cpu().numpy()
-                        if np.any(candidate):
-                            pose_3d_first_driving_frame = candidate
-                            break
-                    
-                    if pose_3d_first_driving_frame is None:
-                        raise ValueError("No valid pose found in pose_input.")
-                        
-                    pose_3d_coco_first_driving_frame = process_data_to_COCO_format(pose_3d_first_driving_frame)
-
-                    poses_2d_ref = ref_dw_pose_input[0]['bodies']['candidate'][0][:14]
-                    poses_2d_ref[:, 0] = poses_2d_ref[:, 0] * width
-                    poses_2d_ref[:, 1] = poses_2d_ref[:, 1] * height
-
-                    # Alignment Berechnungen
-                    poses_3d_ref = solve_new_camera_params_down(pose_3d_coco_first_driving_frame, intrinsic_matrix, poses_2d_ref)
-
-                    try:
-                        # scale_faces Funktion aus nodes.py aufrufen
-                        scale_n = globals()['scale_faces'](dw_pose_input, ref_dw_pose_input)
-                    except Exception as e:
-                        log_messages.append(f"Hinweis: scale_faces konnte nicht ausgeführt werden: {e}")
-                        
-                    # Daten anpassen
-                    pose_input = shift_dwpose_according_to_nlf(poses_3d_ref, pose_input)
-                    log_messages.append("Alignment mit ref_dw_pose erfolgreich durchgeführt.")
-                except Exception as align_err:
-                    log_messages.append(f"WARNUNG: Alignment fehlgeschlagen: {align_err}")
-
-            # 5. DEN KLUGEN KAMERA ZOOM ANWENDEN (aus Config)
-            config = {}
-            try:
-                config = json.loads(nlf_render_config)
-                if "anchor_scale" in config:
-                    log_messages.append(f"\nEmpfangene Config: {config}")
-                    scale_y = float(config["anchor_scale"])
-                    scale_x = float(config.get("scale_x_factor", scale_y))
-                    
-                    p_x = float(config["pivot_x"])
-                    p_y = float(config["pivot_y"])
-
-                    # Normalisierung abfangen
-                    if p_x <= 2.0 and p_y <= 2.0:
-                        p_x = p_x * width
-                        p_y = p_y * height
-                        log_messages.append("Info: Pivot-Werte waren normalisiert, in Pixel umgerechnet.")
-                    
-                    log_messages.append(f"Kamera Zoom X: {scale_x:.3f} | Zoom Y: {scale_y:.3f}")
-
-                    cx_alt = intrinsic_matrix[0, 2]
-                    cy_alt = intrinsic_matrix[1, 2]
-
-                    intrinsic_matrix[0, 0] *= scale_x
-                    intrinsic_matrix[1, 1] *= scale_y
-                    intrinsic_matrix[0, 2] = cx_alt * scale_x + p_x * (1.0 - scale_x)
-                    intrinsic_matrix[1, 2] = cy_alt * scale_y + p_y * (1.0 - scale_y)
-
-                    log_messages.append(f"Modifizierte Intrinsic Matrix:\n{intrinsic_matrix.round(2)}")
-
-                    # 3D-Volumen Skalierung auf die Daten anwenden, damit Zylinder korrekt bleiben
-                    for frame_idx in range(len(pose_input)):
-                        if pose_input[frame_idx] is not None and len(pose_input[frame_idx]) > 0:
-                            pose_input[frame_idx] *= scale_y 
-                            
-                else:
-                    log_messages.append("\nKein 'anchor_scale' in Config. Rendere in Standard-Größe.")
-            except Exception as e:
-                log_messages.append(f"\nFehler beim Lesen der Config (Rendere Standard): {e}")
-
-            # 6. Rendern mit den detaillierten Einstellungen
-            log_messages.append("\nStarte Render-Prozess...")
-            is_multi = False
-            if len(pose_input) > 0:
-                if isinstance(pose_input[0], list):
-                    is_multi = len(pose_input[0]) > 1
-                elif isinstance(pose_input[0], torch.Tensor) and pose_input[0].dim() == 3:
-                    is_multi = pose_input[0].shape[0] > 1
-                    
-            if is_multi:
-                frames_np = render_multi_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=draw_face, draw_hands=draw_hand, draw_body=draw_body, scale_hands=scale_hands, swap_hands=swap_hands, render_backend=render_backend)
-            else:
-                frames_np = render_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=draw_face, draw_hands=draw_hand, draw_body=draw_body, scale_hands=scale_hands, swap_hands=swap_hands, render_backend=render_backend)
-
-            # Prüfe auf schwarze Bilder
-            black_frames = sum(1 for frame in frames_np if np.max(frame) < 5)
-            if black_frames > 0:
-                log_messages.append(f"WARNUNG: {black_frames} von {len(frames_np)} Frames sind SCHWARZ!")
-            else:
-                log_messages.append("Rendering abgeschlossen. Bilder sind in Ordnung.")
-
-            frames_tensor = torch.from_numpy(np.stack(frames_np, axis=0)).contiguous() / 255.0
-            frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
-            
-            # Skalierte Daten wieder ins Dictionary packen
-            if isinstance(scaled_nlf_poses, dict):
-                scaled_nlf_poses['joints3d_nonparam'] = [pose_input]
-            else:
-                scaled_nlf_poses = pose_input
-
-            # Node Mappings erstellen
-            node_mappings = json.dumps({
-                "node_name": "RenderNLFPosesDirect5",
-                "scaled_frames": len(pose_input),
-                "camera_matrix_modified": True if "anchor_scale" in config else False
-            })
-
-            return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages), scaled_nlf_poses, node_mappings)
-
-        except Exception as e:
-            log_messages.append(f"FATALER ABSTURZ BEIM RENDERN: {e}")
-            log_messages.append("--- TRACEBACK ---")
-            log_messages.append(traceback.format_exc())
-            
-            empty_img = torch.zeros((1, height, width, 3), dtype=torch.float32)
-            empty_mask = torch.zeros((1, height, width), dtype=torch.float32)
-            
-            return (empty_img, empty_mask, "\n".join(log_messages), nlf_poses, "{}")
 
 
 class RenderNLFPosesDirect6:
@@ -14276,6 +14078,163 @@ class RenderNLFPosesDirect6:
             return (empty_img, empty_mask, "\n".join(log_messages), nlf_poses, "{}")
 
 
+class RenderNLFPosesDirect7:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "nlf_poses": ("NLFPRED", {"tooltip": "Die originalen NLF Daten"}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "render_backend": (["taichi", "torch"], {"default": "taichi"}),
+                # Hier sind die drei neuen Einstellungen für die Render-Logik:
+                "draw_2d": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet 2D Overlay (falls DW Poses vorhanden)"}),
+                "draw_face": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet das Gesicht (falls DW Poses vorhanden)"}),
+                "draw_hands": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet die Hände (falls DW Poses vorhanden)"}),
+            },
+            "optional": {
+                "dw_poses_fallback": ("DWPOSES", {"tooltip": "Referenz-Posen für Hände/Gesicht"}),
+                "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus der Scaler-Node"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "NLFPRED", "STRING")
+    RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/SCAIL"
+    DESCRIPTION = "V6: Backt die Kamera-Config physisch in die 3D-Daten ein, gibt sie aus UND übernimmt die Render-Einstellungen (Draw 2D/Face/Hands) für mehr Kontrolle."
+
+    def process(self, nlf_poses, width, height, render_backend="taichi", draw_2d=True, draw_face=True, draw_hands=True, dw_poses_fallback=None, nlf_render_config="{}"):
+        import copy
+        import json
+        import torch
+        import numpy as np
+        import traceback
+        from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
+        
+        log_messages = ["=== RENDER NLF POSES DIRECT V6 LOG ==="]
+        
+        if render_backend == "taichi":
+            try:
+                import taichi as ti
+                ti.init(arch=ti.gpu)
+                log_messages.append("Render-Backend: Taichi GPU initialisiert.")
+            except Exception as e:
+                render_backend = "torch"
+                log_messages.append(f"WARNUNG: Taichi GPU fehlgeschlagen. Nutze Torch. Fehler: {e}")
+        else:
+            log_messages.append("Render-Backend: Torch.")
+
+        # 1. Echter Deepcopy der Daten, damit wir sie manipulieren und ausgeben können
+        scaled_nlf_poses = copy.deepcopy(nlf_poses)
+            
+        try:
+            pose_input = scaled_nlf_poses['joints3d_nonparam'][0] if isinstance(scaled_nlf_poses, dict) else scaled_nlf_poses
+            
+            # Referenz DW Poses laden, falls verbunden
+            dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
+            
+            if len(pose_input) > 0 and pose_input[0] is not None:
+                log_messages.append(f"Erfolgreich geladen: {len(pose_input)} Frames.")
+
+            # Standard Kamera Matrix erstellen
+            intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
+            
+            # 2. CONFIG MATHEMATISCH AUF DIE 3D PUNKTE ANWENDEN
+            try:
+                config = json.loads(nlf_render_config)
+                if "anchor_scale" in config:
+                    scale_y = float(config["anchor_scale"])
+                    scale_x = float(config.get("scale_x_factor", scale_y))
+                    
+                    p_x = float(config["pivot_x"])
+                    p_y = float(config["pivot_y"])
+
+                    if p_x <= 2.0 and p_y <= 2.0:
+                        p_x = p_x * width
+                        p_y = p_y * height
+                    
+                    # Originale Brennweiten und Kamera-Zentren
+                    fx = intrinsic_matrix[0, 0]
+                    fy = intrinsic_matrix[1, 1]
+                    cx = intrinsic_matrix[0, 2]
+                    cy = intrinsic_matrix[1, 2]
+
+                    # Wir übersetzen den Kamera-Zoom in eine 3D-Punkt-Verschiebung 
+                    # (Unter Einbezug der Tiefe Z, um die Perspektive zu erhalten)
+                    M13 = (cx - p_x) * (scale_x - 1.0) / fx
+                    M23 = (cy - p_y) * (scale_y - 1.0) / fy
+
+                    log_messages.append(f"Wende 3D-Transformation an: ScaleX={scale_x:.3f}, ScaleY={scale_y:.3f}")
+
+                    # ECHTE 3D DATEN MANIPULATION
+                    for frame_idx in range(len(pose_input)):
+                        if pose_input[frame_idx] is not None and len(pose_input[frame_idx]) > 0:
+                            pts = pose_input[frame_idx]
+                            
+                            # Koordinaten extrahieren
+                            X = pts[..., 0].clone()
+                            Y = pts[..., 1].clone()
+                            Z = pts[..., 2].clone()
+                            
+                            # Punkte transformieren (Z bleibt gleich für korrekte 3D Proportion)
+                            pts[..., 0] = X * scale_x + Z * M13
+                            pts[..., 1] = Y * scale_y + Z * M23
+                            
+                    log_messages.append("Erfolg: Die 3D-NLF-Daten wurden physisch im Raum transformiert!")
+            except Exception as e:
+                log_messages.append(f"Fehler bei 3D Transformation: {e}")
+
+            # 3. Rendern mit allen benutzerdefinierten Einstellungen
+            log_messages.append(f"Rendere Settings -> 2D: {draw_2d} | Face: {draw_face} | Hands: {draw_hands}")
+            
+            is_multi = False
+            if len(pose_input) > 0:
+                if isinstance(pose_input[0], list):
+                    is_multi = len(pose_input[0]) > 1
+                elif isinstance(pose_input[0], torch.Tensor) and pose_input[0].dim() == 3:
+                    is_multi = pose_input[0].shape[0] > 1
+                    
+            if is_multi:
+                frames_np = render_multi_nlf_as_images(
+                    pose_input, dw_pose_input, height, width, len(pose_input), 
+                    intrinsic_matrix=intrinsic_matrix, 
+                    draw_2d=draw_2d, draw_face=draw_face, draw_hands=draw_hands, 
+                    render_backend=render_backend
+                )
+            else:
+                frames_np = render_nlf_as_images(
+                    pose_input, dw_pose_input, height, width, len(pose_input), 
+                    intrinsic_matrix=intrinsic_matrix, 
+                    draw_2d=draw_2d, draw_face=draw_face, draw_hands=draw_hands, 
+                    render_backend=render_backend
+                )
+
+            frames_tensor = torch.from_numpy(np.stack(frames_np, axis=0)).contiguous() / 255.0
+            frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
+            
+            # Die Dictionary Struktur sauber verpacken
+            if isinstance(scaled_nlf_poses, dict):
+                scaled_nlf_poses['joints3d_nonparam'] = [pose_input]
+            else:
+                scaled_nlf_poses = pose_input
+
+            node_mappings = json.dumps({
+                "node_name": "RenderNLFPosesDirect6",
+                "status": "success",
+                "frames_processed": len(pose_input)
+            })
+
+            return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages), scaled_nlf_poses, node_mappings)
+
+        except Exception as e:
+            log_messages.append(f"FATALER ABSTURZ BEIM RENDERN: {e}")
+            log_messages.append(traceback.format_exc())
+            empty_img = torch.zeros((1, height, width, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((1, height, width), dtype=torch.float32)
+            return (empty_img, empty_mask, "\n".join(log_messages), nlf_poses, "{}")
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -14356,6 +14315,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFConfigScaler3DBones": NLFConfigScaler3DBones,
     "RenderNLFPosesDirect5": RenderNLFPosesDirect5,
     "RenderNLFPosesDirect6": RenderNLFPosesDirect6,
+    "RenderNLFPosesDirect7": RenderNLFPosesDirect7,
     
 }
 
@@ -14439,6 +14399,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFConfigScaler3DBones": "NLF Config caler 3D Bones",
     "RenderNLFPosesDirect5": "Render NLF Poses Direct 5",
     "RenderNLFPosesDirect6": "Render NLF Poses Direct 6",
+    "RenderNLFPosesDirect7": "Render NLF Poses Direct 7",
 
 
 }
