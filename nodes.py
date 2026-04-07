@@ -14440,7 +14440,7 @@ class RenderNLFPosesDirectPoseDataMimic2:
     DESCRIPTION = "Mimic: Rendert 3D-Daten als flache 2D-OpenPose-Vektoren. Löst Verdeckungsprobleme durch 3D-Tiefe, simuliert aber DWPose Farben."
 
     def process(self, nlf_poses, width, height, render_backend="taichi_flat", line_thickness=8.0, draw_2d=True, draw_face=True, draw_hands=True, dw_poses_fallback=None, nlf_render_config="{}"):
-        from .NLFPoseExtract.nlf_render import intrinsic_matrix_from_field_of_view, get_single_pose_cylinder_specs
+        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, get_single_pose_cylinder_specs
         from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
         
         try:
