@@ -13925,7 +13925,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFProportionalRetargeterV4": NLFProportionalRetargeterV4,
     "NLFProportionalRetargeterV5": NLFProportionalRetargeterV5,
     "NLFConfigScaler3DBones": NLFConfigScaler3DBones,
-    "RenderNLFPosesDirect5": RenderNLFPosesDirect5,
+    "RenderNLFPosesDirectV5": RenderNLFPosesDirectV5,
     
 }
 
@@ -14007,7 +14007,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFProportionalRetargeterV4": "NLF Proportional Retargeter V4",
     "NLFProportionalRetargeterV5": "NLF Proportional Retargeter V5",
     "NLFConfigScaler3DBones": "NLF Config caler 3D Bones",
-    "RenderNLFPosesDirect5": "Render NLF Poses Direct 5",
+    "RenderNLFPosesDirectV5": "Render NLF Poses Direct V5",
 
 
 }
