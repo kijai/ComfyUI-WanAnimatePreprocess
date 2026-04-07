@@ -13532,6 +13532,179 @@ class NLFProportionalRetargeterV4:
         log_messages.append(f"Vektor-Retargeting erfolgreich abgeschlossen: {frames_processed} Frames skaliert.")
         return (nlf_data_retargeted, "\n".join(log_messages))
         
+class NLFProportionalRetargeterV5:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_nlf_data": ("NLFPRED", {"tooltip": "Die originalen 3D NLF Daten"}),
+                "calibration_data": ("POSE_CALIBRATION", {"tooltip": "Die Referenz-Daten aus V20/V22"}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 90.0, "step": 1.0, "tooltip": "Toleranz für die Frontal-Suche"}),
+            }
+        }
+
+    RETURN_TYPES = ("NLFPRED", "STRING")
+    RETURN_NAMES = ("nlf_data_retargeted", "log_output")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Retargeting"
+
+    def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance):
+        import copy
+        import numpy as np
+        import math
+        import torch
+
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V5 (MIT DETAILLIERTEM LOGGING) ==="]
+        
+        true_3d_bones = calibration_data.get("true_3d_bones", {})
+        if not true_3d_bones:
+            log_messages.append("FEHLER: Keine true_3d_bones in calibration_data gefunden.")
+            return (video_nlf_data, "\n".join(log_messages))
+
+        is_dict = isinstance(video_nlf_data, dict)
+        nlf_data_retargeted = copy.deepcopy(video_nlf_data)
+        
+        if is_dict:
+            raw_poses = nlf_data_retargeted.get('joints3d_nonparam', [nlf_data_retargeted])[0]
+        else:
+            raw_poses = nlf_data_retargeted
+
+        is_normalized = math.isclose(true_3d_bones.get("torso", 0.0), 100.0, abs_tol=1e-3)
+        if is_normalized:
+            log_messages.append("Modus: NORMALISIERT V22 (Prozentual basierend auf Torso=100%).\n")
+        else:
+            log_messages.append("Modus: ABSOLUT V20 (Absolute Werte).\n")
+
+        # --- SMPL 3D KINEMATISCHER BAUM ---
+        tree = {
+            0: [1, 2, 3],
+            1: [4], 4: [7], 7: [10],           # Linkes Bein
+            2: [5], 5: [8], 8: [11],           # Rechtes Bein
+            3: [6], 6: [9], 9: [12, 13, 14],   # Wirbelsäule
+            12: [15],                          # Kopf
+            13: [16], 16: [18], 18: [20], 20: [22], # Linker Arm
+            14: [17], 17: [19], 19: [21], 21: [23]  # Rechter Arm
+        }
+
+        def get_all_descendants(node, tree_map):
+            desc = []
+            if node in tree_map:
+                for child in tree_map[node]:
+                    desc.append(child)
+                    desc.extend(get_all_descendants(child, tree_map))
+            return desc
+
+        frames_processed = 0
+        detailed_log_done = False # Damit wir das Log nicht mit 100 Frames überfluten
+
+        for frame_idx in range(len(raw_poses)):
+            frame_data = raw_poses[frame_idx]
+            if frame_data is None or len(frame_data) == 0:
+                continue
+                
+            is_tensor = isinstance(frame_data, torch.Tensor)
+            if is_tensor:
+                pts = frame_data[0].cpu().numpy().copy() if frame_data.dim() == 3 else frame_data.cpu().numpy().copy()
+            else:
+                arr = np.array(frame_data)
+                pts = arr[0].copy() if arr.ndim == 3 else arr.copy()
+            
+            pts_new = pts.copy()
+
+            # 1. Torso-Länge messen
+            vec_torso = pts[12] - pts[0]
+            current_torso_length = np.linalg.norm(vec_torso)
+            
+            if current_torso_length < 1e-5:
+                continue
+
+            if not detailed_log_done:
+                log_messages.append(f"--- DETAILLIERTER BERICHT FÜR FRAME {frame_idx} ---")
+                log_messages.append(f"Gemessene Torso-Länge (Idx 12 -> 0): {current_torso_length:.4f} Einheiten\n")
+
+            # 2. Ziel-Längen berechnen
+            targets = {}
+            for k, v in true_3d_bones.items():
+                targets[k] = (v / 100.0) * current_torso_length if is_normalized else v
+
+            operations = [
+                ('shoulder_width', 12, 17), # Hals -> R Schulter
+                ('shoulder_width', 12, 16), # Hals -> L Schulter
+                ('hip_width', 0, 2),        # Becken -> R Hüfte
+                ('hip_width', 0, 1),        # Becken -> L Hüfte
+                ('r_arm', 17, 19),          # R Schulter -> R Ellbogen
+                ('r_forearm', 19, 21),      # R Ellbogen -> R Handgelenk
+                ('l_arm', 16, 18),          # L Schulter -> L Ellbogen
+                ('l_forearm', 18, 20),      # L Ellbogen -> L Handgelenk
+                ('r_thigh', 2, 5),          # R Hüfte -> R Knie
+                ('r_calf', 5, 8),           # R Knie -> R Knöchel
+                ('l_thigh', 1, 4),          # L Hüfte -> L Knie
+                ('l_calf', 4, 7)            # L Knie -> L Knöchel
+            ]
+
+            for bone_key, p_idx, c_idx in operations:
+                if bone_key not in targets: continue
+                if c_idx >= len(pts_new) or p_idx >= len(pts_new): continue
+                
+                target_len = targets[bone_key]
+                if bone_key in ['shoulder_width', 'hip_width']:
+                    target_len = target_len / 2.0
+                
+                p_pos = pts_new[p_idx]
+                c_pos = pts_new[c_idx]
+                
+                if np.linalg.norm(p_pos) < 1e-5 or np.linalg.norm(c_pos) < 1e-5:
+                    continue
+
+                vec = c_pos - p_pos
+                curr_len = np.linalg.norm(vec)
+                
+                if curr_len < 1e-5: continue
+                
+                # --- LOGGING FÜR DIESEN KNOCHEN ---
+                if not detailed_log_done:
+                    scale_factor = target_len / curr_len
+                    log_messages.append(f"Knochen: {bone_key} (Idx {p_idx} -> {c_idx})")
+                    log_messages.append(f"  Länge aktuell: {curr_len:.4f}")
+                    log_messages.append(f"  Länge Ziel:    {target_len:.4f}")
+                    log_messages.append(f"  Faktor:        {scale_factor:.4f}x")
+                    log_messages.append("") # Leerzeile für Lesbarkeit
+                
+                dir_vec = vec / curr_len
+                new_c_pos = p_pos + (dir_vec * target_len)
+                
+                delta = new_c_pos - c_pos
+                
+                pts_new[c_idx] += delta
+                
+                descendants = get_all_descendants(c_idx, tree)
+                for d in descendants:
+                    if d < len(pts_new):
+                        if np.linalg.norm(pts_new[d]) > 1e-5:
+                            pts_new[d] += delta
+
+            detailed_log_done = True # Nach dem ersten Frame aufhören so detailliert zu loggen
+
+            if is_tensor:
+                if frame_data.dim() == 3:
+                    raw_poses[frame_idx][0] = torch.from_numpy(pts_new).to(frame_data.device)
+                else:
+                    raw_poses[frame_idx] = torch.from_numpy(pts_new).to(frame_data.device)
+            else:
+                arr_new = np.array(frame_data)
+                if arr_new.ndim == 3:
+                    arr_new[0] = pts_new
+                    raw_poses[frame_idx] = arr_new.tolist()
+                else:
+                    raw_poses[frame_idx] = pts_new.tolist()
+                
+            frames_processed += 1
+
+        log_messages.append(f"--- ZUSAMMENFASSUNG ---")
+        log_messages.append(f"Erfolgreich skaliert: {frames_processed} Frames.")
+        
+        return (nlf_data_retargeted, "\n".join(log_messages))
+
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -13609,6 +13782,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseCalibrationV21": PoseCalibrationV21,
     "PoseCalibrationV22": PoseCalibrationV22,
     "NLFProportionalRetargeterV4": NLFProportionalRetargeterV4,
+    "NLFProportionalRetargeterV5": NLFProportionalRetargeterV5,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -13687,6 +13861,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseCalibrationV21": "Pose Calibration V21 (Symmetric Auto-Fix)",
     "PoseCalibrationV22": "Pose Calibration V22",
     "NLFProportionalRetargeterV4": "NLF Proportional Retargeter V4",
+    "NLFProportionalRetargeterV5": "NLF Proportional Retargeter V5",
+
 
 }
 
