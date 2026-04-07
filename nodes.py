@@ -14235,6 +14235,174 @@ class RenderNLFPosesDirect7:
             return (empty_img, empty_mask, "\n".join(log_messages), nlf_poses, "{}")
 
 
+# === MIMIC NODE: 3D Rendern im klassischen 2D OpenPose Style (mit Z-Buffer, aber flach) ===
+
+class RenderNLFPosesDirectPoseDataMimic:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "nlf_poses": ("NLFPRED", {"tooltip": "Die originalen NLF Daten"}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "render_backend": (["taichi_flat", "torch"], {"default": "taichi_flat"}),
+                "line_thickness": ("FLOAT", {"default": 8.0, "min": 1.0, "max": 50.0, "step": 0.5, "tooltip": "Liniendicke der 3D Zylinder"}),
+                "draw_2d": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet 2D Overlay (falls DW Poses vorhanden)"}),
+                "draw_face": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet das Gesicht"}),
+                "draw_hands": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet die Hände"}),
+            },
+            "optional": {
+                "dw_poses_fallback": ("DWPOSES", {"tooltip": "Für Hände/Gesicht als Fallback"}),
+                "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus der Scaler-Node"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "NLFPRED", "STRING")
+    RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/SCAIL"
+    DESCRIPTION = "Mimic: Rendert 3D-Daten als flache 2D-OpenPose-Vektoren. Löst Verdeckungsprobleme durch 3D-Tiefe, simuliert aber DWPose Farben."
+
+    def process(self, nlf_poses, width, height, render_backend="taichi_flat", line_thickness=8.0, draw_2d=True, draw_face=True, draw_hands=True, dw_poses_fallback=None, nlf_render_config="{}"):
+        from .NLFPoseExtract.nlf_render import intrinsic_matrix_from_field_of_view, get_single_pose_cylinder_specs
+        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+        
+        try:
+            # Wir versuchen den flachen Renderer zu laden (deine neu erstellte Datei)
+            from .render_3d.taichi_cylinder_flat import render_whole_flat as render_whole_taichi_flat
+        except:
+            render_whole_taichi_flat = None
+            
+        from .render_3d.render_torch import render_whole as render_whole_torch
+
+        log_messages = ["=== RENDER NLF POSES POSEDATA MIMIC LOG ==="]
+        scaled_nlf_poses = copy.deepcopy(nlf_poses)
+            
+        try:
+            pose_input = scaled_nlf_poses['joints3d_nonparam'][0] if isinstance(scaled_nlf_poses, dict) else scaled_nlf_poses
+            dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
+            intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
+            
+            # --- 3D Kamera Config Baking ---
+            try:
+                config = json.loads(nlf_render_config)
+                if "anchor_scale" in config:
+                    scale_y = float(config["anchor_scale"])
+                    scale_x = float(config.get("scale_x_factor", scale_y))
+                    p_x, p_y = float(config["pivot_x"]), float(config["pivot_y"])
+                    if p_x <= 2.0 and p_y <= 2.0:
+                        p_x *= width
+                        p_y *= height
+                    
+                    fx, fy = intrinsic_matrix[0, 0], intrinsic_matrix[1, 1]
+                    cx, cy = intrinsic_matrix[0, 2], intrinsic_matrix[1, 2]
+                    M13 = (cx - p_x) * (scale_x - 1.0) / fx
+                    M23 = (cy - p_y) * (scale_y - 1.0) / fy
+
+                    for frame_idx in range(len(pose_input)):
+                        if pose_input[frame_idx] is not None and len(pose_input[frame_idx]) > 0:
+                            pts = pose_input[frame_idx]
+                            X, Y, Z = pts[..., 0].clone(), pts[..., 1].clone(), pts[..., 2].clone()
+                            pts[..., 0] = X * scale_x + Z * M13
+                            pts[..., 1] = Y * scale_y + Z * M23
+            except Exception as e:
+                log_messages.append(f"Fehler bei 3D Transformation: {e}")
+
+            # --- OPENPOSE FARB- UND BONE-MAPPING ---
+            openpose_colors_rgb = [
+                [255, 0, 0],      # 0: Neck -> Nose
+                [255, 85, 0],     # 1: R_Sho -> L_Sho (Spezial)
+                [255, 170, 0],    # 2: R_Sho -> R_Elb
+                [255, 255, 0],    # 3: R_Elb -> R_Wri
+                [85, 255, 0],     # 4: L_Sho -> L_Elb
+                [0, 255, 85],     # 5: L_Elb -> L_Wri
+                [0, 255, 170],    # 6: Neck -> R_Hip
+                [0, 255, 255],    # 7: R_Hip -> R_Kne
+                [0, 170, 255],    # 8: R_Kne -> R_Ank
+                [0, 85, 255],     # 9: Neck -> L_Hip
+                [0, 0, 255],      # 10: L_Hip -> L_Kne
+                [85, 0, 255],     # 11: L_Kne -> L_Ank
+                [170, 0, 255],    # 12: Nose -> R_Eye
+                [255, 0, 255],    # 13: R_Eye -> R_Ear
+                [255, 0, 170],    # 14: Nose -> L_Eye
+                [255, 0, 85],     # 15: L_Eye -> L_Ear
+            ]
+            # Für Taichi / Torch skaliert auf 0.0-1.0
+            mimic_colors = [[c / 255.0 for c in color_rgb] + [1.0] for color_rgb in openpose_colors_rgb]
+
+            mimic_limb_seq = [
+                [1, 0],    # Neck -> Nose
+                [2, 5],    # Schulter zu Schulter
+                [2, 3],    # R_Sho -> R_Elb
+                [3, 4],    # R_Elb -> R_Wri
+                [5, 6],    # L_Sho -> L_Elb
+                [6, 7],    # L_Elb -> L_Wri
+                [1, 8],    # Neck -> R_Hip
+                [8, 9],    # R_Hip -> R_Kne
+                [9, 10],   # R_Kne -> R_Ank
+                [1, 11],   # Neck -> L_Hip
+                [11, 12],  # L_Hip -> L_Kne
+                [12, 13],  # L_Kne -> L_Ank
+                [0, 14],   # Nose -> R_Eye
+                [14, 16],  # R_Eye -> R_Ear
+                [0, 15],   # Nose -> L_Eye
+                [15, 17]   # L_Eye -> L_Ear
+            ]
+            mimic_draw_seq = list(range(len(mimic_limb_seq)))
+
+            cylinder_specs_list = []
+            for i in range(len(pose_input)):
+                specs = get_single_pose_cylinder_specs(
+                    (i, [pose_input[i]], None, None, None, None, mimic_colors, mimic_limb_seq, mimic_draw_seq), 
+                    include_missing=False
+                )
+                cylinder_specs_list.append(specs)
+
+            focal_x = intrinsic_matrix[0,0]
+            focal_y = intrinsic_matrix[1,1]
+            princpt = (intrinsic_matrix[0,2], intrinsic_matrix[1,2])
+            
+            # Rendering
+            if render_backend == "taichi_flat" and render_whole_taichi_flat is not None:
+                try:
+                    import taichi as ti
+                    ti.init(arch=ti.gpu)
+                    frames_np_rgba = render_whole_taichi_flat(cylinder_specs_list, H=height, W=width, fx=focal_x, fy=focal_y, cx=princpt[0], cy=princpt[1], radius=line_thickness)
+                except TypeError:
+                    frames_np_rgba = render_whole_taichi_flat(cylinder_specs_list, H=height, W=width, fx=focal_x, fy=focal_y, cx=princpt[0], cy=princpt[1])
+            else:
+                log_messages.append("WARNUNG: Taichi_flat fehlgeschlagen oder nicht installiert. Nutze Torch.")
+                try:
+                    frames_np_rgba = render_whole_torch(cylinder_specs_list, H=height, W=width, fx=focal_x, fy=focal_y, cx=princpt[0], cy=princpt[1], radius=line_thickness)
+                except TypeError:
+                    frames_np_rgba = render_whole_torch(cylinder_specs_list, H=height, W=width, fx=focal_x, fy=focal_y, cx=princpt[0], cy=princpt[1])
+
+            # 2D Details (Gesicht/Hände) drüberlegen
+            if dw_pose_input is not None and draw_2d:
+                canvas_2d = draw_pose_to_canvas_np(dw_pose_input, pool=None, H=height, W=width, reshape_scale=0, show_feet_flag=False, show_body_flag=False, show_cheek_flag=True, dw_hand=True, show_face_flag=draw_face, show_hand_flag=draw_hands)
+                for i in range(len(frames_np_rgba)):
+                    frame_img = frames_np_rgba[i]
+                    canvas_img = canvas_2d[i]
+                    mask = canvas_img != 0
+                    frame_img[:, :, :3][mask] = canvas_img[mask]
+                    frames_np_rgba[i] = frame_img
+
+            frames_tensor = torch.from_numpy(np.stack(frames_np_rgba, axis=0)).contiguous() / 255.0
+            frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
+            
+            if isinstance(scaled_nlf_poses, dict):
+                scaled_nlf_poses['joints3d_nonparam'] = [pose_input]
+            else:
+                scaled_nlf_poses = pose_input
+
+            node_mappings = json.dumps({"node_name": "RenderNLFPosesDirectPoseDataMimic", "status": "success", "frames": len(pose_input)})
+            return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages), scaled_nlf_poses, node_mappings)
+
+        except Exception as e:
+            log_messages.append(traceback.format_exc())
+            return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -14316,6 +14484,7 @@ NODE_CLASS_MAPPINGS = {
     "RenderNLFPosesDirect5": RenderNLFPosesDirect5,
     "RenderNLFPosesDirect6": RenderNLFPosesDirect6,
     "RenderNLFPosesDirect7": RenderNLFPosesDirect7,
+    "RenderNLFPosesDirectPoseDataMimic": RenderNLFPosesDirectPoseDataMimic,
     
 }
 
@@ -14400,6 +14569,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RenderNLFPosesDirect5": "Render NLF Poses Direct 5",
     "RenderNLFPosesDirect6": "Render NLF Poses Direct 6",
     "RenderNLFPosesDirect7": "Render NLF Poses Direct 7",
+    "RenderNLFPosesDirectPoseDataMimic": "Render NLF Poses Mimic (Flat 3D)",
 
 
 }
