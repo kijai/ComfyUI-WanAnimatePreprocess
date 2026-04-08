@@ -12,6 +12,60 @@ except:
 from ..render_3d.render_torch import render_whole as render_whole_torch
 from ..pose_draw.draw_pose_utils import draw_pose_to_canvas_np
 
+
+def render_nlf_mimic3(pose_data, width, height, point_radius, line_thickness, alpha, colors):
+    frames_out = []
+    
+    # Hier gehst du durch deine Frames (wie in Mimic 2)
+    for frame_data in pose_data: 
+        # Schwarzer Hintergrund
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        
+        # Overlay für die Transparenz erstellen
+        overlay = canvas.copy()
+        
+        # ====================================================================
+        # WICHTIG: Füge hier deine Auslese-Logik aus Mimic 2 für die Knochen
+        # und Keypoints ein.
+        # Beispiel:
+        # keypoints = frame_data['keypoints']  
+        # bones = frame_data['bones']          
+        # ====================================================================
+        
+        ''' 
+        # 1. KNOCHEN (Linien) auf das OVERLAY zeichnen
+        for i, bone in enumerate(bones):
+            pt1 = (int(keypoints[bone[0]][0]), int(keypoints[bone[0]][1]))
+            pt2 = (int(keypoints[bone[1]][0]), int(keypoints[bone[1]][1]))
+            color = colors[i % len(colors)]
+            
+            # Wichtig: auf "overlay" zeichnen, nicht direkt auf "canvas"
+            cv2.line(overlay, pt1, pt2, color, line_thickness)
+        
+        # 2. JOINTS (Punkte) auf das OVERLAY zeichnen
+        for i, kp in enumerate(keypoints):
+            pt = (int(kp[0]), int(kp[1]))
+            color = colors[i % len(colors)]
+            
+            # -1 bedeutet, dass der Kreis ausgefüllt wird
+            cv2.circle(overlay, pt, point_radius, color, -1) 
+        '''
+        
+        # === DER MAGISCHE SCHRITT FÜR DEN "BLASSEN" LOOK ===
+        # Wir mischen das Overlay mit dem Canvas basierend auf dem 'alpha' Wert.
+        cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
+        
+        # Falls nötig: OpenCV (BGR) zu ComfyUI (RGB) konvertieren
+        # canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        
+        # In Torch Tensor umwandeln (Standard für ComfyUI Images)
+        tensor_img = torch.from_numpy(canvas).float() / 255.0
+        frames_out.append(tensor_img)
+        
+    # Batch Stacken [Batch_Size, Height, Width, Channels]
+    return torch.stack(frames_out)
+
+
 def p3d_single_p2d(points, intrinsic_matrix):
     X, Y, Z = points[0], points[1], points[2]
     u = (intrinsic_matrix[0, 0] * X / Z) + intrinsic_matrix[0, 2]
