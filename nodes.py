@@ -14580,7 +14580,7 @@ class RenderNLFPosesDirectPoseDataMimic2:
 
 
 
-class RenderNLFPosesDirectPoseDataMimic36:
+class RenderNLFPosesDirectPoseDataMimic3:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -14800,45 +14800,6 @@ class RenderNLFPosesDirectPoseDataMimic36:
         except Exception as e:
             log_messages.append(traceback.format_exc())
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
-
-# Exakte ViTPose / OpenPose RGB-Werte (COCO Format)
-VITPOSE_COLORS = [
-    [255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0],
-    [85, 255, 0], [0, 255, 0], [0, 255, 85], [0, 255, 170], [0, 255, 255],
-    [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255], [170, 0, 255],
-    [255, 0, 255], [255, 0, 170], [255, 0, 85]
-]
-
-class RenderNLFPosesDirectPoseDataMimic3:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-            "pose_data": ("POSE_DATA",), # Passe den Input-Namen an, falls er in Mimic2 anders heißt
-            "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
-            "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
-            "point_radius": ("INT", {"default": 4, "min": 1, "max": 20}), # Für die Punkte
-            "line_thickness": ("INT", {"default": 2, "min": 1, "max": 20}),
-            "alpha": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05}), # <- Steuert das "Blasse"
-        }}
-    
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "render"
-    CATEGORY = "WanAnimate/Render" 
-
-    def render(self, pose_data, width, height, point_radius, line_thickness, alpha):
-        # Wir importieren die neue Funktion aus der flat.py
-        from .NLFPoseExtract.nlf_render_flat import render_nlf_mimic3
-        
-        # Render-Aufruf mit den ViTPose-Farben und Alpha
-        rendered_frames = render_nlf_mimic3(
-            pose_data, width, height, point_radius, line_thickness, alpha, VITPOSE_COLORS
-        )
-        
-        return (rendered_frames,)
-
-# === GANZ UNTEN in der nodes.py zu den Mappings hinzufügen ===
-# NODE_CLASS_MAPPINGS["RenderNLFPosesDirectPoseDataMimic3"] = RenderNLFPosesDirectPoseDataMimic3
-# NODE_DISPLAY_NAME_MAPPINGS["RenderNLFPosesDirectPoseDataMimic3"] = "Render NLF Poses Mimic 3 (Flat 3D - ViTPose Style)"
 
 
 
