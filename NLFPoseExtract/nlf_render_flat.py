@@ -16,8 +16,11 @@ def p3d_single_p2d(points, intrinsic_matrix):
     X, Y, Z = points[0], points[1], points[2]
     u = (intrinsic_matrix[0, 0] * X / Z) + intrinsic_matrix[0, 2]
     v = (intrinsic_matrix[1, 1] * Y / Z) + intrinsic_matrix[1, 2]
-    u_np = u.cpu().numpy()
-    v_np = v.cpu().numpy()
+    
+    # Sicherstellen, dass es funktioniert, egal ob Tensor oder Numpy-Float
+    u_np = u.cpu().numpy() if hasattr(u, 'cpu') else u
+    v_np = v.cpu().numpy() if hasattr(v, 'cpu') else v
+    
     return np.array([u_np, v_np])
 
 def process_data_to_COCO_format(joints):
