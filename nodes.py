@@ -14801,7 +14801,203 @@ class RenderNLFPosesDirectPoseDataMimic3:
             log_messages.append(traceback.format_exc())
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
 
+class RenderNLFPosesDirectPoseDataMimic4:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "nlf_poses": ("NLFPRED", {"tooltip": "Die originalen NLF Daten"}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "render_backend": (["taichi_flat", "torch"], {"default": "taichi_flat"}),
+                "line_thickness": ("FLOAT", {"default": 8.0, "min": 1.0, "max": 20.0, "step": 0.5}),
+                "draw_2d": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet 2D Overlay (falls DW Poses vorhanden)"}),
+                "draw_face": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet das Gesicht"}),
+                "draw_hands": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet die Hände"}),
+            },
+            "optional": {
+                "dw_poses_fallback": ("DWPOSES", {"tooltip": "Für Hände/Gesicht als Fallback"}),
+                "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus der Scaler-Node"}),
+            }
+        }
 
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "NLFPRED", "STRING")
+    RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/SCAIL"
+    DESCRIPTION = "Mimic 3: Rendert 3D-Daten als flache 2D-OpenPose-Vektoren (60% Knochen-Alpha, 100% Gelenke)."
+
+    def process(self, nlf_poses, width, height, render_backend="taichi_flat", line_thickness=8.0, draw_2d=True, draw_face=True, draw_hands=True, dw_poses_fallback=None, nlf_render_config="{}"):
+        import copy
+        import json
+        import torch
+        import numpy as np
+        import traceback
+        import cv2
+        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, get_single_pose_cylinder_specs, process_data_to_COCO_format, p3d_single_p2d
+        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+
+        try:
+            from .render_3d.taichi_cylinder_flat import render_whole_flat as render_whole_taichi_flat
+        except:
+            render_whole_taichi_flat = None
+        from .render_3d.render_torch import render_whole as render_whole_torch
+
+        log_messages = ["=== RENDER NLF POSES POSEDATA MIMIC 3 LOG ==="]
+        scaled_nlf_poses = copy.deepcopy(nlf_poses)
+
+        try:
+            pose_input = scaled_nlf_poses['joints3d_nonparam'][0] if isinstance(scaled_nlf_poses, dict) else scaled_nlf_poses
+            dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
+
+            intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
+
+            # --- 3D Kamera Config Baking ---
+            try:
+                config = json.loads(nlf_render_config)
+                if "anchor_scale" in config:
+                    scale_y = float(config["anchor_scale"])
+                    scale_x = float(config.get("scale_x_factor", scale_y))
+                    p_x, p_y = float(config["pivot_x"]), float(config["pivot_y"])
+
+                    if p_x <= 2.0 and p_y <= 2.0:
+                        p_x *= width
+                        p_y *= height
+
+                    fx, fy = intrinsic_matrix[0, 0], intrinsic_matrix[1, 1]
+                    cx, cy = intrinsic_matrix[0, 2], intrinsic_matrix[1, 2]
+
+                    M13 = (cx - p_x) * (scale_x - 1.0) / fx
+                    M23 = (cy - p_y) * (scale_y - 1.0) / fy
+
+                    for frame_idx in range(len(pose_input)):
+                        if pose_input[frame_idx] is not None and len(pose_input[frame_idx]) > 0:
+                            pts = pose_input[frame_idx]
+                            X, Y, Z = pts[..., 0].clone(), pts[..., 1].clone(), pts[..., 2].clone()
+                            pts[..., 0] = X * scale_x + Z * M13
+                            pts[..., 1] = Y * scale_y + Z * M23
+            except Exception as e:
+                log_messages.append(f"Fehler bei 3D Transformation: {e}")
+
+            # --- OPENPOSE FARB- UND BONE-MAPPING ---
+            ordered_colors_255 = [
+                [255, 85, 0], [170, 255, 0], [255, 170, 0], [255, 255, 0],
+                [85, 255, 0], [0, 255, 0], [0, 255, 85], [0, 255, 170],
+                [0, 255, 255], [0, 170, 255], [0, 85, 255], [0, 0, 255],
+                [255, 0, 0], [255, 0, 170], [255, 0, 85], [255, 0, 255],
+                [255, 0, 170],
+            ]
+
+            joint_colors_rgb = [
+                [255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0],
+                [170, 255, 0], [85, 255, 0], [0, 255, 0], [0, 255, 85],
+                [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255],
+                [0, 0, 255], [85, 0, 255], [170, 0, 255], [255, 0, 255],
+                [255, 0, 170], [255, 0, 85]
+            ]
+
+            mimic_colors = [[c / 255.0 for c in color_rgb] + [1.0] for color_rgb in ordered_colors_255]
+
+            mimic_limb_seq = [
+                [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8],
+                [8, 9], [9, 10], [1, 11], [11, 12], [12, 13], [1, 0],
+                [0, 14], [14, 16], [0, 15], [15, 17],
+            ]
+
+            mimic_draw_seq = list(range(len(mimic_limb_seq)))
+            cylinder_specs_list = []
+
+            for i in range(len(pose_input)):
+                specs = get_single_pose_cylinder_specs(
+                    (i, [pose_input[i]], None, None, None, None, mimic_colors, mimic_limb_seq, mimic_draw_seq),
+                    include_missing=False
+                )
+                cylinder_specs_list.append(specs)
+
+            focal_x = intrinsic_matrix[0,0]
+            focal_y = intrinsic_matrix[1,1]
+            princpt = (intrinsic_matrix[0,2], intrinsic_matrix[1,2])
+
+            # --- 1. Rendering der Linien (Knochen) ---
+            if render_backend == "taichi_flat" and render_whole_taichi_flat is not None:
+                try:
+                    import taichi as ti
+                    ti.init(arch=ti.gpu)
+                    frames_np_rgba = render_whole_taichi_flat(cylinder_specs_list, H=height, W=width, fx=focal_x, fy=focal_y, cx=princpt[0], cy=princpt[1], radius=line_thickness)
+                except TypeError:
+                    frames_np_rgba = render_whole_taichi_flat(cylinder_specs_list, H=height, W=width, fx=focal_x, fy=focal_y, cx=princpt[0], cy=princpt[1])
+            else:
+                try:
+                    frames_np_rgba = render_whole_torch(cylinder_specs_list, H=height, W=width, fx=focal_x, fy=focal_y, cx=princpt[0], cy=princpt[1], radius=line_thickness)
+                except TypeError:
+                    frames_np_rgba = render_whole_torch(cylinder_specs_list, H=height, W=width, fx=focal_x, fy=focal_y, cx=princpt[0], cy=princpt[1])
+
+            # --- 2. Original ViTPose-Look (Abgedunkelte Knochen, Grelle Kreise) ---
+            for i in range(len(frames_np_rgba)):
+                frame_img = frames_np_rgba[i]
+                if not frame_img.flags.writeable:
+                    frame_img = frame_img.copy()
+
+                # *** DER MAGISCHE SCHRITT ***
+                # Wir dunkeln nur die Farbkanäle (RGB) der Knochen auf 60% ab, exakt wie in draw_utils.py!
+                frame_img[:, :, :3] = (frame_img[:, :, :3] * 0.6).astype(np.uint8)
+
+                # Jetzt zeichnen wir die Gelenkpunkte (Kreise) mit 100% Farbe oben drauf
+                if i < len(pose_input) and pose_input[i] is not None:
+                    joints3d_batch = pose_input[i]
+                    if joints3d_batch.dim() == 3: 
+                        people = joints3d_batch
+                    elif joints3d_batch.dim() == 2: 
+                        people = [joints3d_batch]
+                    else:
+                        people = []
+
+                    for joints3d in people:
+                        j3d_np = joints3d.cpu().numpy() if isinstance(joints3d, torch.Tensor) else joints3d
+                        if np.sum(np.abs(j3d_np)) > 0.01:
+                            j3d_coco = process_data_to_COCO_format(j3d_np)
+                            for j_idx, pt3d in enumerate(j3d_coco):
+                                if np.sum(np.abs(pt3d)) > 0:
+                                    pt2d = p3d_single_p2d(pt3d, intrinsic_matrix)
+                                    x, y = int(pt2d[0]), int(pt2d[1])
+                                    if 0 <= x < width and 0 <= y < height:
+                                        # Volle RGB Farbe ohne Reduzierung
+                                        color_rgba = (int(joint_colors_rgb[j_idx % 18][0]),
+                                                      int(joint_colors_rgb[j_idx % 18][1]),
+                                                      int(joint_colors_rgb[j_idx % 18][2]),
+                                                      255)
+                                        pt_radius = max(3, int(line_thickness * 0.8))
+                                        
+                                        # Kreis wird nach dem Abdunkeln hinzugefügt -> leuchtet!
+                                        cv2.circle(frame_img, (x, y), radius=pt_radius, color=color_rgba, thickness=-1, lineType=cv2.LINE_AA)
+                
+                frames_np_rgba[i] = frame_img
+
+            # --- 3. 2D Details (Gesicht/Hände) drüberlegen ---
+            if dw_pose_input is not None and draw_2d:
+                canvas_2d = draw_pose_to_canvas_np(dw_pose_input, pool=None, H=height, W=width, reshape_scale=0, show_feet_flag=False, show_body_flag=False, show_cheek_flag=True, dw_hand=True, show_face_flag=draw_face, show_hand_flag=draw_hands)
+                for i in range(len(frames_np_rgba)):
+                    frame_img = frames_np_rgba[i]
+                    canvas_img = canvas_2d[i]
+                    mask = canvas_img != 0
+                    frame_img[:, :, :3][mask] = canvas_img[mask]
+                    frames_np_rgba[i] = frame_img
+
+            frames_tensor = torch.from_numpy(np.stack(frames_np_rgba, axis=0)).contiguous() / 255.0
+            frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
+
+            if isinstance(scaled_nlf_poses, dict):
+                scaled_nlf_poses['joints3d_nonparam'] = [pose_input]
+            else:
+                scaled_nlf_poses = pose_input
+
+            node_mappings = json.dumps({"node_name": "RenderNLFPosesDirectPoseDataMimic3", "status": "success", "frames": len(pose_input)})
+
+            return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages), scaled_nlf_poses, node_mappings)
+
+        except Exception as e:
+            log_messages.append(traceback.format_exc())
+            return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -14887,6 +15083,7 @@ NODE_CLASS_MAPPINGS = {
     "RenderNLFPosesDirectPoseDataMimic": RenderNLFPosesDirectPoseDataMimic,
     "RenderNLFPosesDirectPoseDataMimic2": RenderNLFPosesDirectPoseDataMimic2,
     "RenderNLFPosesDirectPoseDataMimic3": RenderNLFPosesDirectPoseDataMimic3,
+    "RenderNLFPosesDirectPoseDataMimic4": RenderNLFPosesDirectPoseDataMimic4,
     
 }
 
@@ -14974,6 +15171,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RenderNLFPosesDirectPoseDataMimic": "Render NLF Poses Mimic (not Flat 3D)",
     "RenderNLFPosesDirectPoseDataMimic2": "Render NLF Poses Mimic 2 (Flat 3D)",
     "RenderNLFPosesDirectPoseDataMimic3": "Render NLF Poses Mimic 3 (Flat 3D)",
+    "RenderNLFPosesDirectPoseDataMimic4": "Render NLF Poses Mimic 4 (Flat 3D)",
 
 
 }
