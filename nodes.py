@@ -16504,7 +16504,344 @@ class RenderNLFPosesDirectPoseDataMimic10:
             log_messages.append(traceback.format_exc())
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
 
+class RenderNLFPosesDirectPoseDataMimic11:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "nlf_poses": ("NLFPRED", {"tooltip": "Die originalen NLF Daten"}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "line_thickness": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1, "tooltip": "Dicke der Knochen (Ovale Form)"}),
+                "point_radius": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1, "tooltip": "Größe der Gelenkpunkte"}),
+                "head_connection_mode": (["Offset Head to Neck", "Keep Head & Stretch Neck"], {"default": "Offset Head to Neck", "tooltip": "Wie der Kopf an den Hals angebunden wird"}),
+                "draw_2d": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet 2D Overlay (falls DW Poses vorhanden)"}),
+                "draw_face": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet das Gesicht"}),
+                "draw_hands": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet die Hände"}),
+            },
+            "optional": {
+                "dw_poses_fallback": ("DWPOSES", {"tooltip": "Für Hände/Gesicht als Fallback"}),
+                "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus der Scaler-Node"}),
+            }
+        }
 
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "NLFPRED", "STRING")
+    RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/SCAIL"
+    DESCRIPTION = "Mimic 10: DWPose Kopf und Gesicht werden exakt auf den NLF Hals verschoben."
+
+    def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Offset Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, dw_poses_fallback=None, nlf_render_config="{}"):
+        import copy
+        import json
+        import math
+        import torch
+        import numpy as np
+        import traceback
+        import cv2
+        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
+        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+
+        log_messages = ["=== RENDER NLF POSES POSEDATA MIMIC 10 LOG ==="]
+        scaled_nlf_poses = copy.deepcopy(nlf_poses)
+
+        try:
+            pose_input = scaled_nlf_poses['joints3d_nonparam'][0] if isinstance(scaled_nlf_poses, dict) else scaled_nlf_poses
+            dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
+
+            intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
+
+            # --- 3D Kamera Config Baking ---
+            try:
+                config = json.loads(nlf_render_config)
+                if "anchor_scale" in config:
+                    scale_y = float(config["anchor_scale"])
+                    scale_x = float(config.get("scale_x_factor", scale_y))
+                    p_x, p_y = float(config["pivot_x"]), float(config["pivot_y"])
+
+                    if p_x <= 2.0 and p_y <= 2.0:
+                        p_x *= width
+                        p_y *= height
+
+                    fx, fy = intrinsic_matrix[0, 0], intrinsic_matrix[1, 1]
+                    cx, cy = intrinsic_matrix[0, 2], intrinsic_matrix[1, 2]
+
+                    M13 = (cx - p_x) * (scale_x - 1.0) / fx
+                    M23 = (cy - p_y) * (scale_y - 1.0) / fy
+
+                    for frame_idx in range(len(pose_input)):
+                        if pose_input[frame_idx] is not None and len(pose_input[frame_idx]) > 0:
+                            pts = pose_input[frame_idx]
+                            X, Y, Z = pts[..., 0].clone(), pts[..., 1].clone(), pts[..., 2].clone()
+                            pts[..., 0] = X * scale_x + Z * M13
+                            pts[..., 1] = Y * scale_y + Z * M23
+            except Exception as e:
+                log_messages.append(f"Fehler bei 3D Transformation: {e}")
+
+            # --- EXAKTE OPENPOSE / DWPose FARBEN ---
+            limb_colors_rgb = [
+                (255, 0, 0),    # 0: Neck -> R.Shoulder (Rot)
+                (255, 85, 0),   # 1: Neck -> L.Shoulder (Orange)
+                (255, 170, 0),  # 2: R.Shoulder -> R.Elbow
+                (255, 255, 0),  # 3: R.Elbow -> R.Wrist
+                (170, 255, 0),  # 4: L.Shoulder -> L.Elbow
+                (85, 255, 0),   # 5: L.Elbow -> L.Wrist
+                (0, 255, 0),    # 6: Neck -> R.Hip
+                (0, 255, 85),   # 7: R.Hip -> R.Knee
+                (0, 255, 170),  # 8: R.Knee -> R.Ankle
+                (0, 255, 255),  # 9: Neck -> L.Hip
+                (0, 170, 255),  # 10: L.Hip -> L.Knee
+                (0, 85, 255),   # 11: L.Knee -> L.Ankle
+                (0, 0, 255),    # 12: Neck -> Nose (Dunkelblau)
+                (85, 0, 255),   # 13: Nose -> R.Eye
+                (170, 0, 255),  # 14: R.Eye -> R.Ear
+                (255, 0, 255),  # 15: Nose -> L.Eye
+                (255, 0, 170),  # 16: L.Eye -> L.Ear
+            ]
+
+            joint_colors_rgb = [
+                (255, 0, 0), (255, 85, 0), (255, 170, 0), (255, 255, 0),
+                (170, 255, 0), (85, 255, 0), (0, 255, 0), (0, 255, 85),
+                (0, 255, 170), (0, 255, 255), (0, 170, 255), (0, 85, 255),
+                (0, 0, 255), (85, 0, 255), (170, 0, 255), (255, 0, 255),
+                (255, 0, 170), (255, 0, 85)
+            ]
+
+            mimic_limb_seq = [
+                [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8],
+                [8, 9], [9, 10], [1, 11], [11, 12], [12, 13], [1, 0],
+                [0, 14], [14, 16], [0, 15], [15, 17],
+            ]
+
+            frames_np_rgba = []
+
+            for i in range(len(pose_input)):
+                frame_img = np.zeros((height, width, 3), dtype=np.uint8)
+                
+                if pose_input[i] is not None:
+                    joints3d_batch = pose_input[i]
+                    if joints3d_batch.dim() == 3: 
+                        people = joints3d_batch
+                    elif joints3d_batch.dim() == 2: 
+                        people = [joints3d_batch]
+                    else:
+                        people = []
+
+                    all_pts_2d_with_z = []
+
+                    # 1. 3D in 2D projizieren UND Z-Wert (Tiefe) merken
+                    for joints3d in people:
+                        j3d_np = joints3d.cpu().numpy() if isinstance(joints3d, torch.Tensor) else joints3d
+                        if np.sum(np.abs(j3d_np)) > 0.01:
+                            j3d_coco = process_data_to_COCO_format(j3d_np)
+                            pts_2d_with_z = []
+                            for pt3d in j3d_coco:
+                                if np.sum(np.abs(pt3d)) > 0:
+                                    pt2d = p3d_single_p2d(pt3d, intrinsic_matrix)
+                                    pts_2d_with_z.append([int(pt2d[0]), int(pt2d[1]), float(pt3d[2])])
+                                else:
+                                    pts_2d_with_z.append(None)
+                            
+                            # --- Gerade Schultern (Neck ist jetzt exakt mittig) ---
+                            if len(pts_2d_with_z) > 5 and pts_2d_with_z[2] is not None and pts_2d_with_z[5] is not None:
+                                p_r = pts_2d_with_z[2]
+                                p_l = pts_2d_with_z[5]
+                                
+                                new_x = (p_r[0] + p_l[0]) / 2.0
+                                new_y = (p_r[1] + p_l[1]) / 2.0
+                                new_z = (p_r[2] + p_l[2]) / 2.0
+                                
+                                pts_2d_with_z[1] = [int(new_x), int(new_y), new_z]
+
+                            # --- KOMPLETTER HEAD OFFSET (NLF Head Punkte anpassen) ---
+                            # Setzt den "roten NLF Punkt" exakt auf den Hals, wie du wolltest
+                            if head_connection_mode == "Offset Head to Neck":
+                                if pts_2d_with_z[0] is not None and pts_2d_with_z[1] is not None:
+                                    offset_x = pts_2d_with_z[1][0] - pts_2d_with_z[0][0]
+                                    offset_y = pts_2d_with_z[1][1] - pts_2d_with_z[0][1]
+                                    
+                                    for h_idx in [0, 14, 15, 16, 17]:
+                                        if pts_2d_with_z[h_idx] is not None:
+                                            pts_2d_with_z[h_idx][0] += offset_x
+                                            pts_2d_with_z[h_idx][1] += offset_y
+                            # --------------------------------------------------------
+
+                            all_pts_2d_with_z.append(pts_2d_with_z)
+
+                    # --- NEU: DWPose Alignment (Hände & Gesicht an 3D Skelett binden) ---
+                    if dw_pose_input is not None and i < len(dw_pose_input):
+                        dw_frame = dw_pose_input[i]
+                        dw_faces = dw_frame.get("faces", [])
+                        dw_hands = dw_frame.get("hands", [])
+                        dw_bodies = dw_frame.get("bodies", []) # WICHTIG: Bodies laden für den DW-Kopf!
+
+                        for p, pts in enumerate(all_pts_2d_with_z):
+                            # --- Hände Alignment (Bleibt unangetastet, funktioniert perfekt) ---
+                            if 2*p + 1 < len(dw_hands):
+                                l_hand = dw_hands[2*p]     
+                                r_hand = dw_hands[2*p + 1] 
+
+                                # Rechte Hand
+                                if len(pts) > 7 and pts[7] is not None and np.sum(r_hand) > 0.01:
+                                    wrist_norm = np.array([pts[7][0] / float(width), pts[7][1] / float(height)])
+                                    gap_offset = np.array([0.0, 0.0])
+                                    if pts[6] is not None:
+                                        dir_vec = np.array([pts[7][0] - pts[6][0], pts[7][1] - pts[6][1]])
+                                        norm_vec = np.linalg.norm(dir_vec)
+                                        if norm_vec > 0:
+                                            gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
+                                    
+                                    offset = (wrist_norm + gap_offset) - r_hand[0]
+                                    valid_mask = r_hand[:, 0] > 0
+                                    r_hand[valid_mask] += offset
+
+                                # Linke Hand
+                                if len(pts) > 4 and pts[4] is not None and np.sum(l_hand) > 0.01:
+                                    wrist_norm = np.array([pts[4][0] / float(width), pts[4][1] / float(height)])
+                                    gap_offset = np.array([0.0, 0.0])
+                                    if pts[3] is not None:
+                                        dir_vec = np.array([pts[4][0] - pts[3][0], pts[4][1] - pts[3][1]])
+                                        norm_vec = np.linalg.norm(dir_vec)
+                                        if norm_vec > 0:
+                                            gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
+                                    
+                                    offset = (wrist_norm + gap_offset) - l_hand[0]
+                                    valid_mask = l_hand[:, 0] > 0
+                                    l_hand[valid_mask] += offset
+
+                            # --- Gesicht/Kopf Alignment ---
+                            if head_connection_mode == "Offset Head to Neck":
+                                if pts[1] is not None: # NLF Hals (Zielposition)
+                                    nlf_neck_norm = np.array([pts[1][0] / float(width), pts[1][1] / float(height)])
+                                    
+                                    offset = None
+                                    
+                                    # 1. DWPose Nase finden & Offset brechen (NLF Hals - DWPose Nase)
+                                    if p < len(dw_bodies):
+                                        body = dw_bodies[p]
+                                        if len(body) > 0 and body[0][0] > 0: # Nase ist Index 0 in DW Body
+                                            dw_nose = np.array([body[0][0], body[0][1]])
+                                            offset = nlf_neck_norm - dw_nose
+                                            
+                                    # Fallback: Gesicht Nasenspitze (Index 30), falls DW Body Nase fehlt
+                                    if offset is None and p < len(dw_faces):
+                                        face = dw_faces[p]
+                                        if len(face) > 30 and face[30][0] > 0:
+                                            dw_nose = np.array([face[30][0], face[30][1]])
+                                            offset = nlf_neck_norm - dw_nose
+                                            
+                                    # 2. Offset auf DWPose anwenden
+                                    if offset is not None:
+                                        # Wende Offset auf DWPose Kopf-Punkte an (0=Nase, 14=RAuge, 15=LAuge, 16=ROhr, 17=LOhr)
+                                        if p < len(dw_bodies):
+                                            body = dw_bodies[p]
+                                            for h_idx in [0, 14, 15, 16, 17]:
+                                                if h_idx < len(body) and body[h_idx][0] > 0:
+                                                    body[h_idx][0] += offset[0]
+                                                    body[h_idx][1] += offset[1]
+                                                    
+                                        # Wende den exakt gleichen Offset auf alle DWPose Gesichts-Punkte an
+                                        if p < len(dw_faces):
+                                            face = dw_faces[p]
+                                            valid_mask = face[:, 0] > 0
+                                            face[valid_mask, 0] += offset[0]  # X-Achse verschieben
+                                            face[valid_mask, 1] += offset[1]  # Y-Achse verschieben
+                    # ---------------------------------------------------------------------
+
+                    # 2. Alle Knochen sammeln und nach Z-Tiefe sortieren
+                    bones_to_draw = []
+                    for pts in all_pts_2d_with_z:
+                        for limb_idx, limb in enumerate(mimic_limb_seq):
+                            start_idx = limb[0]
+                            end_idx = limb[1]
+                            if pts[start_idx] is not None and pts[end_idx] is not None:
+                                pt1 = pts[start_idx]
+                                pt2 = pts[end_idx]
+                                
+                                avg_z = (pt1[2] + pt2[2]) / 2.0
+                                color = limb_colors_rgb[limb_idx % len(limb_colors_rgb)]
+                                
+                                bones_to_draw.append({
+                                    'pt1': (pt1[0], pt1[1]),
+                                    'pt2': (pt2[0], pt2[1]),
+                                    'z': avg_z,
+                                    'color': color
+                                })
+                    
+                    bones_to_draw.sort(key=lambda b: b['z'], reverse=True)
+
+                    # 3. Ovale Knochen zeichnen
+                    for bone in bones_to_draw:
+                        x1, y1 = bone['pt1']
+                        x2, y2 = bone['pt2']
+                        color = bone['color']
+                        
+                        mX = (x1 + x2) / 2.0
+                        mY = (y1 + y2) / 2.0
+                        length = math.hypot(x1 - x2, y1 - y2)
+                        angle = math.degrees(math.atan2(y1 - y2, x1 - x2))
+                        
+                        polygon = cv2.ellipse2Poly(
+                            (int(mX), int(mY)), (int(length / 2), line_thickness), int(angle), 0, 360, 1
+                        )
+                        cv2.fillConvexPoly(frame_img, polygon, color, lineType=cv2.LINE_AA)
+
+                # 4. Knochen abdunkeln (Alpha 0.6 Effekt aus dem Original)
+                frame_img = (frame_img * 0.6).astype(np.uint8)
+
+                # 5. Gelenkpunkte sortieren und voll gesättigt zeichnen
+                if pose_input[i] is not None:
+                    joints_to_draw = []
+                    for pts in all_pts_2d_with_z:
+                        for j_idx, pt in enumerate(pts):
+                            if pt is not None:
+                                color_rgba = joint_colors_rgb[j_idx % len(joint_colors_rgb)]
+                                joints_to_draw.append({
+                                    'pt': (pt[0], pt[1]),
+                                    'z': pt[2],
+                                    'color': color_rgba
+                                })
+                    
+                    joints_to_draw.sort(key=lambda j: j['z'], reverse=True)
+
+                    for joint in joints_to_draw:
+                        x, y = joint['pt']
+                        if 0 <= x < width and 0 <= y < height:
+                            cv2.circle(frame_img, (x, y), point_radius, joint['color'], thickness=-1, lineType=cv2.LINE_AA)
+                
+                # Maske für ComfyUI
+                alpha_channel = np.where(np.any(frame_img > 0, axis=-1), 255, 0).astype(np.uint8)
+                frame_rgba = np.dstack((frame_img, alpha_channel))
+                frames_np_rgba.append(frame_rgba)
+
+            # --- 6. 2D Details (Gesicht/Hände) aus dem verschobenen Array drüberlegen ---
+            if dw_pose_input is not None and draw_2d:
+                canvas_2d = draw_pose_to_canvas_np(dw_pose_input, pool=None, H=height, W=width, reshape_scale=0, show_feet_flag=False, show_body_flag=False, show_cheek_flag=True, dw_hand=True, show_face_flag=draw_face, show_hand_flag=draw_hands)
+                for i in range(len(frames_np_rgba)):
+                    frame_rgba = frames_np_rgba[i]
+                    canvas_img = canvas_2d[i]
+                    mask = canvas_img != 0
+                    frame_rgba[:, :, :3][mask] = canvas_img[mask]
+                    # Alpha-Wert updaten
+                    alpha_mask = np.any(canvas_img > 0, axis=-1)
+                    frame_rgba[:, :, 3][alpha_mask] = 255
+                    frames_np_rgba[i] = frame_rgba
+
+            frames_tensor = torch.from_numpy(np.stack(frames_np_rgba, axis=0)).contiguous() / 255.0
+            frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
+
+            if isinstance(scaled_nlf_poses, dict):
+                scaled_nlf_poses['joints3d_nonparam'] = [pose_input]
+            else:
+                scaled_nlf_poses = pose_input
+
+            node_mappings = json.dumps({"node_name": "RenderNLFPosesDirectPoseDataMimic10", "status": "success", "frames": len(pose_input)})
+
+            return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages), scaled_nlf_poses, node_mappings)
+
+        except Exception as e:
+            log_messages.append(traceback.format_exc())
+            return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -16597,7 +16934,7 @@ NODE_CLASS_MAPPINGS = {
     "RenderNLFPosesDirectPoseDataMimic8": RenderNLFPosesDirectPoseDataMimic8,
     "RenderNLFPosesDirectPoseDataMimic9": RenderNLFPosesDirectPoseDataMimic9,
     "RenderNLFPosesDirectPoseDataMimic10": RenderNLFPosesDirectPoseDataMimic10,
-    #"RenderNLFPosesDirectPoseDataMimic11": RenderNLFPosesDirectPoseDataMimic11,
+    "RenderNLFPosesDirectPoseDataMimic11": RenderNLFPosesDirectPoseDataMimic11,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -16691,7 +17028,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RenderNLFPosesDirectPoseDataMimic8": "Render NLF Poses Mimic 8 (Flat 3D)",
     "RenderNLFPosesDirectPoseDataMimic9": "Render NLF Poses Mimic 9 (Flat 3D)",
     "RenderNLFPosesDirectPoseDataMimic10": "Render NLF Poses Mimic 10 (Flat 3D)",
-    #"RenderNLFPosesDirectPoseDataMimic11": "Render NLF Poses Mimic 11 (Flat 3D)",
+    "RenderNLFPosesDirectPoseDataMimic11": "Render NLF Poses Mimic 11 (Flat 3D)",
 
 
 }
