@@ -15632,7 +15632,7 @@ class RenderNLFPosesDirectPoseDataMimic7:
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
 
 
-class RenderNLFPosesDirectPoseDataMimic3:
+class RenderNLFPosesDirectPoseDataMimic8:
     @classmethod
     def INPUT_TYPES(cls):
         return {
