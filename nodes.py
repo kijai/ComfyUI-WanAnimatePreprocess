@@ -16516,7 +16516,7 @@ class RenderNLFPosesDirectPoseDataMimic11:
                 "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
                 "line_thickness": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1, "tooltip": "Dicke der Knochen (Ovale Form)"}),
                 "point_radius": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1, "tooltip": "Größe der Gelenkpunkte"}),
-                "head_connection_mode": (["Snap Face to Neck", "Keep Original"], {"default": "Snap Face to Neck", "tooltip": "Zieht DWPose Gesicht exakt auf das Ende des NLF-Halses"}),
+                "head_connection_mode": (["Snap Head to Neck", "Keep Original"], {"default": "Snap Head to Neck", "tooltip": "Zieht den DWPose Kopf exakt auf das Ende des NLF-Halses"}),
                 "draw_2d": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet 2D Overlay (falls DW Poses vorhanden)"}),
                 "draw_face": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet das Gesicht"}),
                 "draw_hands": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet die Hände"}),
@@ -16531,9 +16531,9 @@ class RenderNLFPosesDirectPoseDataMimic11:
     RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Mimic 3: ViTPose Look mit gefixten Händen und perfekt berechnetem Kopf-Offset."
+    DESCRIPTION = "Mimic 3: ViTPose Look mit exaktem Kopf-Offset und fehlerfreiem Array-Handling."
 
-    def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Snap Face to Neck", draw_2d=True, draw_face=True, draw_hands=True, dw_poses_fallback=None, nlf_render_config="{}"):
+    def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Snap Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, dw_poses_fallback=None, nlf_render_config="{}"):
         import copy
         import json
         import math
@@ -16549,6 +16549,7 @@ class RenderNLFPosesDirectPoseDataMimic11:
 
         try:
             pose_input = scaled_nlf_poses['joints3d_nonparam'][0] if isinstance(scaled_nlf_poses, dict) else scaled_nlf_poses
+            # Deepcopy schützt uns nicht immer vor read-only tuples, aber es entkoppelt die Daten
             dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
 
             intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
@@ -16657,7 +16658,7 @@ class RenderNLFPosesDirectPoseDataMimic11:
 
                             all_pts_2d_with_z.append(pts_2d_with_z)
 
-                    # --- NEU: DWPose Alignment (Hände & Kopf exakt auf NLF-Hals-Ende snappen) ---
+                    # --- NEU: DWPose Alignment (Absolut Crash-Sicher) ---
                     if dw_pose_input is not None and i < len(dw_pose_input):
                         dw_frame = dw_pose_input[i]
                         dw_faces = dw_frame.get("faces", [])
@@ -16671,75 +16672,101 @@ class RenderNLFPosesDirectPoseDataMimic11:
 
                         for p, pts in enumerate(all_pts_2d_with_z):
                             
-                            # --- Hände Alignment ---
+                            # --- Hände Alignment (Garantiert numpy arrays) ---
                             if 2*p + 1 < len(dw_hands):
-                                l_hand = dw_hands[2*p]     # Index 0, 2 = Linke Hand
-                                r_hand = dw_hands[2*p + 1] # Index 1, 3 = Rechte Hand
-
-                                # RECHTE Hand an NLF R.Wrist (4) und R.Elbow (3)
-                                if len(pts) > 4 and pts[4] is not None and np.sum(r_hand) > 0.01:
-                                    wrist_norm = np.array([pts[4][0] / float(width), pts[4][1] / float(height)])
-                                    gap_offset = np.array([0.0, 0.0])
-                                    if pts[3] is not None:
-                                        dir_vec = np.array([pts[4][0] - pts[3][0], pts[4][1] - pts[3][1]])
-                                        norm_vec = np.linalg.norm(dir_vec)
-                                        if norm_vec > 0:
-                                            gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
-                                    
-                                    offset = (wrist_norm + gap_offset) - r_hand[0]
-                                    valid_mask = r_hand[:, 0] > 0
-                                    r_hand[valid_mask] += offset
+                                l_hand_raw = dw_hands[2*p]     # Index 0, 2
+                                r_hand_raw = dw_hands[2*p + 1] # Index 1, 3
 
                                 # LINKE Hand an NLF L.Wrist (7) und L.Elbow (6)
-                                if len(pts) > 7 and pts[7] is not None and np.sum(l_hand) > 0.01:
-                                    wrist_norm = np.array([pts[7][0] / float(width), pts[7][1] / float(height)])
-                                    gap_offset = np.array([0.0, 0.0])
-                                    if pts[6] is not None:
-                                        dir_vec = np.array([pts[7][0] - pts[6][0], pts[7][1] - pts[6][1]])
-                                        norm_vec = np.linalg.norm(dir_vec)
-                                        if norm_vec > 0:
-                                            gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
-                                    
-                                    offset = (wrist_norm + gap_offset) - l_hand[0]
-                                    valid_mask = l_hand[:, 0] > 0
-                                    l_hand[valid_mask] += offset
+                                if l_hand_raw is not None and len(l_hand_raw) > 0:
+                                    l_hand_np = np.array(l_hand_raw, dtype=np.float64)
+                                    if np.sum(l_hand_np) > 0.01 and len(pts) > 7 and pts[7] is not None:
+                                        wrist_norm = np.array([pts[7][0] / float(width), pts[7][1] / float(height)])
+                                        gap_offset = np.array([0.0, 0.0])
+                                        if pts[6] is not None:
+                                            dir_vec = np.array([pts[7][0] - pts[6][0], pts[7][1] - pts[6][1]])
+                                            norm_vec = np.linalg.norm(dir_vec)
+                                            if norm_vec > 0:
+                                                gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
+                                        
+                                        offset = (wrist_norm + gap_offset) - l_hand_np[0]
+                                        valid_mask = l_hand_np[:, 0] > 0
+                                        l_hand_np[valid_mask, 0] += offset[0]
+                                        l_hand_np[valid_mask, 1] += offset[1]
+                                        dw_hands[2*p] = l_hand_np # Sicher zurückschreiben
+
+                                # RECHTE Hand an NLF R.Wrist (4) und R.Elbow (3)
+                                if r_hand_raw is not None and len(r_hand_raw) > 0:
+                                    r_hand_np = np.array(r_hand_raw, dtype=np.float64)
+                                    if np.sum(r_hand_np) > 0.01 and len(pts) > 4 and pts[4] is not None:
+                                        wrist_norm = np.array([pts[4][0] / float(width), pts[4][1] / float(height)])
+                                        gap_offset = np.array([0.0, 0.0])
+                                        if pts[3] is not None:
+                                            dir_vec = np.array([pts[4][0] - pts[3][0], pts[4][1] - pts[3][1]])
+                                            norm_vec = np.linalg.norm(dir_vec)
+                                            if norm_vec > 0:
+                                                gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
+                                        
+                                        offset = (wrist_norm + gap_offset) - r_hand_np[0]
+                                        valid_mask = r_hand_np[:, 0] > 0
+                                        r_hand_np[valid_mask, 0] += offset[0]
+                                        r_hand_np[valid_mask, 1] += offset[1]
+                                        dw_hands[2*p + 1] = r_hand_np # Sicher zurückschreiben
 
                             # --- Kopf & Gesicht Alignment ---
                             if p < len(subsets) and len(candidates) > 0:
                                 subset = subsets[p]
-                                dw_nose_idx = int(subset[0]) # DWPose Nase (der rote Punkt)
-                                
-                                # Wir nutzen NLF pts[0] (das obere Ende des Halses) als unseren Anker!
-                                if dw_nose_idx != -1 and dw_nose_idx < len(candidates) and len(pts) > 0 and pts[0] is not None:
-                                    nlf_head_anchor = np.array([pts[0][0] / float(width), pts[0][1] / float(height)])
-                                    dw_nose_norm = np.array(candidates[dw_nose_idx][:2])
+                                if len(subset) > 0:
+                                    dw_nose_idx = int(subset[0]) # Der rote DWPose Nasenpunkt
                                     
-                                    if head_connection_mode == "Snap Face to Neck":
-                                        # Exakter Offset vom DWPose Kopf zum NLF Hals-Ende
-                                        offset_norm = nlf_head_anchor - dw_nose_norm
+                                    # pts[0] ist das Ende des NLF Halses (unser Anker!)
+                                    if dw_nose_idx != -1 and dw_nose_idx < len(candidates) and len(pts) > 0 and pts[0] is not None:
+                                        nlf_head_anchor = np.array([pts[0][0] / float(width), pts[0][1] / float(height)])
                                         
-                                        # 1. DWPose Kopf-Punkte verschieben und in NLF überschreiben, damit sie gezeichnet werden!
-                                        for k_idx in [0, 14, 15, 16, 17]:
-                                            if k_idx < len(subset):
-                                                c_idx = int(subset[k_idx])
-                                                if c_idx != -1 and c_idx < len(candidates):
-                                                    candidates[c_idx][0] += offset_norm[0]
-                                                    candidates[c_idx][1] += offset_norm[1]
-                                                    
-                                                    if len(pts) > k_idx:
-                                                        pts[k_idx] = [
-                                                            int(candidates[c_idx][0] * width),
-                                                            int(candidates[c_idx][1] * height),
-                                                            pts[0][2] # Behalte 3D Z-Tiefe für korrekte Verdeckung
-                                                        ]
+                                        dw_nose_pt = candidates[dw_nose_idx]
+                                        dw_nose_norm = np.array([dw_nose_pt[0], dw_nose_pt[1]])
+                                        
+                                        if head_connection_mode == "Snap Head to Neck":
+                                            # Offset: Wie weit muss der DWPose Kopf rutschen, um exakt auf dem NLF-Hals zu sitzen?
+                                            offset_norm = nlf_head_anchor - dw_nose_norm
+                                            
+                                            # 1. DWPose Kopf-Punkte sicher verschieben (auch wenn Arrays read-only tuples sind)
+                                            for k_idx in [0, 14, 15, 16, 17]: # Nase, Augen, Ohren
+                                                if k_idx < len(subset):
+                                                    c_idx = int(subset[k_idx])
+                                                    if c_idx != -1 and c_idx < len(candidates):
+                                                        old_c = candidates[c_idx]
+                                                        new_c_x = old_c[0] + offset_norm[0]
+                                                        new_c_y = old_c[1] + offset_norm[1]
                                                         
-                                        # 2. DWPose Gesicht mit dem gleichen Offset verschieben
-                                        if p < len(dw_faces):
-                                            face = dw_faces[p]
-                                            if face is not None and len(face) > 0:
-                                                valid_mask = face[:, 0] > 0
-                                                face[valid_mask, 0] += offset_norm[0]
-                                                face[valid_mask, 1] += offset_norm[1]
+                                                        # Wir bauen das Array/die Liste sauber neu auf
+                                                        if isinstance(candidates, np.ndarray):
+                                                            candidates[c_idx, 0] = new_c_x
+                                                            candidates[c_idx, 1] = new_c_y
+                                                        else:
+                                                            new_c = list(old_c)
+                                                            new_c[0] = new_c_x
+                                                            new_c[1] = new_c_y
+                                                            candidates[c_idx] = new_c
+                                                        
+                                                        # Und wir sagen dem Oval-Renderer, wo die neuen Punkte liegen
+                                                        if len(pts) > k_idx:
+                                                            pts[k_idx] = [
+                                                                int(new_c_x * width),
+                                                                int(new_c_y * height),
+                                                                pts[0][2] # 3D Tiefe beibehalten
+                                                            ]
+                                                            
+                                            # 2. Das detaillierte DWPose Gesicht (die 68 Punkte) exakt genauso verschieben
+                                            if p < len(dw_faces):
+                                                face_raw = dw_faces[p]
+                                                if face_raw is not None and len(face_raw) > 0:
+                                                    face_np = np.array(face_raw, dtype=np.float64)
+                                                    if np.sum(face_np) > 0.01:
+                                                        valid_mask = face_np[:, 0] > 0
+                                                        face_np[valid_mask, 0] += offset_norm[0]
+                                                        face_np[valid_mask, 1] += offset_norm[1]
+                                                        dw_faces[p] = face_np # Sicher zurückschreiben
                     # ---------------------------------------------------------------------
 
                     # 2. Alle Knochen sammeln und nach Z-Tiefe sortieren
@@ -16834,8 +16861,18 @@ class RenderNLFPosesDirectPoseDataMimic11:
             return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages), scaled_nlf_poses, node_mappings)
 
         except Exception as e:
-            log_messages.append(traceback.format_exc())
-            return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
+            # MAGIE GEGEN SCHWARZE BILDSCHIRME: Wir drucken den echten Fehler direkt aufs Bild!
+            err_msg = traceback.format_exc()
+            log_messages.append(err_msg)
+            err_img = np.zeros((height, width, 3), dtype=np.uint8)
+            cv2.putText(err_img, "CRASH DETECTED (See Console for details)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            y_pos = 70
+            for line in err_msg.split('\n')[-8:]:
+                cv2.putText(err_img, line[:90], (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                y_pos += 25
+                
+            err_tensor = torch.from_numpy(err_img).contiguous().unsqueeze(0) / 255.0
+            return (err_tensor.cpu().float(), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
 
 
 NODE_CLASS_MAPPINGS = {
