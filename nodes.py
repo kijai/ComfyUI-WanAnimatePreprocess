@@ -16188,7 +16188,7 @@ class RenderNLFPosesDirectPoseDataMimic9:
             log_messages.append(traceback.format_exc())
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
 
-class RenderNLFPosesDirectPoseDataMimic3:
+class RenderNLFPosesDirectPoseDataMimic10:
     @classmethod
     def INPUT_TYPES(cls):
         return {
