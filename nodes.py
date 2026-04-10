@@ -16505,7 +16505,7 @@ class RenderNLFPosesDirectPoseDataMimic10:
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
 
 
-class RenderNLFPosesDirectPoseDataMimic11:
+class RenderNLFPosesDirectPoseDataMimic10:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -16530,7 +16530,7 @@ class RenderNLFPosesDirectPoseDataMimic11:
     RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Mimic 10: DW Pose Nase wird auf NLF Halsende ge-offsettet. Ohne NLF zu zerstören."
+    DESCRIPTION = "Mimic 10: Head Offset exakt wie Hand Offset (Nase vom KOPF zu NLF Halsende)."
 
     def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Offset Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, dw_poses_fallback=None, nlf_render_config="{}"):
         import copy
@@ -16630,7 +16630,7 @@ class RenderNLFPosesDirectPoseDataMimic11:
                                 else:
                                     pts_2d_with_z.append(None)
                             
-                            # --- Schultern ausrichten ---
+                            # --- Gerade Schultern (NLF Halsmitte zentrieren) ---
                             if len(pts_2d_with_z) > 5 and pts_2d_with_z[2] is not None and pts_2d_with_z[5] is not None:
                                 p_r = pts_2d_with_z[2]
                                 p_l = pts_2d_with_z[5]
@@ -16639,18 +16639,18 @@ class RenderNLFPosesDirectPoseDataMimic11:
                                 new_z = (p_r[2] + p_l[2]) / 2.0
                                 pts_2d_with_z[1] = [int(new_x), int(new_y), new_z]
 
-                            # WICHTIG: Kein NLF-Offset mehr hier! Der Hals bleibt perfekt so wie er von NLF kommt!
                             all_pts_2d_with_z.append(pts_2d_with_z)
 
-                    # --- DWPose Alignment ---
+                    # --- DWPose Alignment (Hände & Kopf exakt selbe Logik) ---
                     if dw_pose_input is not None and i < len(dw_pose_input):
                         dw_frame = dw_pose_input[i]
                         dw_faces = dw_frame.get("faces", [])
                         dw_hands = dw_frame.get("hands", [])
+                        dw_bodies = dw_frame.get("bodies", {})
 
                         for p, pts in enumerate(all_pts_2d_with_z):
                             
-                            # --- 1. HÄNDE ALIGNMENT (Unverändert, weil es gut funktioniert) ---
+                            # --- 1. HÄNDE ALIGNMENT ---
                             if 2*p + 1 < len(dw_hands):
                                 l_hand = dw_hands[2*p]     
                                 r_hand = dw_hands[2*p + 1] 
@@ -16680,50 +16680,47 @@ class RenderNLFPosesDirectPoseDataMimic11:
                                     l_hand[valid_mask] += offset
 
                             # --- 2. KOPF / GESICHT ALIGNMENT ---
-                            if p < len(dw_faces):
-                                face = dw_faces[p]
-                                # Wenn DW Gesicht da ist und der NLF Halsende-Punkt existiert
-                                if np.sum(face) > 0.01 and pts[0] is not None:
-                                    
-                                    # Ziel: NLF Hals-Ende
-                                    nlf_neck_end = np.array([pts[0][0] / float(width), pts[0][1] / float(height)])
-                                    # DW Pose Nase (Index 30)
-                                    dw_nose = face[30] 
-                                    
-                                    if dw_nose[0] > 0:
-                                        if head_connection_mode == "Offset Head to Neck":
-                                            # Modus 1: NLF bleibt starr. DW Kopf wandert auf den NLF Hals.
-                                            offset = nlf_neck_end - dw_nose
+                            if pts[0] is not None:
+                                # Target: Das Ende vom Hals (NLF Punkt 0)
+                                nlf_neck_end = np.array([pts[0][0] / float(width), pts[0][1] / float(height)])
+                                
+                                dw_head_nose = None
+                                person_subset = None
+                                candidate = None
+                                
+                                # Anchor holen: Die Nase vom KOPF (Index 0 in Body), NICHT vom Face
+                                if isinstance(dw_bodies, dict) and "candidate" in dw_bodies and "subset" in dw_bodies:
+                                    candidate = dw_bodies["candidate"]
+                                    subset = dw_bodies["subset"]
+                                    if p < len(subset):
+                                        person_subset = subset[p]
+                                        nose_idx = int(person_subset[0])
+                                        if 0 <= nose_idx < len(candidate):
+                                            dw_head_nose = np.array([candidate[nose_idx][0], candidate[nose_idx][1]])
                                             
-                                            # A) Das gesamte DW Gesicht verschieben
-                                            valid_mask = face[:, 0] > 0
-                                            face[valid_mask] += offset
-                                            
-                                            # B) Die Kopfpunkte im DW Body verschieben (ohne KeyError Crash!)
-                                            if isinstance(dw_frame.get("bodies"), dict):
-                                                bodies_dict = dw_frame["bodies"]
-                                                candidate = bodies_dict.get("candidate", [])
-                                                subset = bodies_dict.get("subset", [])
+                                if dw_head_nose is not None:
+                                    if head_connection_mode == "Offset Head to Neck":
+                                        # Den simplen Offset berechnen (genau wie bei den Händen)
+                                        offset = nlf_neck_end - dw_head_nose
+                                        
+                                        # Offset auf ALLE Punkte vom Kopf anwenden (0, 14, 15, 16, 17)
+                                        for h_idx in [0, 14, 15, 16, 17]:
+                                            cand_idx = int(person_subset[h_idx])
+                                            if 0 <= cand_idx < len(candidate):
+                                                candidate[cand_idx][0] += offset[0]
+                                                candidate[cand_idx][1] += offset[1]
                                                 
-                                                if p < len(subset):
-                                                    person_subset = subset[p]
-                                                    # Indizes für Nase(0), Augen(14,15), Ohren(16,17) im OpenPose Format
-                                                    for h_idx in [0, 14, 15, 16, 17]:
-                                                        if h_idx < len(person_subset):
-                                                            cand_idx = int(person_subset[h_idx])
-                                                            if cand_idx >= 0 and cand_idx < len(candidate):
-                                                                candidate[cand_idx][0] += offset[0]
-                                                                candidate[cand_idx][1] += offset[1]
-                                                                
-                                        elif head_connection_mode == "Keep Head & Stretch Neck":
-                                            # Modus 2: DW Gesicht bleibt starr. NLF Hals stretcht sich zur DW Nase.
-                                            offset_x = (dw_nose[0] * width) - pts[0][0]
-                                            offset_y = (dw_nose[1] * height) - pts[0][1]
+                                        # Genau den gleichen Offset auf ALLE Punkte vom Gesicht anwenden
+                                        if p < len(dw_faces):
+                                            face = dw_faces[p]
+                                            valid_mask = face[:, 0] > 0
+                                            face[valid_mask, 0] += offset[0]
+                                            face[valid_mask, 1] += offset[1]
                                             
-                                            for h_idx in [0, 14, 15, 16, 17]:
-                                                if pts[h_idx] is not None:
-                                                    pts[h_idx][0] += offset_x
-                                                    pts[h_idx][1] += offset_y
+                                    elif head_connection_mode == "Keep Head & Stretch Neck":
+                                        # Hier bleibt DW starr, NLF Hals streckt sich hoch zur DW Nase
+                                        pts[0][0] = dw_head_nose[0] * width
+                                        pts[0][1] = dw_head_nose[1] * height
                     # ---------------------------------------------------------------------
 
                     # Knochen sammeln und zeichnen
@@ -16812,7 +16809,6 @@ class RenderNLFPosesDirectPoseDataMimic11:
         except Exception as e:
             log_messages.append(traceback.format_exc())
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
-
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
