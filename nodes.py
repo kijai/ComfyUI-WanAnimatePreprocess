@@ -11508,6 +11508,186 @@ class PoseGlobalPerspectiveScalerV40:
 
 
 
+class PoseGlobalPerspectiveScalerV38:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_depth_map": ("IMAGE",),
+                "include_head": ("BOOLEAN", {"default": True}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "frontal_method": (["3D_NLF", "2D_Ratio"], {"default": "3D_NLF"}),
+                "frontal_2d_threshold": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "scale_2d_axes": (["X and Y (Uniform)", "Only Y (Height)"], {"default": "X and Y (Uniform)"}),
+            },
+            "optional": {
+                "video_nlf_data": ("NLFPRED",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING", "NLFPRED", "STRING")
+    RETURN_NAMES = ("scaled_pose_data", "log_output", "nlf_data", "nlf_render_config")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V38: Nutzt die Pinhole-Skalierung und reicht 3D-Daten UNVERÄNDERT an den Renderer weiter."
+
+    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method, frontal_2d_threshold, scale_2d_axes, video_nlf_data=None):
+        import copy
+        import numpy as np
+        import math
+        import json
+
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        log_messages = ["=== V38 GLOBAL SCALER LOG (DEBUG EDITION) ==="]
+
+        if not pose_metas:
+            return (pose_data_copy, "Fehler: Keine Pose-Daten.", video_nlf_data, "{}")
+
+        slope = calibration_data.get("perspective_slope", 0.0)
+        intercept = calibration_data.get("perspective_intercept", 1.0)
+        is_inverted = calibration_data.get("is_depth_inverted", False)
+        use_pinhole_math = calibration_data.get("use_pinhole_math", True)
+        fx_calib = calibration_data.get("focal_length_fx", 500.0)
+        echte_groesse = calibration_data.get("echte_groesse", 0.0)
+
+        depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
+        H, W = depth_np.shape[1], depth_np.shape[2]
+        
+        log_messages.append(f"Image Dimensions (H x W): {H} x {W}")
+        log_messages.append(f"Kalibrierung: fx={fx_calib}, echte_groesse={echte_groesse}")
+
+        def is_valid_point(kps, confs, idx):
+            if kps is None or idx >= len(kps): return False
+            pt = kps[idx]
+            if pt is None or len(pt) < 2: return False
+            c = float(confs[idx]) if (confs is not None and idx < len(confs)) else (float(pt[2]) if len(pt)>=3 else 1.0)
+            return c >= min_confidence
+
+        best_idx = 0
+        best_area = 0.0
+        for i, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            confs = getattr(meta, "kps_body_p", None)
+            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            if valid_y and valid_x:
+                area = (max(valid_x) - min(valid_x)) * (max(valid_y) - min(valid_y))
+                if area > best_area:
+                    best_area = area
+                    best_idx = i
+
+        start_idx = max(0, best_idx - anchor_window)
+        end_idx = min(len(pose_metas) - 1, best_idx + anchor_window)
+
+        log_messages.append(f"Suche abgeschlossen. Bester Frame (best_idx): {best_idx}")
+        log_messages.append(f"Anchor Window: Frame {start_idx} bis {end_idx}")
+
+        sum_norm = 0.0
+        sum_depth = 0.0
+        valid_frames_in_window = 0
+
+        for i in range(start_idx, end_idx + 1):
+            meta = pose_metas[i]
+            kps = getattr(meta, "kps_body", [])
+            confs = getattr(meta, "kps_body_p", None)
+            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            
+            if not valid_y or not valid_x:
+                log_messages.append(f"  Frame {i}: Übersprungen (Keine validen Punkte).")
+                continue
+                
+            norm_val = math.sqrt((max(valid_x) - min(valid_x))**2 + (max(valid_y) - min(valid_y))**2)
+            
+            v_idx = min(i, depth_np.shape[0] - 1)
+            
+            # --- Hier liest V38 die Punkte für die Tiefe aus ---
+            valid_x_d = [kps[idx][0] * W for idx in [1,8,11] if is_valid_point(kps, confs, idx)]
+            valid_y_d = [kps[idx][1] * H for idx in [1,8,11] if is_valid_point(kps, confs, idx)]
+            
+            log_messages.append(f"\n  Frame {i} Depth-Analyse:")
+            log_messages.append(f"    Gefundene Norm: {norm_val:.1f} px")
+            log_messages.append(f"    Punkte zum Tiefe auslesen (Neck/Hip): X={valid_x_d}, Y={valid_y_d}")
+            
+            depth_vals = [depth_np[v_idx, int(py), int(px)] for px, py in zip(valid_x_d, valid_y_d) if 0 <= int(px) < W and 0 <= int(py) < H]
+            
+            log_messages.append(f"    Gefundene depth_vals in DepthMap: {depth_vals}")
+            
+            frame_depth = float(np.mean(depth_vals)) if depth_vals else 0.5
+            log_messages.append(f"    Resultierende Tiefe (Mittelwert oder 0.5 Fallback): {frame_depth:.4f} m")
+
+            if is_inverted:
+                frame_depth = 1.0 / max(frame_depth, 0.0001)
+                
+            sum_norm += norm_val
+            sum_depth += frame_depth
+            valid_frames_in_window += 1
+
+        if valid_frames_in_window == 0:
+            return (pose_data_copy, "Fehler: Anchor-Window ungültig.", video_nlf_data, "{}")
+
+        avg_anchor_norm = sum_norm / valid_frames_in_window
+        avg_anchor_depth = sum_depth / valid_frames_in_window
+
+        log_messages.append(f"\n--- SKALIERUNG RECHENVORGANG ---")
+        log_messages.append(f"Durchschnittliche Ist-Norm: {avg_anchor_norm:.1f} px")
+        log_messages.append(f"Durchschnittliche Ist-Tiefe: {avg_anchor_depth:.4f} m")
+
+        if use_pinhole_math and echte_groesse > 0.0:
+            expected_norm = (echte_groesse * fx_calib) / avg_anchor_depth
+            log_messages.append(f"Soll-Norm = ({echte_groesse:.3f}m * {fx_calib:.2f}) / {avg_anchor_depth:.4f}m = {expected_norm:.1f} px")
+        else:
+            expected_norm = (avg_anchor_depth * slope) + intercept
+            log_messages.append(f"Soll-Norm = ({avg_anchor_depth:.4f} * {slope:.2f}) + {intercept:.2f} = {expected_norm:.1f} px")
+
+        anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
+        scale_x_factor = anchor_scale if scale_2d_axes == "X and Y (Uniform)" else 1.0
+        
+        log_messages.append(f"Skalierungs-Faktor = Soll-Norm / Ist-Norm = {anchor_scale:.3f}x")
+
+        # --- Wir berechnen den GLOBALEN KAMERA PIVOT aus dem Anchor Frame ---
+        global_pivot_x, global_pivot_y = 0.5, 0.5
+        if best_idx < len(pose_metas):
+            kps_best = getattr(pose_metas[best_idx], "kps_body", [])
+            c_best = getattr(pose_metas[best_idx], "kps_body_p", None)
+            val_y = [kps_best[idx][1] for idx in range(len(kps_best)) if is_valid_point(kps_best, c_best, idx)]
+            val_x = [kps_best[idx][0] for idx in range(len(kps_best)) if is_valid_point(kps_best, c_best, idx)]
+            if val_y and val_x:
+                global_pivot_x = np.mean(val_x)
+                global_pivot_y = max(val_y)  # Füße im Anchor Frame
+
+        log_messages.append(f"Kamera Pivot X/Y: {global_pivot_x:.1f}, {global_pivot_y:.1f}")
+
+        # --- 1. 2D Daten Skalieren (relativ zum globalen Kamera Pivot) ---
+        for i, meta in enumerate(pose_metas):
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None and len(arr) > 0:
+                    for j in range(len(arr)):
+                        if len(arr[j]) >= 2 and arr[j][1] > 0:
+                            arr[j][0] = global_pivot_x + (arr[j][0] - global_pivot_x) * scale_x_factor
+                            arr[j][1] = global_pivot_y + (arr[j][1] - global_pivot_y) * anchor_scale
+
+        # --- 2. CONFIGURATION DATA BAUEN ---
+        nlf_render_config = {
+            "anchor_scale": float(anchor_scale),
+            "scale_x_factor": float(scale_x_factor),
+            "pivot_x": float(global_pivot_x),
+            "pivot_y": float(global_pivot_y)
+        }
+        config_str = json.dumps(nlf_render_config)
+
+        log_messages.append("\n=== NLF 3D DATA DELEGATION LOG ===")
+        log_messages.append("Genialer Plan aktiv: 3D-Daten bleiben UNVERÄNDERT. Die Kamera-Anweisungen wurden in nlf_render_config verpackt!")
+
+        # Wir reichen die originalen, unbeschädigten NLF-Daten weiter!
+        return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
