@@ -16873,7 +16873,7 @@ class RenderNLFPosesDirectPoseDataMimic12:
     RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Mimic 10: Kompletter Offset inkl. Nachziehen der dicken NLF-Kopfpunkte."
+    DESCRIPTION = "Mimic 10: Head Offset exakt wie Hand Offset (Verschiebt den kompletten Kopf als festen Block)."
 
     def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Offset Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, dw_poses_fallback=None, nlf_render_config="{}"):
         import copy
@@ -17044,6 +17044,7 @@ class RenderNLFPosesDirectPoseDataMimic12:
                                 person_subset = None
                                 candidate = None
                                 
+                                # Nasenpunkt im DW-Body finden
                                 if isinstance(dw_bodies, dict) and "candidate" in dw_bodies and "subset" in dw_bodies:
                                     candidate = dw_bodies["candidate"]
                                     subset = dw_bodies["subset"]
@@ -17062,41 +17063,38 @@ class RenderNLFPosesDirectPoseDataMimic12:
                                                 dw_hx = float(cand_val[0])
                                                 dw_hy = float(cand_val[1])
 
+                                # Fallback auf Gesicht, falls kein Body gefunden wurde
+                                if dw_hx is None and p < len(dw_faces):
+                                    face = dw_faces[p]
+                                    if isinstance(face, np.ndarray) and len(face) > 30 and face[30, 0] > 0:
+                                        dw_hx = float(face[30, 0])
+                                        dw_hy = float(face[30, 1])
+
                                 if dw_hx is not None and dw_hy is not None:
                                     if head_connection_mode == "Offset Head to Neck":
+                                        # Der eine, perfekte Offset
                                         ox = float(nlf_nx - dw_hx)
                                         oy = float(nlf_ny - dw_hy)
                                         
-                                        # Offset auf DW Head anwenden (0, 14, 15, 16, 17)
-                                        for h_idx in [0, 14, 15, 16, 17]:
-                                            h_idx_flat = int(np.array(person_subset).flatten()[h_idx])
-                                            if 0 <= h_idx_flat < len(candidate):
-                                                elem = candidate[h_idx_flat]
-                                                new_nx, new_ny = 0.0, 0.0
-                                                if isinstance(elem, np.ndarray):
-                                                    elem.flat[0] += ox
-                                                    elem.flat[1] += oy
-                                                    new_nx = float(elem.flat[0])
-                                                    new_ny = float(elem.flat[1])
-                                                elif isinstance(elem, list):
-                                                    if isinstance(elem[0], list):
-                                                        elem[0][0] += ox
-                                                        elem[0][1] += oy
-                                                        new_nx = float(elem[0][0])
-                                                        new_ny = float(elem[0][1])
-                                                    else:
-                                                        elem[0] += ox
-                                                        elem[1] += oy
-                                                        new_nx = float(elem[0])
-                                                        new_ny = float(elem[1])
+                                        # 1. Offset auf alle DW Kopf-Punkte addieren
+                                        if person_subset is not None and candidate is not None:
+                                            for h_idx in [0, 14, 15, 16, 17]:
+                                                if h_idx < len(person_subset):
+                                                    cand_idx = int(np.array(person_subset).flatten()[h_idx])
+                                                    if 0 <= cand_idx < len(candidate):
+                                                        cand = candidate[cand_idx]
+                                                        if isinstance(cand, np.ndarray):
+                                                            cand.flat[0] += ox
+                                                            cand.flat[1] += oy
+                                                        elif isinstance(cand, list):
+                                                            if isinstance(cand[0], list):
+                                                                cand[0][0] += ox
+                                                                cand[0][1] += oy
+                                                            else:
+                                                                cand[0] += ox
+                                                                cand[1] += oy
                                                 
-                                                # WICHTIG: Die dicken NLF Knochen exakt auf die DWPose-Punkte setzen, 
-                                                # damit sie nicht "an der alten Stelle" stehen bleiben!
-                                                if h_idx in [14, 15, 16, 17] and pts[h_idx] is not None:
-                                                    pts[h_idx][0] = new_nx * float(width)
-                                                    pts[h_idx][1] = new_ny * float(height)
-                                                
-                                        # Offset auf DW Face anwenden
+                                        # 2. Offset auf alle DW Gesichtspunkte addieren
                                         if p < len(dw_faces):
                                             face = dw_faces[p]
                                             if isinstance(face, np.ndarray):
@@ -17108,19 +17106,25 @@ class RenderNLFPosesDirectPoseDataMimic12:
                                                     if f_pt[0] > 0:
                                                         f_pt[0] += ox
                                                         f_pt[1] += oy
+                                                        
+                                        # 3. Den gleichen Offset auf die Ovale (NLF Punkte) addieren, damit nichts zurückbleibt!
+                                        pixel_ox = ox * float(width)
+                                        pixel_oy = oy * float(height)
+                                        for h_idx in [14, 15, 16, 17]:
+                                            if pts[h_idx] is not None:
+                                                pts[h_idx][0] += pixel_ox
+                                                pts[h_idx][1] += pixel_oy
                                             
                                     elif head_connection_mode == "Keep Head & Stretch Neck":
-                                        pts[0][0] = dw_hx * float(width)
-                                        pts[0][1] = dw_hy * float(height)
+                                        # Wenn der Hals sich strecken soll, berechnen wir, wie weit er sich streckt
+                                        pixel_ox = (dw_hx * float(width)) - pts[0][0]
+                                        pixel_oy = (dw_hy * float(height)) - pts[0][1]
                                         
-                                        # Auch beim Stretchen müssen die Knochen exakt zum DWPose-Kopf passen
-                                        for h_idx in [14, 15, 16, 17]:
-                                            h_idx_flat = int(np.array(person_subset).flatten()[h_idx])
-                                            if 0 <= h_idx_flat < len(candidate) and pts[h_idx] is not None:
-                                                cand_val = np.array(candidate[h_idx_flat]).flatten()
-                                                if cand_val[0] > 0:
-                                                    pts[h_idx][0] = float(cand_val[0]) * float(width)
-                                                    pts[h_idx][1] = float(cand_val[1]) * float(height)
+                                        # Wir ziehen den Hals und alle NLF Ovale um genau diesen Wert mit!
+                                        for h_idx in [0, 14, 15, 16, 17]:
+                                            if pts[h_idx] is not None:
+                                                pts[h_idx][0] += pixel_ox
+                                                pts[h_idx][1] += pixel_oy
                     # ---------------------------------------------------------------------
 
                     # Knochen sammeln und zeichnen
