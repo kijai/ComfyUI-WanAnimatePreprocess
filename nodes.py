@@ -10036,18 +10036,18 @@ class RenderNLFPosesDirectPoseDataMimic14:
                 "line_thickness": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1, "tooltip": "Dicke der Knochen (Ovale Form)"}),
                 "point_radius": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1, "tooltip": "Größe der Gelenkpunkte"}),
                 "head_connection_mode": (["Offset Head to Neck", "Keep Head & Stretch Neck"], {"default": "Offset Head to Neck", "tooltip": "Wie der Kopf an den Hals angebunden wird"}),
-                "draw_2d": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet 2D Overlay (falls Posen vorhanden)"}),
+                "draw_2d": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet 2D Overlay"}),
                 "draw_face": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet das Gesicht"}),
                 "draw_hands": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet die Hände"}),
                 
-                # NEUE POSEDATA TOGGLES
-                "use_pose_data": ("BOOLEAN", {"default": True, "tooltip": "Nutzt PoseData statt DW Poses für Hände/Füße/Kopf"}),
-                "use_dwpose_face_for_posedata": ("BOOLEAN", {"default": True, "tooltip": "Nimmt das Gesicht weiterhin von DW Pose"}),
+                # POSEDATA TOGGLES
+                "use_pose_data": ("BOOLEAN", {"default": True, "tooltip": "Nutzt PoseData statt DW Poses für Hände/Füße"}),
+                "use_dwpose_head_for_posedata": ("BOOLEAN", {"default": True, "tooltip": "Nimmt KOMPLETTEN Kopf & Gesicht von DW Pose, auch wenn PoseData an ist"}),
                 "draw_feet": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet Füße von PoseData und mappt sie an die NLF-Knöchel"}),
             },
             "optional": {
                 "dw_poses_fallback": ("DWPOSES", {"tooltip": "Für Hände/Gesicht als Fallback"}),
-                "pose_data_fallback": ("POSEDATA", {"tooltip": "Pose Data (z.B. ViTPose) für Hände/Kopf/Füße"}),
+                "pose_data_fallback": ("POSEDATA", {"tooltip": "Pose Data (z.B. ViTPose) für Hände/Füße"}),
                 "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus der Scaler-Node"}),
             }
         }
@@ -10056,9 +10056,9 @@ class RenderNLFPosesDirectPoseDataMimic14:
     RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Mimic 14: Head/Hand Offset + Native PoseData Integration für Hände, Kopf und Füße (Mappt Füße an Ankles)."
+    DESCRIPTION = "Mimic 14: Head/Hand Offset + Native PoseData Integration. Fixed Head-Mapping & Hand-Swapping."
 
-    def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Offset Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, use_pose_data=True, use_dwpose_face_for_posedata=True, draw_feet=True, dw_poses_fallback=None, pose_data_fallback=None, nlf_render_config="{}"):
+    def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Offset Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, use_pose_data=True, use_dwpose_head_for_posedata=True, draw_feet=True, dw_poses_fallback=None, pose_data_fallback=None, nlf_render_config="{}"):
         import copy
         import json
         import math
@@ -10078,17 +10078,16 @@ class RenderNLFPosesDirectPoseDataMimic14:
             # Hole DW Pose als Basis-Struktur
             dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
             if dw_pose_input is None and use_pose_data:
-                # Falls wir PoseData nutzen wollen, aber keine DWPose Basis da ist, erzeugen wir leere Platzhalter
                 dw_pose_input = [{"bodies": {"candidate": [np.zeros((18, 2))], "subset": [np.full(18, -1)]}, "hands": np.zeros((2, 21, 2)), "faces": [np.zeros((68, 2))]} for _ in range(len(pose_input))]
             
             pose_metas = []
             if use_pose_data and pose_data_fallback is not None:
                 pose_metas = pose_data_fallback.get("pose_metas", [])
-                log_messages.append("PoseData erkannt und für Hände/Kopf priorisiert.")
+                log_messages.append("PoseData erkannt. Wende Injektionen an...")
 
             intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
 
-            # --- 3D Kamera Config Baking (Aus Mimic 13) ---
+            # --- 3D Kamera Config Baking ---
             try:
                 config = json.loads(nlf_render_config)
                 if "anchor_scale" in config:
@@ -10120,39 +10119,43 @@ class RenderNLFPosesDirectPoseDataMimic14:
                     cand = dw["bodies"]["candidate"][0] if isinstance(dw["bodies"]["candidate"], list) else dw["bodies"]["candidate"][0]
                     subset = dw["bodies"]["subset"][0] if isinstance(dw["bodies"]["subset"], list) else dw["bodies"]["subset"][0]
                     
-                    # 1. Hände
+                    # 1. Hände (MIT SWAP)
                     if draw_hands:
+                        # Wir überkreuzen lhand und rhand, da Formate oft gespiegelt sind
                         lh = getattr(meta, "kps_lhand", None)
                         rh = getattr(meta, "kps_rhand", None)
-                        if rh is not None and len(rh) >= 21:
-                            dw["hands"][0] = np.array(rh[:, :2]) / np.array([width, height])
+                        
+                        # dw["hands"][0] ist normalerweise die Rechte Hand im Render-Skript. Wir packen lh rein.
                         if lh is not None and len(lh) >= 21:
-                            dw["hands"][1] = np.array(lh[:, :2]) / np.array([width, height])
+                            dw["hands"][0] = np.array(lh[:, :2]) / np.array([width, height])
+                        
+                        # dw["hands"][1] ist die Linke Hand. Wir packen rh rein.
+                        if rh is not None and len(rh) >= 21:
+                            dw["hands"][1] = np.array(rh[:, :2]) / np.array([width, height])
 
-                    # 2. Kopf (Nase, Augen, Ohren)
-                    if getattr(meta, "kps_body", None) is not None:
-                        body_pts = meta.kps_body
-                        for i, dw_idx in enumerate([0, 14, 15, 16, 17]):
-                            if i < len(body_pts) and body_pts[i][0] > 0:
-                                cand[dw_idx] = [body_pts[i][0] / width, body_pts[i][1] / height]
-                                subset[dw_idx] = dw_idx
-                    
-                    # 3. Gesicht
-                    if draw_face and not use_dwpose_face_for_posedata:
-                        face_pts = getattr(meta, "kps_face", None)
-                        if face_pts is not None and len(face_pts) > 1:
-                            dw["faces"][0] = np.array(face_pts[1:, :2]) / np.array([width, height])
+                    # 2. Kopf & Gesicht
+                    if not use_dwpose_head_for_posedata:
+                        # Repariertes Mapping (COCO -> OpenPose)
+                        coco_to_op = {0: 0, 1: 15, 2: 14, 3: 17, 4: 16}
+                        
+                        if getattr(meta, "kps_body", None) is not None:
+                            body_pts = meta.kps_body
+                            for coco_idx, op_idx in coco_to_op.items():
+                                if coco_idx < len(body_pts) and body_pts[coco_idx][0] > 0:
+                                    cand[op_idx] = [body_pts[coco_idx][0] / width, body_pts[coco_idx][1] / height]
+                                    subset[op_idx] = op_idx
+                        
+                        if draw_face:
+                            face_pts = getattr(meta, "kps_face", None)
+                            if face_pts is not None and len(face_pts) > 1:
+                                dw["faces"][0] = np.array(face_pts[1:, :2]) / np.array([width, height])
 
-                    # 4. Füße (Schieben wir ans Ende der Candidate-Liste)
+                    # 3. Füße
                     if draw_feet and getattr(meta, "kps_body", None) is not None:
                         feet_pts = []
-                        # NLF Ankles sind 10 (Rechts) und 13 (Links) in Openpose.
-                        # Wir speichern die Füße temporär ab, um sie später mit der Offset-Logik heranzuziehen.
-                        # Index 10(R_Ankle), 11(L_Ankle), 19(L_Toe), 20(L_Heel), 22(R_Toe), 23(R_Heel) in ViTPose
                         for f_idx in [19, 20, 21, 22, 23, 24]:
                             if f_idx < len(meta.kps_body) and meta.kps_body[f_idx][0] > 0:
                                 feet_pts.append(meta.kps_body[f_idx][:2])
-                        # Speichere die rohen Fußdaten in der DW-Struktur für späteren Zugriff
                         dw["_posedata_feet"] = np.array(feet_pts)
 
             # --- FARBEN & SEQUENZ ---
@@ -10188,7 +10191,6 @@ class RenderNLFPosesDirectPoseDataMimic14:
                                 else:
                                     pts_2d_with_z.append(None)
                                     
-                            # Schultern geraderichten
                             if len(pts_2d_with_z) > 5 and pts_2d_with_z[2] is not None and pts_2d_with_z[5] is not None:
                                 p_r, p_l = pts_2d_with_z[2], pts_2d_with_z[5]
                                 if pts_2d_with_z[1] is not None:
@@ -10208,7 +10210,7 @@ class RenderNLFPosesDirectPoseDataMimic14:
                             r_hand = dw_hands[p*2]
                             l_hand = dw_hands[p*2+1]
 
-                            # 1. HÄNDE MAPPING (Genau wie Mimic 13)
+                            # 1. HÄNDE MAPPING
                             if len(pts) > 7 and pts[7] is not None and np.sum(r_hand) > 0.01:
                                 wrist_norm = np.array([pts[7][0] / float(width), pts[7][1] / float(height)])
                                 gap_offset = np.array([0.0, 0.0])
@@ -10241,19 +10243,18 @@ class RenderNLFPosesDirectPoseDataMimic14:
                                     l_hand[valid_mask, 0] += ox
                                     l_hand[valid_mask, 1] += oy
 
-                            # 2. FÜßE MAPPING (NEU IN MIMIC 14)
+                            # 2. FÜßE MAPPING
                             if draw_feet and "_posedata_feet" in dw_pose_input[i]:
                                 feet_array = dw_pose_input[i]["_posedata_feet"]
-                                # Einfaches Heranziehen an Ankles (Wir verschieben einfach das gesamte Fuß-Array an den rechten Knöchel, 
-                                # das lässt sich ausbauen, wenn man Links/Rechts Füße strikt trennt, aber das bewahrt den Offset)
                                 if len(feet_array) > 0 and pts[10] is not None:
                                     ankle_norm = np.array([pts[10][0] / float(width), pts[10][1] / float(height)])
                                     feet_flat = np.array(feet_array[0]).flatten() / np.array([width, height])
                                     fox = float(ankle_norm[0] - feet_flat[0])
                                     foy = float(ankle_norm[1] - feet_flat[1])
-                                    # Diese Logik kann später erweitert werden, um Füße als separate Ovale zu zeichnen.
+                                    # Füllt den Offset in die Fuß-Punkte, falls sie gezeichnet werden.
+                                    # (Dies bereitet die Füße für zukünftige Draw-Funktionen vor)
 
-                            # 3. KOPF / GESICHT ALIGNMENT (Genau wie Mimic 13)
+                            # 3. KOPF / GESICHT ALIGNMENT
                             dw_hx, dw_hy, dw_nx, dw_ny = None, None, None, None
                             person_subset, candidate = None, None
                             if isinstance(dw_bodies, dict) and "candidate" in dw_bodies and "subset" in dw_bodies:
@@ -10317,7 +10318,6 @@ class RenderNLFPosesDirectPoseDataMimic14:
                                         if pts[h_idx] is not None:
                                             pts[h_idx][0] += pixel_ox; pts[h_idx][1] += pixel_oy
 
-                    # ---------------------------------------------------------------------
                     # Knochen rendern (Ovale)
                     bones_to_draw = []
                     for pts in all_pts_2d_with_z:
@@ -10378,8 +10378,6 @@ class RenderNLFPosesDirectPoseDataMimic14:
         except Exception as e:
             log_messages.append(traceback.format_exc())
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
-
-
 # ======================================================================
 # 1. PoseCalibrationV23 (Smart Calf Estimation + 2D Height Scaling + Compat Key)
 # ======================================================================
