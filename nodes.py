@@ -11269,6 +11269,245 @@ class PoseGlobalPerspectiveScalerV39:
         return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
 
 
+class PoseGlobalPerspectiveScalerV40:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_depth_map": ("IMAGE",),
+                "include_head": ("BOOLEAN", {"default": True}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "frontal_method": (["3D_NLF", "2D_Ratio"], {"default": "3D_NLF"}),
+                "frontal_2d_threshold": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 90.0, "step": 1.0}),
+                "scale_2d_axes": (["X and Y (Uniform)", "Only Y (Height)"], {"default": "X and Y (Uniform)"}),
+            },
+            "optional": {
+                "video_nlf_data": ("NLFPRED",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING", "NLFPRED", "STRING")
+    RETURN_NAMES = ("scaled_pose_data", "log_output", "nlf_data", "nlf_render_config")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V40: Kombiniert V28 (Scoring-System mit 3D NLF) und V38 (Pinhole Math & nlf_render_config)."
+
+    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method, frontal_2d_threshold, frontal_3d_angle_tolerance, scale_2d_axes, video_nlf_data=None):
+        import copy
+        import numpy as np
+        import math
+        import json
+
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        log_messages = ["=== V40 GLOBAL SCALER LOG (V28 Scoring + V38 Output) ==="]
+
+        if not pose_metas:
+            return (pose_data_copy, "Fehler: Keine Pose-Daten.", video_nlf_data, "{}")
+
+        # Kalibrierungsdaten extrahieren
+        slope = calibration_data.get("perspective_slope", 0.0)
+        intercept = calibration_data.get("perspective_intercept", 1.0)
+        is_inverted = calibration_data.get("is_depth_inverted", False)
+        use_pinhole_math = calibration_data.get("use_pinhole_math", True)
+        fx_calib = calibration_data.get("focal_length_fx", 500.0)
+        echte_groesse = calibration_data.get("echte_groesse", 0.0)
+        
+        depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
+        H, W = depth_np.shape[1], depth_np.shape[2]
+
+        def is_valid_point(kps, confs, idx):
+            if kps is None or idx >= len(kps): return False
+            pt = kps[idx]
+            if pt is None or len(pt) < 2: return False
+            c = float(confs[idx]) if (confs is not None and idx < len(confs)) else (float(pt[2]) if len(pt)>=3 else 1.0)
+            return c >= min_confidence
+
+        # --- SCHRITT 1: V28 SCORING SYSTEM (Mit 3D NLF Check) ---
+        log_messages.append("\n--- SUCHE NACH DEM BESTEN FRAME (V28 Punktesystem) ---")
+        frame_scores = []
+        frame_details = []
+        
+        pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0] if isinstance(video_nlf_data, dict) else video_nlf_data
+
+        for i, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            confs = getattr(meta, "kps_body_p", None)
+            
+            # Wichtige Punkte checken
+            has_ankles = is_valid_point(kps, confs, 10) or is_valid_point(kps, confs, 13)
+            has_knees = is_valid_point(kps, confs, 9) or is_valid_point(kps, confs, 12)
+            has_feet = any(is_valid_point(kps, confs, x) for x in [18, 19, 20, 21, 22, 23, 24])
+
+            # Länge berechnen
+            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            
+            top_y = min(valid_y) if valid_y else None
+            bottom_y = max(valid_y) if valid_y else None
+            if not include_head and valid_y:
+                if is_valid_point(kps, confs, 1):
+                    top_y = kps[1][1]
+            length = (bottom_y - top_y) if top_y is not None and bottom_y is not None else 0.0
+
+            # Frontalität prüfen (Mit NLF Toleranz)
+            is_frontal = False
+            frontal_pts = 0.0
+            
+            if frontal_method == "3D_NLF" and pose_input_3d is not None and i < len(pose_input_3d):
+                pose_3d = pose_input_3d[i][0] if len(pose_input_3d[i]) > 0 else []
+                if len(pose_3d) > 11:
+                    # Hüft-Winkel im 3D Raum
+                    dx = pose_3d[11][0] - pose_3d[8][0]
+                    dz = pose_3d[11][2] - pose_3d[8][2]
+                    angle = math.degrees(math.atan2(abs(dz), abs(dx)))
+                    if angle <= frontal_3d_angle_tolerance:
+                        is_frontal = True
+                        frontal_pts = max(0.0, (frontal_3d_angle_tolerance - angle) * 10.0)
+            elif frontal_method == "2D_Ratio":
+                if valid_y and valid_x:
+                    w = max(valid_x) - min(valid_x)
+                    ratio = w / length if length > 0 else 0.0
+                    if ratio >= frontal_2d_threshold:
+                        is_frontal = True
+                        frontal_pts = ratio * 100.0
+
+            data = {
+                'has_feet': has_feet,
+                'has_ankles': has_ankles,
+                'has_knees': has_knees,
+                'is_frontal': is_frontal,
+                'length': length,
+                'frontal_pts': frontal_pts
+            }
+            frame_details.append(data)
+
+        # Die von dir genannte originale V28 Punktevergabe
+        max_body_length = max([d['length'] for d in frame_details]) if frame_details else 1.0
+        if max_body_length == 0: max_body_length = 1.0
+
+        for i, data in enumerate(frame_details):
+            waden_pts = 1000.0 if (data['has_feet'] or data['has_ankles']) else 0.0
+            schenkel_pts = 500.0 if (waden_pts == 0 and data['has_knees']) else 0.0
+            bein_pts = max(waden_pts, schenkel_pts)
+            fuss_bonus_pts = 500.0 if (data['has_feet'] and data['is_frontal']) else 0.0
+            
+            total = bein_pts + fuss_bonus_pts + data['frontal_pts'] + ((data['length'] / max_body_length) * 100.0)
+            frame_scores.append(total)
+
+        if not frame_scores:
+            return (pose_data_copy, "Fehler: Konnte keine Scores berechnen.", video_nlf_data, "{}")
+
+        best_idx = int(np.argmax(frame_scores))
+        best_score = frame_scores[best_idx]
+        log_messages.append(f"-> Gewinner Frame: {best_idx} (V28 Score: {best_score:.1f})")
+
+        # --- SCHRITT 2: ANCHOR WINDOW UND DURCHSCHNITT BERECHNEN ---
+        start_idx = max(0, best_idx - anchor_window)
+        end_idx = min(len(pose_metas) - 1, best_idx + anchor_window)
+        
+        sum_norm = 0.0
+        sum_depth = 0.0
+        valid_frames_in_window = 0
+
+        for i in range(start_idx, end_idx + 1):
+            kps = getattr(pose_metas[i], "kps_body", [])
+            confs = getattr(pose_metas[i], "kps_body_p", None)
+            
+            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            
+            top_y = min(valid_y) if valid_y else None
+            bottom_y = max(valid_y) if valid_y else None
+            if not include_head and valid_y:
+                if is_valid_point(kps, confs, 1):
+                    top_y = kps[1][1]
+            
+            if top_y is not None and bottom_y is not None and bottom_y > top_y:
+                norm_val = bottom_y - top_y
+                
+                depth_vals = []
+                v_idx = min(i, depth_np.shape[0] - 1)
+                for px, py in zip(valid_x, valid_y):
+                    ix, iy = int(px), int(py)
+                    if 0 <= ix < W and 0 <= iy < H:
+                        depth_vals.append(depth_np[v_idx, iy, ix])
+                
+                frame_depth = float(np.mean(depth_vals)) if depth_vals else 0.5
+                if is_inverted:
+                    frame_depth = 1.0 / max(frame_depth, 0.0001)
+                
+                sum_norm += norm_val
+                sum_depth += frame_depth
+                valid_frames_in_window += 1
+
+        if valid_frames_in_window == 0:
+            return (pose_data_copy, "Fehler: Im Anchor-Window konnte keine Tiefe/Norm ermittelt werden.", video_nlf_data, "{}")
+
+        avg_anchor_norm = sum_norm / valid_frames_in_window
+        avg_anchor_depth = sum_depth / valid_frames_in_window
+
+        log_messages.append(f"\n--- SKALIERUNG RECHENVORGANG ---")
+        log_messages.append(f"Ist-Norm (Video): {avg_anchor_norm:.1f} px")
+        log_messages.append(f"Ist-Tiefe (Video): {avg_anchor_depth:.3f} m")
+
+        # --- SCHRITT 3: V38 BERECHNUNG & CONFIG-OUTPUT ---
+        if use_pinhole_math and echte_groesse > 0.0:
+            log_messages.append("\n--> PINHOLE SKALIERUNG AKTIV")
+            expected_norm = (echte_groesse * fx_calib) / avg_anchor_depth
+            log_messages.append(f"Soll-Norm = ({echte_groesse:.3f}m * {fx_calib:.2f}) / {avg_anchor_depth:.3f}m = {expected_norm:.1f} px")
+        else:
+            log_messages.append("\n--> LINEARE SKALIERUNG AKTIV (FALLBACK)")
+            expected_norm = (avg_anchor_depth * slope) + intercept
+            log_messages.append(f"Soll-Norm = ({avg_anchor_depth:.3f} * {slope:.2f}) + {intercept:.2f} = {expected_norm:.1f} px")
+
+        anchor_scale = expected_norm / avg_anchor_norm if avg_anchor_norm > 0 else 1.0
+        scale_x_factor = anchor_scale if scale_2d_axes == "X and Y (Uniform)" else 1.0
+        
+        log_messages.append(f"\nFaktor = Soll-Norm / Ist-Norm = {anchor_scale:.3f}x")
+
+        # Global Kamera Pivot finden (vom best_idx Frame)
+        global_pivot_x, global_pivot_y = 0.5, 0.5
+        if best_idx < len(pose_metas):
+            kps_best = getattr(pose_metas[best_idx], "kps_body", [])
+            c_best = getattr(pose_metas[best_idx], "kps_body_p", None)
+            val_y = [kps_best[idx][1] for idx in range(len(kps_best)) if is_valid_point(kps_best, c_best, idx)]
+            val_x = [kps_best[idx][0] for idx in range(len(kps_best)) if is_valid_point(kps_best, c_best, idx)]
+            if val_y and val_x:
+                global_pivot_x = np.mean(val_x)
+                global_pivot_y = max(val_y)  # Tiefster Punkt als Anker (meistens die Füße)
+
+        # 2D Posen updaten
+        for i, meta in enumerate(pose_metas):
+            for attr_name in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr_name, None)
+                if arr is not None and len(arr) > 0:
+                    for j in range(len(arr)):
+                        if len(arr[j]) >= 2 and arr[j][1] > 0:
+                            arr[j][0] = global_pivot_x + (arr[j][0] - global_pivot_x) * scale_x_factor
+                            arr[j][1] = global_pivot_y + (arr[j][1] - global_pivot_y) * anchor_scale
+
+        # NLF Config bauen (V38 Prinzip)
+        nlf_render_config = {
+            "anchor_scale": float(anchor_scale),
+            "scale_x_factor": float(scale_x_factor),
+            "pivot_x": float(global_pivot_x),
+            "pivot_y": float(global_pivot_y)
+        }
+        config_str = json.dumps(nlf_render_config)
+
+        log_messages.append("\n=== NLF 3D DATA DELEGATION LOG ===")
+        log_messages.append("Die echten NLF 3D-Daten bleiben UNVERÄNDERT.")
+        log_messages.append("Die Skalierungs- und Pivot-Werte wurden erfolgreich als 'nlf_render_config' an den Renderer gesendet.")
+
+        return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
+
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -11333,6 +11572,7 @@ NODE_CLASS_MAPPINGS = {
     "RenderNLFPosesDirectPoseDataMimic14": RenderNLFPosesDirectPoseDataMimic14,
     "PoseCalibrationV23": PoseCalibrationV23,
     "PoseGlobalPerspectiveScalerV39": PoseGlobalPerspectiveScalerV39,
+    "PoseGlobalPerspectiveScalerV40": PoseGlobalPerspectiveScalerV40,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -11398,7 +11638,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseCalibrationV23": "Pose Calibration V23",
     "PoseGlobalPerspectiveScalerV39": "Pose Global Perspective Scaler V39",
     "PoseCalibrationV15": "Pose Calibration V15",
-    "PoseGlobalPerspectiveScalerV28": "Pose Global Perspective Scaler V28"
+    "PoseGlobalPerspectiveScalerV28": "Pose Global Perspective Scaler V28",
+    "PoseGlobalPerspectiveScalerV40": "Global Perspective Scaler V40 (V28+V38 Best-of)",
 }
 
 
