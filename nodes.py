@@ -16732,7 +16732,122 @@ class RenderNLFPosesDirectPoseDataMimic11:
                                         ox = float(nlf_nx - dw_hx)
                                         oy = float(nlf_ny - dw_hy)
                                         
-                                        # Offset auf DW Head anwenden (0, 1
+                                        # Offset auf DW Head anwenden (0, 14, 15, 16, 17)
+                                        for h_idx in [0, 14, 15, 16, 17]:
+                                            h_idx_flat = int(np.array(person_subset).flatten()[h_idx])
+                                            if 0 <= h_idx_flat < len(candidate):
+                                                elem = candidate[h_idx_flat]
+                                                if isinstance(elem, np.ndarray):
+                                                    elem.flat[0] += ox
+                                                    elem.flat[1] += oy
+                                                elif isinstance(elem, list):
+                                                    if isinstance(elem[0], list):
+                                                        elem[0][0] += ox
+                                                        elem[0][1] += oy
+                                                    else:
+                                                        elem[0] += ox
+                                                        elem[1] += oy
+                                                
+                                        # Offset auf DW Face anwenden
+                                        if p < len(dw_faces):
+                                            face = dw_faces[p]
+                                            if isinstance(face, np.ndarray):
+                                                valid_mask = face[:, 0] > 0
+                                                face[valid_mask, 0] += ox
+                                                face[valid_mask, 1] += oy
+                                            
+                                    elif head_connection_mode == "Keep Head & Stretch Neck":
+                                        pts[0][0] = dw_hx * float(width)
+                                        pts[0][1] = dw_hy * float(height)
+                    # ---------------------------------------------------------------------
+
+                    # Knochen sammeln und zeichnen
+                    bones_to_draw = []
+                    for pts in all_pts_2d_with_z:
+                        for limb_idx, limb in enumerate(mimic_limb_seq):
+                            start_idx = limb[0]
+                            end_idx = limb[1]
+                            if pts[start_idx] is not None and pts[end_idx] is not None:
+                                pt1 = pts[start_idx]
+                                pt2 = pts[end_idx]
+                                avg_z = (pt1[2] + pt2[2]) / 2.0
+                                color = limb_colors_rgb[limb_idx % len(limb_colors_rgb)]
+                                bones_to_draw.append({
+                                    'pt1': (pt1[0], pt1[1]),
+                                    'pt2': (pt2[0], pt2[1]),
+                                    'z': avg_z,
+                                    'color': color
+                                })
+                    
+                    bones_to_draw.sort(key=lambda b: b['z'], reverse=True)
+
+                    for bone in bones_to_draw:
+                        x1, y1 = bone['pt1']
+                        x2, y2 = bone['pt2']
+                        color = bone['color']
+                        
+                        length = math.hypot(x1 - x2, y1 - y2)
+                        if length > 0.1:
+                            mX = (x1 + x2) / 2.0
+                            mY = (y1 + y2) / 2.0
+                            angle = math.degrees(math.atan2(y1 - y2, x1 - x2))
+                            polygon = cv2.ellipse2Poly(
+                                (int(mX), int(mY)), (int(length / 2), line_thickness), int(angle), 0, 360, 1
+                            )
+                            cv2.fillConvexPoly(frame_img, polygon, color, lineType=cv2.LINE_AA)
+
+                frame_img = (frame_img * 0.6).astype(np.uint8)
+
+                if pose_input[i] is not None:
+                    joints_to_draw = []
+                    for pts in all_pts_2d_with_z:
+                        for j_idx, pt in enumerate(pts):
+                            if pt is not None:
+                                color_rgba = joint_colors_rgb[j_idx % len(joint_colors_rgb)]
+                                joints_to_draw.append({
+                                    'pt': (pt[0], pt[1]),
+                                    'z': pt[2],
+                                    'color': color_rgba
+                                })
+                    
+                    joints_to_draw.sort(key=lambda j: j['z'], reverse=True)
+
+                    for joint in joints_to_draw:
+                        x, y = joint['pt']
+                        if 0 <= x < width and 0 <= y < height:
+                            cv2.circle(frame_img, (x, y), point_radius, joint['color'], thickness=-1, lineType=cv2.LINE_AA)
+                
+                alpha_channel = np.where(np.any(frame_img > 0, axis=-1), 255, 0).astype(np.uint8)
+                frame_rgba = np.dstack((frame_img, alpha_channel))
+                frames_np_rgba.append(frame_rgba)
+
+            if dw_pose_input is not None and draw_2d:
+                canvas_2d = draw_pose_to_canvas_np(dw_pose_input, pool=None, H=height, W=width, reshape_scale=0, show_feet_flag=False, show_body_flag=False, show_cheek_flag=True, dw_hand=True, show_face_flag=draw_face, show_hand_flag=draw_hands)
+                for i in range(len(frames_np_rgba)):
+                    frame_rgba = frames_np_rgba[i]
+                    canvas_img = canvas_2d[i]
+                    mask = canvas_img != 0
+                    frame_rgba[:, :, :3][mask] = canvas_img[mask]
+                    alpha_mask = np.any(canvas_img > 0, axis=-1)
+                    frame_rgba[:, :, 3][alpha_mask] = 255
+                    frames_np_rgba[i] = frame_rgba
+
+            frames_tensor = torch.from_numpy(np.stack(frames_np_rgba, axis=0)).contiguous() / 255.0
+            frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
+
+            if isinstance(scaled_nlf_poses, dict):
+                scaled_nlf_poses['joints3d_nonparam'] = [pose_input]
+            else:
+                scaled_nlf_poses = pose_input
+
+            node_mappings = json.dumps({"node_name": "RenderNLFPosesDirectPoseDataMimic10", "status": "success", "frames": len(pose_input)})
+
+            return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages), scaled_nlf_poses, node_mappings)
+
+        except Exception as e:
+            log_messages.append(traceback.format_exc())
+            return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
