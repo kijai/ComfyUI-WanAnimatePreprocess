@@ -11688,6 +11688,247 @@ class PoseGlobalPerspectiveScalerV38:
         return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
 
 
+
+class PoseCalibrationV24:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_nah_scaled": ("POSEDATA", {"tooltip": "Skalierte Pose für Pixel-Größe"}),
+                "pose_nah_unscaled": ("POSEDATA", {"tooltip": "Originale Pose als Maske für Depth-Map"}),
+                "depth_nah": ("IMAGE",),
+                "pose_fern_scaled": ("POSEDATA", {"tooltip": "Skalierte Pose für Pixel-Größe"}),
+                "pose_fern_unscaled": ("POSEDATA", {"tooltip": "Originale Pose als Maske für Depth-Map"}),
+                "depth_fern": ("IMAGE",),
+                "norm_method": (["Dynamic Full-Body", "Torso (Neck-Hip)"], {"default": "Dynamic Full-Body"}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "invert_depth": ("BOOLEAN", {"default": False}),
+                "use_pinhole_math": ("BOOLEAN", {"default": True}),
+                "normalize_bones_to_100": ("BOOLEAN", {"default": True, "tooltip": "Setzt Torso auf 100 und berechnet den Rest in Prozent (für V5 Retargeter)"}),
+            },
+            "optional": {
+                "intrinsics_json": ("STRING", {"forceInput": True, "tooltip": "Intrinsics JSON aus DA3"}),
+                "nlf_data_nah": ("NLFPRED",),
+                "nlf_data_fern": ("NLFPRED",),
+                "config_data": ("STRING", {"default": "{}"}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION", "STRING",)
+    RETURN_NAMES = ("calibration_data", "log_output",)
+    FUNCTION = "calibrate"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V24: Vereint V15 Pinhole Math + V22 True 3D Bones + V23 Scaler Bones."
+
+    def calibrate(self, pose_nah_scaled, pose_nah_unscaled, depth_nah, pose_fern_scaled, pose_fern_unscaled, depth_fern, norm_method, min_confidence, invert_depth, use_pinhole_math=True, normalize_bones_to_100=True, intrinsics_json=None, nlf_data_nah=None, nlf_data_fern=None, config_data="{}"):
+        import json
+        import math
+        import numpy as np
+
+        log_messages = ["=== V24 CALIBRATION LOG (V15 Pinhole + V22/23 Bones) ==="]
+
+        try:
+            config = json.loads(config_data)
+        except:
+            config = {}
+
+        def get_body_metrics(pose_s, pose_u, depth_map):
+            meta_s = pose_s.get("pose_metas", [])[0]
+            meta_u = pose_u.get("pose_metas", [])[0]
+            kps_s = getattr(meta_s, "kps_body", None)
+            confs_s = getattr(meta_s, "kps_body_p", None)
+            kps_u = getattr(meta_u, "kps_body", None)
+            confs_u = getattr(meta_u, "kps_body_p", None)
+            
+            depth_np = depth_map.cpu().numpy() if hasattr(depth_map, 'cpu') else depth_map
+            H, W = depth_np.shape[1], depth_np.shape[2]
+
+            def is_val(kps, confs, idx):
+                if kps is None or idx >= len(kps): return False
+                pt = kps[idx]
+                if pt is None or len(pt) < 2: return False
+                c = float(confs[idx]) if confs is not None and idx < len(confs) else 1.0
+                return c >= min_confidence
+
+            # Norm
+            norm = 100.0
+            if norm_method == "Torso (Neck-Hip)":
+                if is_val(kps_s, confs_s, 1) and is_val(kps_s, confs_s, 8) and is_val(kps_s, confs_s, 11):
+                    mid_x = (kps_s[8][0] + kps_s[11][0]) / 2.0
+                    mid_y = (kps_s[8][1] + kps_s[11][1]) / 2.0
+                    norm = math.sqrt((kps_s[1][0] - mid_x)**2 + (kps_s[1][1] - mid_y)**2)
+            else:
+                valid_y = [kps_s[i][1] for i in range(len(kps_s)) if is_val(kps_s, confs_s, i)]
+                valid_x = [kps_s[i][0] for i in range(len(kps_s)) if is_val(kps_s, confs_s, i)]
+                if valid_y and valid_x:
+                    norm = math.sqrt((max(valid_x) - min(valid_x))**2 + (max(valid_y) - min(valid_y))**2)
+
+            # Depth (from unscaled)
+            depth = 0.5
+            valid_u_x = [kps_u[idx][0] for idx in [1, 8, 11] if is_val(kps_u, confs_u, idx)]
+            valid_u_y = [kps_u[idx][1] for idx in [1, 8, 11] if is_val(kps_u, confs_u, idx)]
+            
+            if valid_u_x and valid_u_y:
+                min_x = int(max(0, min(valid_u_x) * W))
+                max_x = int(min(W-1, max(valid_u_x) * W))
+                min_y = int(max(0, min(valid_u_y) * H))
+                max_y = int(min(H-1, max(valid_u_y) * H))
+                if max_x > min_x and max_y > min_y:
+                    depth = float(np.mean(depth_np[0, min_y:max_y, min_x:max_x]))
+            
+            return {"norm": norm, "depth": depth}
+
+        data_nah = get_body_metrics(pose_nah_scaled, pose_nah_unscaled, depth_nah)
+        data_fern = get_body_metrics(pose_fern_scaled, pose_fern_unscaled, depth_fern)
+
+        norm_nah, norm_fern = data_nah['norm'], data_fern['norm']
+        depth_c, depth_f = data_nah['depth'], data_fern['depth']
+
+        if invert_depth:
+            depth_c = 1.0 / max(depth_c, 0.0001)
+            depth_f = 1.0 / max(depth_f, 0.0001)
+
+        slope, intercept = 0.0, 1.0
+        depth_diff = abs(depth_f - depth_c)
+        if depth_diff > 0.05:
+            slope = (norm_fern - norm_nah) / (depth_f - depth_c)
+            intercept = norm_nah - (slope * depth_c)
+        else:
+            slope = -500.0 if invert_depth else 500.0
+            intercept = norm_nah - (slope * depth_c)
+
+        # --- V15 PINHOLE DELTA RECHNUNG ---
+        fx = 500.0
+        if intrinsics_json:
+            try:
+                int_data = json.loads(intrinsics_json)
+                if "intrinsics" in int_data and len(int_data["intrinsics"]) > 0:
+                    matrix = int_data["intrinsics"][0].get("image_0", None)
+                    if matrix is not None:
+                        fx = float(matrix[0][0])
+                        log_messages.append(f"Brennweite (fx) aus DA3 geladen: {fx:.2f}")
+            except Exception as e:
+                log_messages.append(f"Warnung: Intrinsics JSON Fehler ({e}). Nutze Fallback fx={fx}.")
+
+        log_messages.append("\n--- PINHOLE DELTA RECHNUNG ---")
+        # Hier ist der V15 Fix: delta_z genau wie früher berechnen
+        delta_z = depth_f - depth_c
+        log_messages.append(f"Gemessene metrische Differenz (Delta Z): {delta_z:.3f}m")
+
+        echte_groesse = 0.0
+        if use_pinhole_math:
+            if delta_z > 0 and (norm_nah - norm_fern) > 0:
+                echte_groesse = (delta_z * norm_nah * norm_fern) / (fx * (norm_nah - norm_fern))
+                log_messages.append(f"Echte physikalische Größe berechnet: {echte_groesse:.3f}m")
+            else:
+                echte_groesse = (norm_nah * depth_c) / fx
+                log_messages.append(f"Warnung: Delta Z negativ oder Norm-Fehler. Fallback: {echte_groesse:.3f}m")
+
+        log_messages.append(f"\nFinale Norm Nah: {norm_nah:.1f} px | Tiefe: {depth_c:.4f}m")
+        log_messages.append(f"Finale Norm Fern: {norm_fern:.1f} px | Tiefe: {depth_f:.4f}m")
+
+        # --- V22/V23 2D BONES BERECHNUNG ---
+        log_messages.append("\n--- 2D BONE EXTRAKTION ---")
+
+        def extract_2d_bones(pose_data):
+            try:
+                meta = pose_data.get("pose_metas", [])[0]
+                kps = getattr(meta, "kps_body", None)
+                if kps is None or len(kps) < 14: return None, None
+
+                def dist_2d(idx1, idx2):
+                    if idx1 >= len(kps) or idx2 >= len(kps): return 0.0
+                    p1, p2 = kps[idx1], kps[idx2]
+                    if p1 is None or p2 is None or len(p1) < 2 or len(p2) < 2: return 0.0
+                    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+                mid_hip_x = (kps[8][0] + kps[11][0]) / 2.0
+                mid_hip_y = (kps[8][1] + kps[11][1]) / 2.0
+                torso_len = math.sqrt((kps[1][0] - mid_hip_x)**2 + (kps[1][1] - mid_hip_y)**2)
+                
+                if torso_len <= 0: return None, None
+
+                raw_bones = {
+                    "torso": torso_len,
+                    "shoulder_width": dist_2d(2, 5),
+                    "hip_width": dist_2d(8, 11),
+                    "r_arm": dist_2d(2, 3), "r_forearm": dist_2d(3, 4),
+                    "l_arm": dist_2d(5, 6), "l_forearm": dist_2d(6, 7),
+                    "r_thigh": dist_2d(8, 9), "r_calf": dist_2d(9, 10),
+                    "l_thigh": dist_2d(11, 12), "l_calf": dist_2d(12, 13)
+                }
+
+                # Symmetrie erzwingen (Aus V22)
+                sym_bones = {
+                    "torso": raw_bones["torso"],
+                    "shoulder_width": raw_bones["shoulder_width"],
+                    "hip_width": raw_bones["hip_width"],
+                    "r_arm": (raw_bones["r_arm"] + raw_bones["l_arm"]) / 2.0,
+                    "l_arm": (raw_bones["r_arm"] + raw_bones["l_arm"]) / 2.0,
+                    "r_forearm": (raw_bones["r_forearm"] + raw_bones["l_forearm"]) / 2.0,
+                    "l_forearm": (raw_bones["r_forearm"] + raw_bones["l_forearm"]) / 2.0,
+                    "r_thigh": (raw_bones["r_thigh"] + raw_bones["l_thigh"]) / 2.0,
+                    "l_thigh": (raw_bones["r_thigh"] + raw_bones["l_thigh"]) / 2.0,
+                    "r_calf": (raw_bones["r_calf"] + raw_bones["l_calf"]) / 2.0,
+                    "l_calf": (raw_bones["r_calf"] + raw_bones["l_calf"]) / 2.0
+                }
+
+                # Optional: Torso auf 100 setzen (Aus V22)
+                norm_bones = {}
+                if normalize_bones_to_100:
+                    for k, v in sym_bones.items():
+                        norm_bones[k] = (v / sym_bones["torso"]) * 100.0
+                else:
+                    norm_bones = sym_bones.copy()
+
+                # Gebe BEIDES zurück (Unskaliert für V23 Scaler, Normalisiert für V22 Retargeter)
+                return sym_bones, norm_bones
+            except Exception as e:
+                log_messages.append(f"Fehler bei Bone-Extraktion: {e}")
+                return None, None
+
+        # Priorisiere Fern-Bild für saubere Knochen (wie immer)
+        unscaled_bones, true_3d_bones = extract_2d_bones(pose_fern_scaled)
+        if not unscaled_bones:
+            unscaled_bones, true_3d_bones = extract_2d_bones(pose_nah_scaled)
+            log_messages.append("Nutze Nah-Bild für Bones (Fern fehlgeschlagen).")
+        else:
+            log_messages.append("2D-Proportionen aus Fern-Bild extrahiert.")
+
+        total_3d_height = 0.0
+        bone_length_for_scaler = {}
+        
+        if unscaled_bones:
+            # Das ist das V23 Feature, das dem Scaler gefehlt hat
+            bone_length_for_scaler = {
+                "torso": unscaled_bones["torso"],
+                "thigh": unscaled_bones["r_thigh"],
+                "calf": unscaled_bones["r_calf"]
+            }
+            log_messages.append(f"-> Unscaled Torso: {bone_length_for_scaler['torso']:.2f}")
+            log_messages.append(f"-> Unscaled Thigh: {bone_length_for_scaler['thigh']:.2f}")
+            log_messages.append(f"-> Unscaled Calf: {bone_length_for_scaler['calf']:.2f}")
+            
+            total_3d_height = unscaled_bones["torso"] + unscaled_bones["r_thigh"] + unscaled_bones["r_calf"] + config.get("head_allowance_3d", 150.0)
+
+        calib_data = {
+            "perspective_slope": slope,
+            "perspective_intercept": intercept,
+            "is_depth_inverted": invert_depth,
+            "norm_method": norm_method,
+            "use_pinhole_math": use_pinhole_math,
+            "focal_length_fx": fx,
+            "echte_groesse": echte_groesse,
+            "true_3d_bones": true_3d_bones or {},
+            "bone_length_for_scaler": bone_length_for_scaler or {},
+            "total_3d_height": total_3d_height,
+            "config": config
+        }
+
+        return (calib_data, "\n".join(log_messages))
+
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -11751,6 +11992,7 @@ NODE_CLASS_MAPPINGS = {
     "RenderNLFPosesDirectPoseDataMimic13": RenderNLFPosesDirectPoseDataMimic13,
     "RenderNLFPosesDirectPoseDataMimic14": RenderNLFPosesDirectPoseDataMimic14,
     "PoseCalibrationV23": PoseCalibrationV23,
+    "PoseCalibrationV24": PoseCalibrationV24,
     "PoseGlobalPerspectiveScalerV39": PoseGlobalPerspectiveScalerV39,
     "PoseGlobalPerspectiveScalerV40": PoseGlobalPerspectiveScalerV40,
 }
@@ -11816,6 +12058,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RenderNLFPosesDirectPoseDataMimic13": "Render NLF Poses Mimic 13 (Flat 3D)",
     "RenderNLFPosesDirectPoseDataMimic14": "Render NLF Poses Mimic 14 (Flat 3D PoseData)",
     "PoseCalibrationV23": "Pose Calibration V23",
+    "PoseCalibrationV24": "Pose Calibration V24",
     "PoseGlobalPerspectiveScalerV39": "Pose Global Perspective Scaler V39",
     "PoseCalibrationV15": "Pose Calibration V15",
     "PoseGlobalPerspectiveScalerV28": "Pose Global Perspective Scaler V28",
