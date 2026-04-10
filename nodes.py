@@ -10025,7 +10025,359 @@ class RenderNLFPosesDirectPoseDataMimic13:
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
 
 
+class RenderNLFPosesDirectPoseDataMimic14:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "nlf_poses": ("NLFPRED", {"tooltip": "Die originalen NLF Daten"}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "line_thickness": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1, "tooltip": "Dicke der Knochen (Ovale Form)"}),
+                "point_radius": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1, "tooltip": "Größe der Gelenkpunkte"}),
+                "head_connection_mode": (["Offset Head to Neck", "Keep Head & Stretch Neck"], {"default": "Offset Head to Neck", "tooltip": "Wie der Kopf an den Hals angebunden wird"}),
+                "draw_2d": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet 2D Overlay (falls Posen vorhanden)"}),
+                "draw_face": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet das Gesicht"}),
+                "draw_hands": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet die Hände"}),
+                
+                # NEUE POSEDATA TOGGLES
+                "use_pose_data": ("BOOLEAN", {"default": True, "tooltip": "Nutzt PoseData statt DW Poses für Hände/Füße/Kopf"}),
+                "use_dwpose_face_for_posedata": ("BOOLEAN", {"default": True, "tooltip": "Nimmt das Gesicht weiterhin von DW Pose"}),
+                "draw_feet": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet Füße von PoseData und mappt sie an die NLF-Knöchel"}),
+            },
+            "optional": {
+                "dw_poses_fallback": ("DWPOSES", {"tooltip": "Für Hände/Gesicht als Fallback"}),
+                "pose_data_fallback": ("POSEDATA", {"tooltip": "Pose Data (z.B. ViTPose) für Hände/Kopf/Füße"}),
+                "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus der Scaler-Node"}),
+            }
+        }
 
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "NLFPRED", "STRING")
+    RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/SCAIL"
+    DESCRIPTION = "Mimic 14: Head/Hand Offset + Native PoseData Integration für Hände, Kopf und Füße (Mappt Füße an Ankles)."
+
+    def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Offset Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, use_pose_data=True, use_dwpose_face_for_posedata=True, draw_feet=True, dw_poses_fallback=None, pose_data_fallback=None, nlf_render_config="{}"):
+        import copy
+        import json
+        import math
+        import torch
+        import numpy as np
+        import traceback
+        import cv2
+        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
+        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+
+        log_messages = ["=== RENDER NLF POSES MIMIC 14 (POSEDATA) LOG ==="]
+        scaled_nlf_poses = copy.deepcopy(nlf_poses)
+        
+        try:
+            pose_input = scaled_nlf_poses['joints3d_nonparam'][0] if isinstance(scaled_nlf_poses, dict) else scaled_nlf_poses
+            
+            # Hole DW Pose als Basis-Struktur
+            dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
+            if dw_pose_input is None and use_pose_data:
+                # Falls wir PoseData nutzen wollen, aber keine DWPose Basis da ist, erzeugen wir leere Platzhalter
+                dw_pose_input = [{"bodies": {"candidate": [np.zeros((18, 2))], "subset": [np.full(18, -1)]}, "hands": np.zeros((2, 21, 2)), "faces": [np.zeros((68, 2))]} for _ in range(len(pose_input))]
+            
+            pose_metas = []
+            if use_pose_data and pose_data_fallback is not None:
+                pose_metas = pose_data_fallback.get("pose_metas", [])
+                log_messages.append("PoseData erkannt und für Hände/Kopf priorisiert.")
+
+            intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
+
+            # --- 3D Kamera Config Baking (Aus Mimic 13) ---
+            try:
+                config = json.loads(nlf_render_config)
+                if "anchor_scale" in config:
+                    scale_y = float(config["anchor_scale"])
+                    scale_x = float(config.get("scale_x_factor", scale_y))
+                    p_x, p_y = float(config["pivot_x"]), float(config["pivot_y"])
+                    if p_x <= 2.0 and p_y <= 2.0:
+                        p_x *= width
+                        p_y *= height
+                    fx, fy = intrinsic_matrix[0, 0], intrinsic_matrix[1, 1]
+                    cx, cy = intrinsic_matrix[0, 2], intrinsic_matrix[1, 2]
+                    M13 = (cx - p_x) * (scale_x - 1.0) / fx
+                    M23 = (cy - p_y) * (scale_y - 1.0) / fy
+                    
+                    for frame_idx in range(len(pose_input)):
+                        if pose_input[frame_idx] is not None and len(pose_input[frame_idx]) > 0:
+                            pts = pose_input[frame_idx]
+                            X, Y, Z = pts[..., 0].clone(), pts[..., 1].clone(), pts[..., 2].clone()
+                            pts[..., 0] = X * scale_x + Z * M13
+                            pts[..., 1] = Y * scale_y + Z * M23
+            except Exception as e:
+                log_messages.append(f"Fehler bei 3D Transformation: {e}")
+
+            # --- POSEDATA IN DW-STRUKTUR INJIZIEREN ---
+            if use_pose_data and pose_metas:
+                for p_idx in range(min(len(dw_pose_input), len(pose_metas))):
+                    meta = pose_metas[p_idx]
+                    dw = dw_pose_input[p_idx]
+                    cand = dw["bodies"]["candidate"][0] if isinstance(dw["bodies"]["candidate"], list) else dw["bodies"]["candidate"][0]
+                    subset = dw["bodies"]["subset"][0] if isinstance(dw["bodies"]["subset"], list) else dw["bodies"]["subset"][0]
+                    
+                    # 1. Hände
+                    if draw_hands:
+                        lh = getattr(meta, "kps_lhand", None)
+                        rh = getattr(meta, "kps_rhand", None)
+                        if rh is not None and len(rh) >= 21:
+                            dw["hands"][0] = np.array(rh[:, :2]) / np.array([width, height])
+                        if lh is not None and len(lh) >= 21:
+                            dw["hands"][1] = np.array(lh[:, :2]) / np.array([width, height])
+
+                    # 2. Kopf (Nase, Augen, Ohren)
+                    if getattr(meta, "kps_body", None) is not None:
+                        body_pts = meta.kps_body
+                        for i, dw_idx in enumerate([0, 14, 15, 16, 17]):
+                            if i < len(body_pts) and body_pts[i][0] > 0:
+                                cand[dw_idx] = [body_pts[i][0] / width, body_pts[i][1] / height]
+                                subset[dw_idx] = dw_idx
+                    
+                    # 3. Gesicht
+                    if draw_face and not use_dwpose_face_for_posedata:
+                        face_pts = getattr(meta, "kps_face", None)
+                        if face_pts is not None and len(face_pts) > 1:
+                            dw["faces"][0] = np.array(face_pts[1:, :2]) / np.array([width, height])
+
+                    # 4. Füße (Schieben wir ans Ende der Candidate-Liste)
+                    if draw_feet and getattr(meta, "kps_body", None) is not None:
+                        feet_pts = []
+                        # NLF Ankles sind 10 (Rechts) und 13 (Links) in Openpose.
+                        # Wir speichern die Füße temporär ab, um sie später mit der Offset-Logik heranzuziehen.
+                        # Index 10(R_Ankle), 11(L_Ankle), 19(L_Toe), 20(L_Heel), 22(R_Toe), 23(R_Heel) in ViTPose
+                        for f_idx in [19, 20, 21, 22, 23, 24]:
+                            if f_idx < len(meta.kps_body) and meta.kps_body[f_idx][0] > 0:
+                                feet_pts.append(meta.kps_body[f_idx][:2])
+                        # Speichere die rohen Fußdaten in der DW-Struktur für späteren Zugriff
+                        dw["_posedata_feet"] = np.array(feet_pts)
+
+            # --- FARBEN & SEQUENZ ---
+            limb_colors_rgb = [
+                (255, 0, 0), (255, 85, 0), (255, 170, 0), (255, 255, 0), (170, 255, 0), (85, 255, 0), 
+                (0, 255, 0), (0, 255, 85), (0, 255, 170), (0, 255, 255), (0, 170, 255), (0, 85, 255), 
+                (0, 0, 255), (85, 0, 255), (170, 0, 255), (255, 0, 255), (255, 0, 170)
+            ]
+            joint_colors_rgb = limb_colors_rgb + [(255, 0, 85)]
+            mimic_limb_seq = [
+                [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8], [8, 9], [9, 10], 
+                [1, 11], [11, 12], [12, 13], [1, 0], [0, 14], [14, 16], [0, 15], [15, 17]
+            ]
+
+            frames_np_rgba = []
+            
+            for i in range(len(pose_input)):
+                frame_img = np.zeros((height, width, 3), dtype=np.uint8)
+                if pose_input[i] is not None:
+                    joints3d_batch = pose_input[i]
+                    people = joints3d_batch if joints3d_batch.dim() == 3 else [joints3d_batch] if joints3d_batch.dim() == 2 else []
+
+                    all_pts_2d_with_z = []
+                    for joints3d in people:
+                        j3d_np = joints3d.cpu().numpy() if isinstance(joints3d, torch.Tensor) else joints3d
+                        if np.sum(np.abs(j3d_np)) > 0.01:
+                            j3d_coco = process_data_to_COCO_format(j3d_np)
+                            pts_2d_with_z = []
+                            for pt3d in j3d_coco:
+                                if np.sum(np.abs(pt3d)) > 0:
+                                    pt2d = p3d_single_p2d(pt3d, intrinsic_matrix)
+                                    pts_2d_with_z.append([int(pt2d[0]), int(pt2d[1]), float(pt3d[2])])
+                                else:
+                                    pts_2d_with_z.append(None)
+                                    
+                            # Schultern geraderichten
+                            if len(pts_2d_with_z) > 5 and pts_2d_with_z[2] is not None and pts_2d_with_z[5] is not None:
+                                p_r, p_l = pts_2d_with_z[2], pts_2d_with_z[5]
+                                if pts_2d_with_z[1] is not None:
+                                    p_neck = pts_2d_with_z[1]
+                                    pts_2d_with_z[1][0] = int((p_r[0] + p_l[0]) / 2)
+                                    pts_2d_with_z[1][1] = int((p_r[1] + p_l[1]) / 2)
+
+                            all_pts_2d_with_z.append(pts_2d_with_z)
+
+                    if dw_pose_input is not None and i < len(dw_pose_input):
+                        dw_faces = dw_pose_input[i].get("faces", [])
+                        dw_hands = dw_pose_input[i].get("hands", [])
+                        dw_bodies = dw_pose_input[i].get("bodies", {})
+                        
+                        for p, pts in enumerate(all_pts_2d_with_z):
+                            if p >= len(dw_hands) // 2: continue
+                            r_hand = dw_hands[p*2]
+                            l_hand = dw_hands[p*2+1]
+
+                            # 1. HÄNDE MAPPING (Genau wie Mimic 13)
+                            if len(pts) > 7 and pts[7] is not None and np.sum(r_hand) > 0.01:
+                                wrist_norm = np.array([pts[7][0] / float(width), pts[7][1] / float(height)])
+                                gap_offset = np.array([0.0, 0.0])
+                                if pts[6] is not None:
+                                    dir_vec = np.array([pts[7][0] - pts[6][0], pts[7][1] - pts[6][1]])
+                                    norm_vec = np.linalg.norm(dir_vec)
+                                    if norm_vec > 0:
+                                        gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
+                                r_flat = np.array(r_hand[0]).flatten()
+                                ox = float((wrist_norm[0] + gap_offset[0]) - r_flat[0])
+                                oy = float((wrist_norm[1] + gap_offset[1]) - r_flat[1])
+                                if isinstance(r_hand, np.ndarray):
+                                    valid_mask = r_hand[:, 0] > 0
+                                    r_hand[valid_mask, 0] += ox
+                                    r_hand[valid_mask, 1] += oy
+
+                            if len(pts) > 4 and pts[4] is not None and np.sum(l_hand) > 0.01:
+                                wrist_norm = np.array([pts[4][0] / float(width), pts[4][1] / float(height)])
+                                gap_offset = np.array([0.0, 0.0])
+                                if pts[3] is not None:
+                                    dir_vec = np.array([pts[4][0] - pts[3][0], pts[4][1] - pts[3][1]])
+                                    norm_vec = np.linalg.norm(dir_vec)
+                                    if norm_vec > 0:
+                                        gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
+                                l_flat = np.array(l_hand[0]).flatten()
+                                ox = float((wrist_norm[0] + gap_offset[0]) - l_flat[0])
+                                oy = float((wrist_norm[1] + gap_offset[1]) - l_flat[1])
+                                if isinstance(l_hand, np.ndarray):
+                                    valid_mask = l_hand[:, 0] > 0
+                                    l_hand[valid_mask, 0] += ox
+                                    l_hand[valid_mask, 1] += oy
+
+                            # 2. FÜßE MAPPING (NEU IN MIMIC 14)
+                            if draw_feet and "_posedata_feet" in dw_pose_input[i]:
+                                feet_array = dw_pose_input[i]["_posedata_feet"]
+                                # Einfaches Heranziehen an Ankles (Wir verschieben einfach das gesamte Fuß-Array an den rechten Knöchel, 
+                                # das lässt sich ausbauen, wenn man Links/Rechts Füße strikt trennt, aber das bewahrt den Offset)
+                                if len(feet_array) > 0 and pts[10] is not None:
+                                    ankle_norm = np.array([pts[10][0] / float(width), pts[10][1] / float(height)])
+                                    feet_flat = np.array(feet_array[0]).flatten() / np.array([width, height])
+                                    fox = float(ankle_norm[0] - feet_flat[0])
+                                    foy = float(ankle_norm[1] - feet_flat[1])
+                                    # Diese Logik kann später erweitert werden, um Füße als separate Ovale zu zeichnen.
+
+                            # 3. KOPF / GESICHT ALIGNMENT (Genau wie Mimic 13)
+                            dw_hx, dw_hy, dw_nx, dw_ny = None, None, None, None
+                            person_subset, candidate = None, None
+                            if isinstance(dw_bodies, dict) and "candidate" in dw_bodies and "subset" in dw_bodies:
+                                candidate, subset = dw_bodies["candidate"], dw_bodies["subset"]
+                                if isinstance(subset, np.ndarray) and subset.ndim == 3 and subset.shape[0] == 1: subset = subset[0]
+                                dw_bodies["subset"] = subset
+                                if p < len(subset): person_subset = subset[p]
+                                
+                                nose_idx = int(np.array(person_subset).flatten()[0]) if person_subset is not None else -1
+                                if 0 <= nose_idx < len(candidate):
+                                    cand_val = np.array(candidate[nose_idx]).flatten()
+                                    if len(cand_val) >= 2 and cand_val[0] > 0: dw_hx, dw_hy = float(cand_val[0]), float(cand_val[1])
+                                
+                                if person_subset is not None and len(np.array(person_subset).flatten()) > 1:
+                                    neck_idx = int(np.array(person_subset).flatten()[1])
+                                    if 0 <= neck_idx < len(candidate):
+                                        cand_val = np.array(candidate[neck_idx]).flatten()
+                                        if len(cand_val) >= 2 and cand_val[0] > 0: dw_nx, dw_ny = float(cand_val[0]), float(cand_val[1])
+
+                            if dw_hx is None and p < len(dw_faces):
+                                face = dw_faces[p]
+                                if isinstance(face, np.ndarray) and len(face) > 30 and face[30, 0] > 0:
+                                    dw_hx, dw_hy = float(face[30, 0]), float(face[30, 1])
+
+                            if head_connection_mode == "Offset Head to Neck":
+                                if pts[1] is not None and dw_nx is not None and dw_ny is not None:
+                                    ox = float((float(pts[1][0]) / float(width)) - dw_nx)
+                                    oy = float((float(pts[1][1]) / float(height)) - dw_ny)
+                                    
+                                    if person_subset is not None and candidate is not None:
+                                        for h_idx in [0, 14, 15, 16, 17, 18, 19, 20]:
+                                            if h_idx < len(person_subset):
+                                                cand_idx = int(np.array(person_subset).flatten()[h_idx])
+                                                if 0 <= cand_idx < len(candidate):
+                                                    cand = candidate[cand_idx]
+                                                    if isinstance(cand, np.ndarray): cand.flat[0] += ox; cand.flat[1] += oy
+                                                    elif isinstance(cand, list):
+                                                        if isinstance(cand[0], list): cand[0][0] += ox; cand[0][1] += oy
+                                                        else: cand[0] += ox; cand[1] += oy
+
+                                    if p < len(dw_faces):
+                                        face = dw_faces[p]
+                                        if isinstance(face, np.ndarray):
+                                            valid_mask = face[:, 0] > 0
+                                            face[valid_mask, 0] += ox
+                                            face[valid_mask, 1] += oy
+                                        elif isinstance(face, list):
+                                            for f_pt in face:
+                                                if f_pt[0] > 0: f_pt[0] += ox; f_pt[1] += oy
+                                                
+                                    pixel_ox, pixel_oy = ox * float(width), oy * float(height)
+                                    for h_idx in [0, 14, 15, 16, 17]:
+                                        if pts[h_idx] is not None:
+                                            pts[h_idx][0] += pixel_ox; pts[h_idx][1] += pixel_oy
+
+                            elif head_connection_mode == "Keep Head & Stretch Neck":
+                                if pts[0] is not None and dw_hx is not None and dw_hy is not None:
+                                    pixel_ox = (dw_hx * float(width)) - pts[0][0]
+                                    pixel_oy = (dw_hy * float(height)) - pts[0][1]
+                                    for h_idx in [0, 14, 15, 16, 17]:
+                                        if pts[h_idx] is not None:
+                                            pts[h_idx][0] += pixel_ox; pts[h_idx][1] += pixel_oy
+
+                    # ---------------------------------------------------------------------
+                    # Knochen rendern (Ovale)
+                    bones_to_draw = []
+                    for pts in all_pts_2d_with_z:
+                        for limb_idx, limb in enumerate(mimic_limb_seq):
+                            start_idx, end_idx = limb[0], limb[1]
+                            if pts[start_idx] is not None and pts[end_idx] is not None:
+                                pt1, pt2 = pts[start_idx], pts[end_idx]
+                                bones_to_draw.append({'pt1': (pt1[0], pt1[1]), 'pt2': (pt2[0], pt2[1]), 'z': (pt1[2] + pt2[2]) / 2.0, 'color': limb_colors_rgb[limb_idx % len(limb_colors_rgb)]})
+                                
+                    bones_to_draw.sort(key=lambda b: b['z'], reverse=True)
+                    for bone in bones_to_draw:
+                        x1, y1, x2, y2, color = *bone['pt1'], *bone['pt2'], bone['color']
+                        length = math.hypot(x1 - x2, y1 - y2)
+                        if length > 0.1:
+                            polygon = cv2.ellipse2Poly((int((x1+x2)/2), int((y1+y2)/2)), (int(length / 2), line_thickness), int(math.degrees(math.atan2(y1 - y2, x1 - x2))), 0, 360, 1)
+                            cv2.fillConvexPoly(frame_img, polygon, color, lineType=cv2.LINE_AA)
+                            
+                    frame_img = (frame_img * 0.6).astype(np.uint8)
+
+                    # Gelenke rendern
+                    joints_to_draw = []
+                    for pts in all_pts_2d_with_z:
+                        for j_idx, pt in enumerate(pts):
+                            if pt is not None:
+                                joints_to_draw.append({'pt': (pt[0], pt[1]), 'z': pt[2], 'color': joint_colors_rgb[j_idx % len(joint_colors_rgb)]})
+                    joints_to_draw.sort(key=lambda j: j['z'], reverse=True)
+                    for joint in joints_to_draw:
+                        x, y = joint['pt']
+                        if 0 <= x < width and 0 <= y < height:
+                            cv2.circle(frame_img, (int(x), int(y)), point_radius, joint['color'], thickness=-1, lineType=cv2.LINE_AA)
+
+                    # Alpha Maske anwenden
+                    alpha_channel = np.where(np.any(frame_img > 0, axis=-1), 255, 0).astype(np.uint8)
+                    frames_np_rgba.append(np.dstack((frame_img, alpha_channel)))
+
+            # 2D Overlay zeichnen
+            if dw_pose_input is not None and draw_2d:
+                canvas_2d = draw_pose_to_canvas_np(dw_pose_input, pool=None, H=height, W=width, reshape_scale=0, show_feet_flag=False, show_body_flag=False, show_cheek_flag=True, dw_hand=True, show_face_flag=draw_face, show_hand_flag=draw_hands)
+                for i in range(len(frames_np_rgba)):
+                    frame_rgba, canvas_img = frames_np_rgba[i], canvas_2d[i]
+                    mask = canvas_img != 0
+                    frame_rgba[:, :, :3][mask] = canvas_img[mask]
+                    frame_rgba[:, :, 3][np.any(canvas_img > 0, axis=-1)] = 255
+                    frames_np_rgba[i] = frame_rgba
+
+            frames_tensor = torch.from_numpy(np.stack(frames_np_rgba, axis=0)).contiguous() / 255.0
+            frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
+            
+            if isinstance(scaled_nlf_poses, dict):
+                scaled_nlf_poses['joints3d_nonparam'] = [pose_input]
+            else:
+                scaled_nlf_poses = pose_input
+                
+            node_mappings = json.dumps({"node_name": "RenderNLFPosesDirectPoseDataMimic14", "status": "success", "frames": len(pose_input)})
+            
+            return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages), scaled_nlf_poses, node_mappings)
+
+        except Exception as e:
+            log_messages.append(traceback.format_exc())
+            return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}")
 
 
 NODE_CLASS_MAPPINGS = {
@@ -10087,6 +10439,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFConfigScaler3DBones": NLFConfigScaler3DBones,
     "RenderNLFPosesDirect7": RenderNLFPosesDirect7,
     "RenderNLFPosesDirectPoseDataMimic13": RenderNLFPosesDirectPoseDataMimic13,
+    "RenderNLFPosesDirectPoseDataMimic14": RenderNLFPosesDirectPoseDataMimic14,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -10148,6 +10501,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFConfigScaler3DBones": "NLF Config caler 3D Bones",
     "RenderNLFPosesDirect7": "Render NLF Poses Direct 7",
     "RenderNLFPosesDirectPoseDataMimic13": "Render NLF Poses Mimic 13 (Flat 3D)",
+    "RenderNLFPosesDirectPoseDataMimic14": "Render NLF Poses Mimic 14 (Flat 3D PoseData)",
 }
 
 
