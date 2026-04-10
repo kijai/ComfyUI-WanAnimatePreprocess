@@ -16530,7 +16530,7 @@ class RenderNLFPosesDirectPoseDataMimic11:
     RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Mimic 10: Head Offset exakt wie Hand Offset (Nase vom KOPF zu NLF Halsende)."
+    DESCRIPTION = "Mimic 10: Head Offset exakt wie Hand Offset (Crash-freie Float Logik)."
 
     def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Offset Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, dw_poses_fallback=None, nlf_render_config="{}"):
         import copy
@@ -16663,9 +16663,13 @@ class RenderNLFPosesDirectPoseDataMimic11:
                                         norm_vec = np.linalg.norm(dir_vec)
                                         if norm_vec > 0:
                                             gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
-                                    offset = (wrist_norm + gap_offset) - r_hand[0]
+                                    
+                                    # Rein als Float berechnen um Shape-Crashes zu vermeiden
+                                    ox = float((wrist_norm[0] + gap_offset[0]) - r_hand[0, 0])
+                                    oy = float((wrist_norm[1] + gap_offset[1]) - r_hand[0, 1])
                                     valid_mask = r_hand[:, 0] > 0
-                                    r_hand[valid_mask] += offset
+                                    r_hand[valid_mask, 0] += ox
+                                    r_hand[valid_mask, 1] += oy
 
                                 if len(pts) > 4 and pts[4] is not None and np.sum(l_hand) > 0.01:
                                     wrist_norm = np.array([pts[4][0] / float(width), pts[4][1] / float(height)])
@@ -16675,16 +16679,21 @@ class RenderNLFPosesDirectPoseDataMimic11:
                                         norm_vec = np.linalg.norm(dir_vec)
                                         if norm_vec > 0:
                                             gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
-                                    offset = (wrist_norm + gap_offset) - l_hand[0]
+                                            
+                                    ox = float((wrist_norm[0] + gap_offset[0]) - l_hand[0, 0])
+                                    oy = float((wrist_norm[1] + gap_offset[1]) - l_hand[0, 1])
                                     valid_mask = l_hand[:, 0] > 0
-                                    l_hand[valid_mask] += offset
+                                    l_hand[valid_mask, 0] += ox
+                                    l_hand[valid_mask, 1] += oy
 
                             # --- 2. KOPF / GESICHT ALIGNMENT ---
                             if pts[0] is not None:
-                                # Target: Das Ende vom Hals (NLF Punkt 0)
-                                nlf_neck_end = np.array([pts[0][0] / float(width), pts[0][1] / float(height)])
+                                # Target: Das Ende vom Hals (NLF Punkt 0) als Float
+                                nlf_nx = float(pts[0][0]) / float(width)
+                                nlf_ny = float(pts[0][1]) / float(height)
                                 
-                                dw_head_nose = None
+                                dw_hx = None
+                                dw_hy = None
                                 person_subset = None
                                 candidate = None
                                 
@@ -16696,31 +16705,34 @@ class RenderNLFPosesDirectPoseDataMimic11:
                                         person_subset = subset[p]
                                         nose_idx = int(person_subset[0])
                                         if 0 <= nose_idx < len(candidate):
-                                            dw_head_nose = np.array([candidate[nose_idx][0], candidate[nose_idx][1]])
+                                            dw_hx = float(candidate[nose_idx][0])
+                                            dw_hy = float(candidate[nose_idx][1])
                                             
-                                if dw_head_nose is not None:
+                                if dw_hx is not None and dw_hy is not None:
                                     if head_connection_mode == "Offset Head to Neck":
-                                        # Den simplen Offset berechnen (genau wie bei den Händen)
-                                        offset = nlf_neck_end - dw_head_nose
+                                        # Den simplen Offset berechnen (als nackte Floats!)
+                                        ox = nlf_nx - dw_hx
+                                        oy = nlf_ny - dw_hy
                                         
                                         # Offset auf ALLE Punkte vom Kopf anwenden (0, 14, 15, 16, 17)
                                         for h_idx in [0, 14, 15, 16, 17]:
-                                            cand_idx = int(person_subset[h_idx])
-                                            if 0 <= cand_idx < len(candidate):
-                                                candidate[cand_idx][0] += offset[0]
-                                                candidate[cand_idx][1] += offset[1]
+                                            if h_idx < len(person_subset):
+                                                cand_idx = int(person_subset[h_idx])
+                                                if 0 <= cand_idx < len(candidate):
+                                                    candidate[cand_idx][0] += ox
+                                                    candidate[cand_idx][1] += oy
                                                 
                                         # Genau den gleichen Offset auf ALLE Punkte vom Gesicht anwenden
                                         if p < len(dw_faces):
                                             face = dw_faces[p]
                                             valid_mask = face[:, 0] > 0
-                                            face[valid_mask, 0] += offset[0]
-                                            face[valid_mask, 1] += offset[1]
+                                            face[valid_mask, 0] += ox
+                                            face[valid_mask, 1] += oy
                                             
                                     elif head_connection_mode == "Keep Head & Stretch Neck":
                                         # Hier bleibt DW starr, NLF Hals streckt sich hoch zur DW Nase
-                                        pts[0][0] = dw_head_nose[0] * width
-                                        pts[0][1] = dw_head_nose[1] * height
+                                        pts[0][0] = dw_hx * float(width)
+                                        pts[0][1] = dw_hy * float(height)
                     # ---------------------------------------------------------------------
 
                     # Knochen sammeln und zeichnen
