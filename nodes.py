@@ -12025,6 +12025,17 @@ class PoseCalibrationV25:
             depth_c = 1.0 / max(depth_c, 0.0001)
             depth_f = 1.0 / max(depth_f, 0.0001)
 
+        # --- DER FEHLENDE BLOCK AUS V24 (JETZT WIEDER DA) ---
+        slope, intercept = 0.0, 1.0
+        depth_diff = abs(depth_f - depth_c)
+        if depth_diff > 0.05:
+            slope = (norm_fern - norm_nah) / (depth_f - depth_c)
+            intercept = norm_nah - (slope * depth_c)
+        else:
+            slope = -500.0 if invert_depth else 500.0
+            intercept = norm_nah - (slope * depth_c)
+        # ----------------------------------------------------
+
         fx = 500.0
         if intrinsics_json:
             try:
@@ -12059,7 +12070,7 @@ class PoseCalibrationV25:
                 mid_hip_y = (kps[8][1] + kps[11][1]) / 2.0
                 
                 raw_bones = {
-                    "head": dist_2d(0, 1), # Nase zu Hals
+                    "head": dist_2d(0, 1),
                     "torso": math.sqrt((kps[1][0] - mid_hip_x)**2 + (kps[1][1] - mid_hip_y)**2),
                     "shoulder_width": dist_2d(2, 5), "hip_width": dist_2d(8, 11),
                     "r_arm": dist_2d(2, 3), "r_forearm": dist_2d(3, 4),
@@ -12104,7 +12115,6 @@ class PoseCalibrationV25:
                 "calf": unscaled_bones["r_calf"]
             }
             
-            # Die Magie: Wir verteilen die echte_groesse (Meter) auf die Knochen
             total_px = sum(bone_length_for_scaler.values())
             if total_px > 0 and echte_groesse > 0:
                 log_messages.append("\n--- METRISCHE KNOCHEN VERTEILUNG ---")
@@ -12126,7 +12136,6 @@ class PoseCalibrationV25:
         }
 
         return (calib_data, "\n".join(log_messages))
-
 
 class PoseGlobalPerspectiveScalerV41:
     @classmethod
