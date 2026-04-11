@@ -12726,7 +12726,7 @@ class PoseGlobalPerspectiveScalerV43:
                 "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "frontal_method": (["3D_NLF", "2D_Ratio"], {"default": "3D_NLF"}),
                 "frontal_2d_threshold": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
-                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 90.0, "step": 1.0}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 90.0, "step": 1.0}),
                 "scale_2d_axes": (["X and Y (Uniform)", "Only Y (Height)"], {"default": "X and Y (Uniform)"}),
             },
             "optional": {
@@ -12738,7 +12738,7 @@ class PoseGlobalPerspectiveScalerV43:
     RETURN_NAMES = ("scaled_pose_data", "log_output", "nlf_data", "nlf_render_config")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V44: Doppelter NLF-Check (Hüfte + Schultern) für unfehlbaren Frontal-Filter."
+    DESCRIPTION = "V45: V28 Perfect 3D-Format-Detector + Skelett-Masken Tiefe + Dynamic Fullbody."
 
     def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method, frontal_2d_threshold, frontal_3d_angle_tolerance, scale_2d_axes, video_nlf_data=None):
         import copy
@@ -12748,7 +12748,7 @@ class PoseGlobalPerspectiveScalerV43:
 
         pose_data_copy = copy.deepcopy(video_pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
-        log_messages = ["=== V44 GLOBAL SCALER LOG (STRICT DOUBLE-ANGLE FILTER) ==="]
+        log_messages = ["=== V45 GLOBAL SCALER LOG (PERFECT FORMAT DETECTOR) ==="]
 
         if not pose_metas: 
             return (pose_data_copy, "Fehler: Keine Pose-Daten.", video_nlf_data, "{}")
@@ -12809,7 +12809,7 @@ class PoseGlobalPerspectiveScalerV43:
         frontal_indices = []
         pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0] if isinstance(video_nlf_data, dict) else video_nlf_data
 
-        log_messages.append("\n--- WINKEL-RADAR (3D NLF Check) ---")
+        log_messages.append("\n--- WINKEL-RADAR (3D NLF Format-Check wie in V28) ---")
 
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
@@ -12828,32 +12828,37 @@ class PoseGlobalPerspectiveScalerV43:
 
             is_frontal = False
             frontal_pts = 0.0
-            angle_h = 90.0
-            angle_s = 90.0
-            max_angle = 90.0
             
             if frontal_method == "3D_NLF" and pose_input_3d is not None and i < len(pose_input_3d):
-                pose_3d = pose_input_3d[i][0] if len(pose_input_3d[i]) > 0 else []
-                if len(pose_3d) > 11:
-                    # Hüfte (8 und 11)
-                    dx_h, dz_h = pose_3d[11][0] - pose_3d[8][0], pose_3d[11][2] - pose_3d[8][2]
-                    angle_h = math.degrees(math.atan2(abs(dz_h), abs(dx_h)))
+                pose_3d_frame = pose_input_3d[i]
+                if pose_3d_frame is not None and len(pose_3d_frame) > 0:
+                    person_3d = pose_3d_frame[0]
+                    num_joints = len(person_3d)
                     
-                    # Schultern (2 und 5)
-                    dx_s, dz_s = pose_3d[5][0] - pose_3d[2][0], pose_3d[5][2] - pose_3d[2][2]
-                    angle_s = math.degrees(math.atan2(abs(dz_s), abs(dx_s)))
+                    # === DIE PERFEKTE V28 LOGIK IST ZURÜCK ===
+                    idx_r, idx_l = 2, 5
+                    format_name = "OpenPose"
+                    if num_joints == 17:
+                        idx_r, idx_l = 11, 14
+                        format_name = "H36M"
+                    elif num_joints in [24, 45, 68]:
+                        idx_r, idx_l = 16, 17
+                        format_name = "SMPL"
+                        
+                    if num_joints > max(idx_r, idx_l):
+                        x_r, z_r = float(person_3d[idx_r][0]), float(person_3d[idx_r][2])
+                        x_l, z_l = float(person_3d[idx_l][0]), float(person_3d[idx_l][2])
+                        dx = x_r - x_l
+                        dz = z_r - z_l
+                        angle = math.degrees(math.atan2(abs(dz), abs(dx)))
+                        
+                        if angle <= frontal_3d_angle_tolerance:
+                            is_frontal = True
+                            frontal_pts = max(0.0, (frontal_3d_angle_tolerance - angle) * 10.0)
 
-                    # Der strengste Wert zählt!
-                    max_angle = max(angle_h, angle_s)
-                    
-                    if max_angle <= frontal_3d_angle_tolerance:
-                        is_frontal = True
-                        frontal_pts = max(0.0, (frontal_3d_angle_tolerance - max_angle) * 10.0)
-
-            # Wir protokollieren die ersten 5 Frames und alle, die als frontal gelten, um zu sehen, was passiert.
-            if i <= 5 or is_frontal:
-                status = "FRONTAL" if is_frontal else "SEITLICH"
-                log_messages.append(f"Frame {i}: Max-Winkel {max_angle:.1f}° (Hüfte: {angle_h:.1f}°, Schultern: {angle_s:.1f}°) -> {status}")
+                        if i <= 6 or is_frontal:
+                            status = "FRONTAL" if is_frontal else "SEITLICH"
+                            log_messages.append(f"Frame {i}: Winkel {angle:.1f}° ({format_name} Schultern) -> {status}")
 
             frame_data = {'has_feet': has_feet, 'has_ankles': has_ankles, 'has_knees': has_knees, 'is_frontal': is_frontal, 'length': length, 'frontal_pts': frontal_pts}
             all_frames_data.append(frame_data)
@@ -12866,7 +12871,7 @@ class PoseGlobalPerspectiveScalerV43:
             log_messages.append(f">> PASS-FILTER AKTIV: {len(frontal_indices)} echte frontale Frames gefunden! Alle anderen fliegen raus.")
             candidates = frontal_indices
         else:
-            log_messages.append(f">> PASS-FILTER INAKTIV: Kein einziger Frame hat Hüfte UND Schultern unter {frontal_3d_angle_tolerance}°. Nutze alle Frames als Fallback.")
+            log_messages.append(f">> PASS-FILTER INAKTIV: Kein einziger Frame ist unter {frontal_3d_angle_tolerance}°. Nutze alle Frames als Fallback.")
             candidates = list(range(len(pose_metas)))
 
         # --- STUFE 2: SCORING NUR FÜR KANDIDATEN ---
