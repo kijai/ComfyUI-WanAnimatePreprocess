@@ -12136,8 +12136,12 @@ class PoseGlobalPerspectiveScalerV41:
                 "video_pose_data": ("POSEDATA",),
                 "calibration_data": ("POSE_CALIBRATION",),
                 "video_depth_map": ("IMAGE",),
+                "include_head": ("BOOLEAN", {"default": True}),
                 "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1}),
                 "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "frontal_method": (["3D_NLF", "2D_Ratio"], {"default": "3D_NLF"}),
+                "frontal_2d_threshold": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 90.0, "step": 1.0}),
                 "scale_2d_axes": (["X and Y (Uniform)", "Only Y (Height)"], {"default": "X and Y (Uniform)"}),
             },
             "optional": {
@@ -12149,9 +12153,9 @@ class PoseGlobalPerspectiveScalerV41:
     RETURN_NAMES = ("scaled_pose_data", "log_output", "nlf_data", "nlf_render_config")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V41: DYNAMIC FULLBODY SCALER - Skaliert basierend auf aktuell sichtbaren Körperteilen."
+    DESCRIPTION = "V41: V40 Frontal-Scoring kombiniert mit Dynamic Fullbody Knochen-Skalierung."
 
-    def process(self, video_pose_data, calibration_data, video_depth_map, anchor_window, min_confidence, scale_2d_axes, video_nlf_data=None):
+    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method, frontal_2d_threshold, frontal_3d_angle_tolerance, scale_2d_axes, video_nlf_data=None):
         import copy
         import numpy as np
         import math
@@ -12159,9 +12163,10 @@ class PoseGlobalPerspectiveScalerV41:
 
         pose_data_copy = copy.deepcopy(video_pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
-        log_messages = ["=== V41 GLOBAL SCALER LOG (DYNAMIC FULLBODY) ==="]
+        log_messages = ["=== V41 GLOBAL SCALER LOG (V40 SCORING + DYNAMIC FULLBODY) ==="]
 
-        if not pose_metas: return (pose_data_copy, "Fehler: Keine Pose-Daten.", video_nlf_data, "{}")
+        if not pose_metas: 
+            return (pose_data_copy, "Fehler: Keine Pose-Daten.", video_nlf_data, "{}")
 
         use_pinhole_math = calibration_data.get("use_pinhole_math", True)
         fx_calib = calibration_data.get("focal_length_fx", 500.0)
@@ -12174,7 +12179,7 @@ class PoseGlobalPerspectiveScalerV41:
         depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
         H, W = depth_np.shape[1], depth_np.shape[2]
 
-        def is_val(kps, confs, idx):
+        def is_valid_point(kps, confs, idx):
             if kps is None or idx >= len(kps): return False
             pt = kps[idx]
             if pt is None or len(pt) < 2: return False
@@ -12184,24 +12189,74 @@ class PoseGlobalPerspectiveScalerV41:
         def dist_2d(kps, i1, i2):
             return math.sqrt((kps[i1][0] - kps[i2][0])**2 + (kps[i1][1] - kps[i2][1])**2)
 
-        # 1. Besten Frame suchen (V28 Punktesystem beibehalten)
+        # --- SCHRITT 1: V40/V28 SCORING SYSTEM WIEDERHERGESTELLT ---
+        log_messages.append("\n--- SUCHE NACH DEM BESTEN FRAME (V40 Punktesystem inkl. 3D NLF) ---")
         frame_scores = []
+        frame_details = []
+        
+        pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0] if isinstance(video_nlf_data, dict) else video_nlf_data
+
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
             confs = getattr(meta, "kps_body_p", None)
-            pts = 0.0
-            if is_val(kps, confs, 0) and is_val(kps, confs, 1): pts += 100  # Kopf
-            if is_val(kps, confs, 1) and is_val(kps, confs, 8): pts += 200  # Torso
-            if is_val(kps, confs, 8) and is_val(kps, confs, 9): pts += 300  # Oberschenkel
-            if is_val(kps, confs, 9) and is_val(kps, confs, 10): pts += 500 # Waden/Füße
-            frame_scores.append(pts)
+            
+            has_ankles = is_valid_point(kps, confs, 10) or is_valid_point(kps, confs, 13)
+            has_knees = is_valid_point(kps, confs, 9) or is_valid_point(kps, confs, 12)
+            has_feet = any(is_valid_point(kps, confs, x) for x in [18, 19, 20, 21, 22, 23, 24])
+
+            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_valid_point(kps, confs, idx)]
+            
+            top_y = min(valid_y) if valid_y else None
+            bottom_y = max(valid_y) if valid_y else None
+            if not include_head and valid_y:
+                if is_valid_point(kps, confs, 1):
+                    top_y = kps[1][1]
+            length = (bottom_y - top_y) if top_y is not None and bottom_y is not None else 0.0
+
+            is_frontal = False
+            frontal_pts = 0.0
+            
+            if frontal_method == "3D_NLF" and pose_input_3d is not None and i < len(pose_input_3d):
+                pose_3d = pose_input_3d[i][0] if len(pose_input_3d[i]) > 0 else []
+                if len(pose_3d) > 11:
+                    dx = pose_3d[11][0] - pose_3d[8][0]
+                    dz = pose_3d[11][2] - pose_3d[8][2]
+                    angle = math.degrees(math.atan2(abs(dz), abs(dx)))
+                    if angle <= frontal_3d_angle_tolerance:
+                        is_frontal = True
+                        frontal_pts = max(0.0, (frontal_3d_angle_tolerance - angle) * 10.0)
+            elif frontal_method == "2D_Ratio":
+                if valid_y and valid_x:
+                    w = max(valid_x) - min(valid_x)
+                    ratio = w / length if length > 0 else 0.0
+                    if ratio >= frontal_2d_threshold:
+                        is_frontal = True
+                        frontal_pts = ratio * 100.0
+
+            data = {
+                'has_feet': has_feet, 'has_ankles': has_ankles, 'has_knees': has_knees,
+                'is_frontal': is_frontal, 'length': length, 'frontal_pts': frontal_pts
+            }
+            frame_details.append(data)
+
+        max_body_length = max([d['length'] for d in frame_details]) if frame_details else 1.0
+        if max_body_length == 0: max_body_length = 1.0
+
+        for i, data in enumerate(frame_details):
+            waden_pts = 1000.0 if (data['has_feet'] or data['has_ankles']) else 0.0
+            schenkel_pts = 500.0 if (waden_pts == 0 and data['has_knees']) else 0.0
+            bein_pts = max(waden_pts, schenkel_pts)
+            fuss_bonus_pts = 500.0 if (data['has_feet'] and data['is_frontal']) else 0.0
+            total = bein_pts + fuss_bonus_pts + data['frontal_pts'] + ((data['length'] / max_body_length) * 100.0)
+            frame_scores.append(total)
 
         best_idx = int(np.argmax(frame_scores))
         start_idx = max(0, best_idx - anchor_window)
         end_idx = min(len(pose_metas) - 1, best_idx + anchor_window)
-        
-        log_messages.append(f"Bester Frame gefunden: {best_idx} (Suche im Fenster {start_idx}-{end_idx})")
+        log_messages.append(f"-> Gewinner Frame gefunden: {best_idx} (Score: {frame_scores[best_idx]:.1f})")
 
+        # --- SCHRITT 2: DYNAMIC FULLBODY RECHNUNG IM ANCHOR WINDOW ---
         sum_scale_factors = 0.0
         valid_frames = 0
 
@@ -12213,35 +12268,35 @@ class PoseGlobalPerspectiveScalerV41:
             frame_soll_m = 0.0
             visible_parts = []
 
-            # Dynamisch schauen, was im Video WIRKLICH zu sehen ist:
-            if is_val(kps, confs, 0) and is_val(kps, confs, 1):
+            # Kopf nur addieren, wenn include_head aktiv ist
+            if include_head and is_valid_point(kps, confs, 0) and is_valid_point(kps, confs, 1):
                 frame_ist_px += dist_2d(kps, 0, 1)
                 frame_soll_m += bone_m.get("head", 0)
                 visible_parts.append("Kopf")
                 
-            if is_val(kps, confs, 1) and is_val(kps, confs, 8) and is_val(kps, confs, 11):
+            if is_valid_point(kps, confs, 1) and is_valid_point(kps, confs, 8) and is_valid_point(kps, confs, 11):
                 mid_x, mid_y = (kps[8][0]+kps[11][0])/2, (kps[8][1]+kps[11][1])/2
                 frame_ist_px += math.sqrt((kps[1][0]-mid_x)**2 + (kps[1][1]-mid_y)**2)
                 frame_soll_m += bone_m.get("torso", 0)
                 visible_parts.append("Torso")
                 
-            if is_val(kps, confs, 8) and is_val(kps, confs, 9):
+            if is_valid_point(kps, confs, 8) and is_valid_point(kps, confs, 9):
                 frame_ist_px += dist_2d(kps, 8, 9)
                 frame_soll_m += bone_m.get("thigh", 0)
                 visible_parts.append("Oberschenkel")
                 
-            if is_val(kps, confs, 9) and is_val(kps, confs, 10):
+            if is_valid_point(kps, confs, 9) and is_valid_point(kps, confs, 10):
                 frame_ist_px += dist_2d(kps, 9, 10)
                 frame_soll_m += bone_m.get("calf", 0)
                 visible_parts.append("Wade")
 
             if frame_ist_px == 0 or frame_soll_m == 0: continue
 
-            # Tiefe auslesen (Ohne den V38 Bug, saubere Int-Koordinaten)
+            # Tiefe auslesen
             v_idx = min(i, depth_np.shape[0] - 1)
             depth_vals = []
             for idx in [1, 8, 11]:
-                if is_val(kps, confs, idx):
+                if is_valid_point(kps, confs, idx):
                     ix, iy = int(kps[idx][0]), int(kps[idx][1])
                     if 0 <= ix < W and 0 <= iy < H:
                         depth_vals.append(depth_np[v_idx, iy, ix])
@@ -12249,19 +12304,18 @@ class PoseGlobalPerspectiveScalerV41:
             frame_depth = float(np.mean(depth_vals)) if depth_vals else 0.5
             if is_inverted: frame_depth = 1.0 / max(frame_depth, 0.0001)
 
-            # Frame Pinhole Rechnung
             expected_px = (frame_soll_m * fx_calib) / frame_depth
             scale_factor = expected_px / frame_ist_px
             
             sum_scale_factors += scale_factor
             valid_frames += 1
             
-            log_messages.append(f"\nFrame {i} Analyse:")
-            log_messages.append(f"Sichtbar: {', '.join(visible_parts)}")
-            log_messages.append(f"Ist-Pixel (Addiert): {frame_ist_px:.1f} px")
-            log_messages.append(f"Ist-Meter (Addiert): {frame_soll_m:.3f} m")
-            log_messages.append(f"Tiefe: {frame_depth:.3f} m -> Soll-Pixel: {expected_px:.1f} px")
-            log_messages.append(f"Lokaler Faktor: {scale_factor:.3f}x")
+            log_messages.append(f"\n  Frame {i} Analyse:")
+            log_messages.append(f"    Sichtbar: {', '.join(visible_parts)}")
+            log_messages.append(f"    Ist-Pixel (Addiert): {frame_ist_px:.1f} px")
+            log_messages.append(f"    Ist-Meter (Addiert): {frame_soll_m:.3f} m")
+            log_messages.append(f"    Tiefe: {frame_depth:.3f} m -> Soll-Pixel: {expected_px:.1f} px")
+            log_messages.append(f"    Lokaler Faktor: {scale_factor:.3f}x")
 
         if valid_frames == 0:
             return (pose_data_copy, "Fehler: Keine validen Körperteile im Anchor-Window gefunden.", video_nlf_data, "{}")
@@ -12270,12 +12324,11 @@ class PoseGlobalPerspectiveScalerV41:
         log_messages.append(f"\n=== FINALES ERGEBNIS ===")
         log_messages.append(f"Gemittelter Skalierungsfaktor: {final_scale:.3f}x")
 
-        # Pivot finden
         global_pivot_x, global_pivot_y = 0.5, 0.5
         kps_b = getattr(pose_metas[best_idx], "kps_body", [])
         c_b = getattr(pose_metas[best_idx], "kps_body_p", None)
-        val_y = [kps_b[idx][1] for idx in range(len(kps_b)) if is_val(kps_b, c_b, idx)]
-        val_x = [kps_b[idx][0] for idx in range(len(kps_b)) if is_val(kps_b, c_b, idx)]
+        val_y = [kps_b[idx][1] for idx in range(len(kps_b)) if is_valid_point(kps_b, c_b, idx)]
+        val_x = [kps_b[idx][0] for idx in range(len(kps_b)) if is_valid_point(kps_b, c_b, idx)]
         if val_y and val_x:
             global_pivot_x, global_pivot_y = np.mean(val_x), max(val_y)
 
