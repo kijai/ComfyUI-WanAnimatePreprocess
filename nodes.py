@@ -12714,6 +12714,255 @@ class PoseCalibrationV29:
         return (calib_data, "\n".join(log_messages))
 
 
+class PoseGlobalPerspectiveScalerV43:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "video_depth_map": ("IMAGE",),
+                "include_head": ("BOOLEAN", {"default": True}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "frontal_method": (["3D_NLF", "2D_Ratio"], {"default": "3D_NLF"}),
+                "frontal_2d_threshold": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 90.0, "step": 1.0}),
+                "scale_2d_axes": (["X and Y (Uniform)", "Only Y (Height)"], {"default": "X and Y (Uniform)"}),
+            },
+            "optional": {
+                "video_nlf_data": ("NLFPRED",),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING", "NLFPRED", "STRING")
+    RETURN_NAMES = ("scaled_pose_data", "log_output", "nlf_data", "nlf_render_config")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V43: V28 Pass-Filter + Skelett-Masken Tiefe + Dynamic Fullbody Knochensumme."
+
+    def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method, frontal_2d_threshold, frontal_3d_angle_tolerance, scale_2d_axes, video_nlf_data=None):
+        import copy
+        import numpy as np
+        import math
+        import json
+
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        log_messages = ["=== V43 GLOBAL SCALER LOG (STRICT PASS-FILTER + SKELETON DEPTH) ==="]
+
+        if not pose_metas: 
+            return (pose_data_copy, "Fehler: Keine Pose-Daten.", video_nlf_data, "{}")
+
+        use_pinhole_math = calibration_data.get("use_pinhole_math", True)
+        fx_calib = calibration_data.get("focal_length_fx", 500.0)
+        bone_m = calibration_data.get("bone_lengths_in_meters", {})
+        is_inverted = calibration_data.get("is_depth_inverted", False)
+
+        if not bone_m:
+            return (pose_data_copy, "Fehler: Calibration Daten (bone_lengths_in_meters) fehlen.", video_nlf_data, "{}")
+
+        depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, 'cpu') else video_depth_map
+        H, W = depth_np.shape[1], depth_np.shape[2]
+
+        def is_val(kps, confs, idx):
+            if kps is None or idx >= len(kps): return False
+            pt = kps[idx]
+            if pt is None or len(pt) < 2: return False
+            c = float(confs[idx]) if (confs is not None and idx < len(confs)) else 1.0
+            return c >= min_confidence
+
+        def dist_2d(kps, i1, i2):
+            return math.sqrt((kps[i1][0] - kps[i2][0])**2 + (kps[i1][1] - kps[i2][1])**2)
+
+        # --- SKELETT-MASKE (TIEFENAUSLESUNG) ---
+        def get_skeleton_depth(kps, confs, depth_img, v_idx, W, H):
+            skeleton_connections = [
+                (0,1), (1,2), (2,3), (3,4), (1,5), (5,6), (6,7),
+                (1,8), (8,9), (9,10), (1,11), (11,12), (12,13), (8,11)
+            ]
+            depth_vals = []
+            for p1, p2 in skeleton_connections:
+                if is_val(kps, confs, p1) and is_val(kps, confs, p2):
+                    x1, y1 = int(kps[p1][0]), int(kps[p1][1])
+                    x2, y2 = int(kps[p2][0]), int(kps[p2][1])
+                    dist = max(abs(x2 - x1), abs(y2 - y1))
+                    if dist > 0:
+                        for step in range(dist + 1):
+                            t = step / dist
+                            px = int(x1 + t * (x2 - x1))
+                            py = int(y1 + t * (y2 - y1))
+                            if 0 <= px < W and 0 <= py < H:
+                                val = depth_img[v_idx, py, px]
+                                depth_vals.append(float(val[0] if isinstance(val, (np.ndarray, list)) else val))
+            if not depth_vals:
+                for idx in range(len(kps)):
+                    if is_val(kps, confs, idx):
+                        px, py = int(kps[idx][0]), int(kps[idx][1])
+                        if 0 <= px < W and 0 <= py < H:
+                            val = depth_img[v_idx, py, px]
+                            depth_vals.append(float(val[0] if isinstance(val, (np.ndarray, list)) else val))
+            if depth_vals: return float(np.mean(depth_vals))
+            return 0.5
+
+        # --- STUFE 1: ALLE FRAMES ANALYSIEREN UND FRONTALE FILTERN ---
+        all_frames_data = []
+        frontal_indices = []
+        pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0] if isinstance(video_nlf_data, dict) else video_nlf_data
+
+        for i, meta in enumerate(pose_metas):
+            kps = getattr(meta, "kps_body", [])
+            confs = getattr(meta, "kps_body_p", None)
+            
+            has_ankles = is_val(kps, confs, 10) or is_val(kps, confs, 13)
+            has_knees = is_val(kps, confs, 9) or is_val(kps, confs, 12)
+            has_feet = any(is_val(kps, confs, x) for x in [18, 19, 20, 21, 22, 23, 24])
+
+            valid_y = [kps[idx][1] for idx in range(len(kps)) if is_val(kps, confs, idx)]
+            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_val(kps, confs, idx)]
+            
+            top_y = min(valid_y) if valid_y else None
+            bottom_y = max(valid_y) if valid_y else None
+            if not include_head and valid_y:
+                if is_val(kps, confs, 1): top_y = kps[1][1]
+            length = (bottom_y - top_y) if top_y is not None and bottom_y is not None else 0.0
+
+            is_frontal = False
+            frontal_pts = 0.0
+            
+            if frontal_method == "3D_NLF" and pose_input_3d is not None and i < len(pose_input_3d):
+                pose_3d = pose_input_3d[i][0] if len(pose_input_3d[i]) > 0 else []
+                if len(pose_3d) > 11:
+                    dx, dz = pose_3d[11][0] - pose_3d[8][0], pose_3d[11][2] - pose_3d[8][2]
+                    angle = math.degrees(math.atan2(abs(dz), abs(dx)))
+                    if angle <= frontal_3d_angle_tolerance:
+                        is_frontal = True
+                        frontal_pts = max(0.0, (frontal_3d_angle_tolerance - angle) * 10.0)
+            elif frontal_method == "2D_Ratio":
+                if valid_y and valid_x:
+                    w = max(valid_x) - min(valid_x)
+                    ratio = w / length if length > 0 else 0.0
+                    if ratio >= frontal_2d_threshold:
+                        is_frontal = True
+                        frontal_pts = ratio * 100.0
+
+            frame_data = {'has_feet': has_feet, 'has_ankles': has_ankles, 'has_knees': has_knees, 'is_frontal': is_frontal, 'length': length, 'frontal_pts': frontal_pts}
+            all_frames_data.append(frame_data)
+            
+            if is_frontal:
+                frontal_indices.append(i)
+
+        log_messages.append("\n--- PASS-FILTER (DER TÜRSTEHER) ---")
+        if len(frontal_indices) > 0:
+            log_messages.append(f">> PASS-FILTER AKTIV: {len(frontal_indices)} frontale Frames gefunden! Seitliche Frames fliegen raus.")
+            candidates = frontal_indices
+        else:
+            log_messages.append(f">> PASS-FILTER INAKTIV: Kein einziger Frame innerhalb der Toleranz ({frontal_3d_angle_tolerance}°). Nutze alle Frames als Fallback.")
+            candidates = list(range(len(pose_metas)))
+
+        # --- STUFE 2: SCORING NUR FÜR KANDIDATEN ---
+        max_body_length = max([all_frames_data[idx]['length'] for idx in candidates]) if candidates else 1.0
+        if max_body_length == 0: max_body_length = 1.0
+
+        best_idx = candidates[0]
+        best_score = -1.0
+
+        for idx in candidates:
+            data = all_frames_data[idx]
+            waden_pts = 1000.0 if (data['has_feet'] or data['has_ankles']) else 0.0
+            schenkel_pts = 500.0 if (waden_pts == 0 and data['has_knees']) else 0.0
+            bein_pts = max(waden_pts, schenkel_pts)
+            fuss_bonus_pts = 500.0 if (data['has_feet'] and data['is_frontal']) else 0.0
+            
+            total_score = bein_pts + fuss_bonus_pts + data['frontal_pts'] + ((data['length'] / max_body_length) * 100.0)
+            if total_score > best_score:
+                best_score = total_score
+                best_idx = idx
+
+        log_messages.append(f"\n-> Gewinner Frame: {best_idx} (Score: {best_score:.1f})")
+
+        # --- STUFE 3: DYNAMIC FULLBODY RECHNUNG MIT SKELETT-MASKE ---
+        start_idx = max(0, best_idx - anchor_window)
+        end_idx = min(len(pose_metas) - 1, best_idx + anchor_window)
+        
+        sum_scale_factors = 0.0
+        valid_frames = 0
+
+        for i in range(start_idx, end_idx + 1):
+            kps = getattr(pose_metas[i], "kps_body", [])
+            confs = getattr(pose_metas[i], "kps_body_p", None)
+            
+            frame_ist_px, frame_soll_m = 0.0, 0.0
+            visible_parts = []
+
+            if include_head and is_val(kps, confs, 0) and is_val(kps, confs, 1):
+                frame_ist_px += dist_2d(kps, 0, 1); frame_soll_m += bone_m.get("head", 0)
+                visible_parts.append("Kopf")
+            if is_val(kps, confs, 1) and is_val(kps, confs, 8) and is_val(kps, confs, 11):
+                mid_x, mid_y = (kps[8][0]+kps[11][0])/2, (kps[8][1]+kps[11][1])/2
+                frame_ist_px += math.sqrt((kps[1][0]-mid_x)**2 + (kps[1][1]-mid_y)**2)
+                frame_soll_m += bone_m.get("torso", 0)
+                visible_parts.append("Torso")
+            if is_val(kps, confs, 8) and is_val(kps, confs, 9):
+                frame_ist_px += dist_2d(kps, 8, 9); frame_soll_m += bone_m.get("thigh", 0)
+                visible_parts.append("Oberschenkel")
+            if is_val(kps, confs, 9) and is_val(kps, confs, 10):
+                frame_ist_px += dist_2d(kps, 9, 10); frame_soll_m += bone_m.get("calf", 0)
+                visible_parts.append("Wade")
+
+            if frame_ist_px == 0 or frame_soll_m == 0: continue
+
+            # HIER WIRD DIE SKELETT MASKE ANGEWENDET
+            v_idx = min(i, depth_np.shape[0] - 1)
+            frame_depth = get_skeleton_depth(kps, confs, depth_np, v_idx, W, H)
+            if is_inverted: frame_depth = 1.0 / max(frame_depth, 0.0001)
+
+            expected_px = (frame_soll_m * fx_calib) / frame_depth
+            scale_factor = expected_px / frame_ist_px
+            sum_scale_factors += scale_factor
+            valid_frames += 1
+            
+            log_messages.append(f"\n  Frame {i} Analyse:")
+            log_messages.append(f"    Sichtbar: {', '.join(visible_parts)}")
+            log_messages.append(f"    Ist-Pixel (Knochensumme): {frame_ist_px:.1f} px")
+            log_messages.append(f"    Ist-Meter (Knochensumme): {frame_soll_m:.3f} m")
+            log_messages.append(f"    Skelett-Tiefe: {frame_depth:.3f} m -> Soll-Pixel: {expected_px:.1f} px")
+            log_messages.append(f"    Lokaler Faktor: {scale_factor:.3f}x")
+
+        if valid_frames == 0:
+            return (pose_data_copy, "Fehler: Keine validen Körperteile gefunden.", video_nlf_data, "{}")
+
+        final_scale = sum_scale_factors / valid_frames
+        log_messages.append(f"\n=== FINALES ERGEBNIS ===")
+        log_messages.append(f"Gemittelter Skalierungsfaktor: {final_scale:.3f}x")
+
+        global_pivot_x, global_pivot_y = 0.5, 0.5
+        kps_b = getattr(pose_metas[best_idx], "kps_body", [])
+        c_b = getattr(pose_metas[best_idx], "kps_body_p", None)
+        val_y = [kps_b[idx][1] for idx in range(len(kps_b)) if is_val(kps_b, c_b, idx)]
+        val_x = [kps_b[idx][0] for idx in range(len(kps_b)) if is_val(kps_b, c_b, idx)]
+        if val_y and val_x:
+            global_pivot_x, global_pivot_y = np.mean(val_x), max(val_y)
+
+        scale_x = final_scale if scale_2d_axes == "X and Y (Uniform)" else 1.0
+
+        for meta in pose_metas:
+            for attr in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr, None)
+                if arr is not None and len(arr) > 0:
+                    for j in range(len(arr)):
+                        if len(arr[j]) >= 2 and arr[j][1] > 0:
+                            arr[j][0] = global_pivot_x + (arr[j][0] - global_pivot_x) * scale_x
+                            arr[j][1] = global_pivot_y + (arr[j][1] - global_pivot_y) * final_scale
+
+        config_str = json.dumps({
+            "anchor_scale": float(final_scale), "scale_x_factor": float(scale_x),
+            "pivot_x": float(global_pivot_x), "pivot_y": float(global_pivot_y)
+        })
+
+        return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -12784,6 +13033,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV41": PoseGlobalPerspectiveScalerV41,
     "PoseCalibrationManipulator": PoseCalibrationManipulator,
     "PoseCalibrationV29": PoseCalibrationV29,
+    "PoseGlobalPerspectiveScalerV43": PoseGlobalPerspectiveScalerV43,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -12856,6 +13106,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV41": "Global Perspective Scaler V41 (V28+V38 Best-of)",
     "PoseCalibrationManipulator": "Pose Calibration Manipulator",
     "PoseCalibrationV29": "Pose Calibration V29",
+    "PoseGlobalPerspectiveScalerV43": "Pose Global Perspective Scaler V43",
     
 }
 
