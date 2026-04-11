@@ -11957,23 +11957,32 @@ class PoseCalibrationV25:
     RETURN_NAMES = ("calibration_data", "log_output",)
     FUNCTION = "calibrate"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V25: Berechnet Metrische Knochenlängen für den Dynamic Fullbody Scaler."
+    DESCRIPTION = "V26: V15 EXTRAPOLATION + Pinhole Math + Dynamic Bones."
 
     def calibrate(self, pose_nah_scaled, pose_nah_unscaled, depth_nah, pose_fern_scaled, pose_fern_unscaled, depth_fern, norm_method, min_confidence, invert_depth, use_pinhole_math=True, normalize_bones_to_100=True, intrinsics_json=None, nlf_data_nah=None, nlf_data_fern=None, config_data="{}"):
         import json
         import math
         import numpy as np
 
-        log_messages = ["=== V25 CALIBRATION LOG (DYNAMIC METRIC BONES) ==="]
+        log_messages = ["=== V26 CALIBRATION LOG (V15 EXTRAPOLATION + PINHOLE) ==="]
 
         try:
             config = json.loads(config_data)
         except:
             config = {}
 
+        def is_val(kps, confs, idx):
+            if kps is None or idx >= len(kps): return False
+            pt = kps[idx]
+            if pt is None or len(pt) < 2: return False
+            c = float(confs[idx]) if confs is not None and idx < len(confs) else 1.0
+            return c >= min_confidence
+
         def get_body_metrics(pose_s, pose_u, depth_map):
-            meta_s = pose_s.get("pose_metas", [])[0]
-            meta_u = pose_u.get("pose_metas", [])[0]
+            meta_s = pose_s.get("pose_metas", [])[0] if pose_s.get("pose_metas") else None
+            meta_u = pose_u.get("pose_metas", [])[0] if pose_u.get("pose_metas") else None
+            if not meta_s or not meta_u: return {"norm": 100.0, "depth": 0.5}
+
             kps_s = getattr(meta_s, "kps_body", None)
             confs_s = getattr(meta_s, "kps_body_p", None)
             kps_u = getattr(meta_u, "kps_body", None)
@@ -11981,13 +11990,6 @@ class PoseCalibrationV25:
             
             depth_np = depth_map.cpu().numpy() if hasattr(depth_map, 'cpu') else depth_map
             H, W = depth_np.shape[1], depth_np.shape[2]
-
-            def is_val(kps, confs, idx):
-                if kps is None or idx >= len(kps): return False
-                pt = kps[idx]
-                if pt is None or len(pt) < 2: return False
-                c = float(confs[idx]) if confs is not None and idx < len(confs) else 1.0
-                return c >= min_confidence
 
             norm = 100.0
             if norm_method == "Torso (Neck-Hip)":
@@ -12014,46 +12016,6 @@ class PoseCalibrationV25:
                     depth = float(np.mean(depth_np[0, min_y:max_y, min_x:max_x]))
             
             return {"norm": norm, "depth": depth}
-
-        data_nah = get_body_metrics(pose_nah_scaled, pose_nah_unscaled, depth_nah)
-        data_fern = get_body_metrics(pose_fern_scaled, pose_fern_unscaled, depth_fern)
-
-        norm_nah, norm_fern = data_nah['norm'], data_fern['norm']
-        depth_c, depth_f = data_nah['depth'], data_fern['depth']
-
-        if invert_depth:
-            depth_c = 1.0 / max(depth_c, 0.0001)
-            depth_f = 1.0 / max(depth_f, 0.0001)
-
-        # --- DER FEHLENDE BLOCK AUS V24 (JETZT WIEDER DA) ---
-        slope, intercept = 0.0, 1.0
-        depth_diff = abs(depth_f - depth_c)
-        if depth_diff > 0.05:
-            slope = (norm_fern - norm_nah) / (depth_f - depth_c)
-            intercept = norm_nah - (slope * depth_c)
-        else:
-            slope = -500.0 if invert_depth else 500.0
-            intercept = norm_nah - (slope * depth_c)
-        # ----------------------------------------------------
-
-        fx = 500.0
-        if intrinsics_json:
-            try:
-                int_data = json.loads(intrinsics_json)
-                if "intrinsics" in int_data and len(int_data["intrinsics"]) > 0:
-                    matrix = int_data["intrinsics"][0].get("image_0", None)
-                    if matrix is not None:
-                        fx = float(matrix[0][0])
-            except: pass
-
-        delta_z = depth_f - depth_c
-        echte_groesse = 0.0
-        if use_pinhole_math and delta_z > 0 and (norm_nah - norm_fern) > 0:
-            echte_groesse = (delta_z * norm_nah * norm_fern) / (fx * (norm_nah - norm_fern))
-        else:
-            echte_groesse = (norm_nah * depth_c) / fx
-
-        log_messages.append(f"Berechnete echte Größe: {echte_groesse:.3f}m")
 
         def extract_2d_bones(pose_data):
             try:
@@ -12101,18 +12063,88 @@ class PoseCalibrationV25:
                 return sym_bones, norm_bones
             except Exception as e: return None, None
 
-        unscaled_bones, true_3d_bones = extract_2d_bones(pose_fern_scaled)
-        if not unscaled_bones: unscaled_bones, true_3d_bones = extract_2d_bones(pose_nah_scaled)
+        log_messages.append(f"Methode: {norm_method}")
 
+        # 1. Rohdaten holen
+        data_nah = get_body_metrics(pose_nah_scaled, pose_nah_unscaled, depth_nah)
+        data_fern = get_body_metrics(pose_fern_scaled, pose_fern_unscaled, depth_fern)
+        norm_nah, norm_fern = data_nah['norm'], data_fern['norm']
+        depth_c, depth_f = data_nah['depth'], data_fern['depth']
+
+        if invert_depth:
+            depth_c = 1.0 / max(depth_c, 0.0001)
+            depth_f = 1.0 / max(depth_f, 0.0001)
+
+        # 2. Knochen extrahieren für Extrapolation
+        unscaled_bones_nah, _ = extract_2d_bones(pose_nah_scaled)
+        unscaled_bones_fern, true_3d_bones = extract_2d_bones(pose_fern_scaled)
+
+        # --- 3. EXTRAPOLATION RECHENVORGANG (DER FEHLENDE V15 BLOCK) ---
+        if unscaled_bones_nah and unscaled_bones_fern:
+            torso_nah = unscaled_bones_nah["torso"]
+            torso_fern = unscaled_bones_fern["torso"]
+            if torso_fern > 0:
+                torso_faktor = torso_nah / torso_fern
+                log_messages.append("\n--- EXTRAPOLATION RECHENVORGANG ---")
+                log_messages.append(f"Torso-Faktor = Torso Nah ({torso_nah:.1f}) / Torso Fern ({torso_fern:.1f}) = {torso_faktor:.3f}")
+                log_messages.append("'Fern' zeigt mehr vom Körper (Ganzkörper).")
+                
+                # Nah-Norm künstlich reparieren
+                extrapolated_nah = norm_fern * torso_faktor
+                log_messages.append(f"Extrapoliere 'Nah' = Max_Len_Fern ({norm_fern:.1f}) * Torso-Faktor ({torso_faktor:.3f}) = {extrapolated_nah:.1f} px")
+                norm_nah = extrapolated_nah
+        else:
+            if not unscaled_bones_fern: unscaled_bones_fern, true_3d_bones = unscaled_bones_nah, _
+
+        # 4. Slope und Intercept (Jetzt mit reparierter Norm!)
+        slope, intercept = 0.0, 1.0
+        depth_diff = abs(depth_f - depth_c)
+        if depth_diff > 0.05:
+            slope = (norm_fern - norm_nah) / (depth_f - depth_c)
+            intercept = norm_nah - (slope * depth_c)
+        else:
+            slope = -500.0 if invert_depth else 500.0
+            intercept = norm_nah - (slope * depth_c)
+
+        # 5. Brennweite laden
+        fx = 500.0
+        if intrinsics_json:
+            try:
+                int_data = json.loads(intrinsics_json)
+                if "intrinsics" in int_data and len(int_data["intrinsics"]) > 0:
+                    matrix = int_data["intrinsics"][0].get("image_0", None)
+                    if matrix is not None:
+                        fx = float(matrix[0][0])
+                        log_messages.append(f"\nBrennweite (fx) aus DA3 geladen: {fx:.2f}")
+            except: pass
+
+        # --- 6. PINHOLE DELTA RECHNUNG ---
+        delta_z = depth_f - depth_c
+        log_messages.append("\n--- PINHOLE DELTA RECHNUNG ---")
+        log_messages.append(f"Gemessene metrische Differenz (Delta Z): {delta_z:.3f}m")
+
+        echte_groesse = 0.0
+        if use_pinhole_math and delta_z > 0 and (norm_nah - norm_fern) > 0:
+            echte_groesse = (delta_z * norm_nah * norm_fern) / (fx * (norm_nah - norm_fern))
+            log_messages.append(f"Echte physikalische Größe berechnet: {echte_groesse:.3f}m")
+        else:
+            echte_groesse = (norm_nah * depth_c) / fx
+            log_messages.append(f"Warnung: Delta Z negativ. Fallback Größe: {echte_groesse:.3f}m")
+
+        log_messages.append(f"\n=== ERGEBNIS ===")
+        log_messages.append(f"Finale Norm Nah: {norm_nah:.1f} px | Tiefe Nah: {depth_c:.4f}m")
+        log_messages.append(f"Finale Norm Fern: {norm_fern:.1f} px | Tiefe Fern: {depth_f:.4f}m")
+
+        # 7. Knochen-Verteilung für den neuen V41 Scaler
         bone_length_for_scaler = {}
         bone_lengths_in_meters = {}
 
-        if unscaled_bones:
+        if unscaled_bones_fern:
             bone_length_for_scaler = {
-                "head": unscaled_bones["head"],
-                "torso": unscaled_bones["torso"],
-                "thigh": unscaled_bones["r_thigh"],
-                "calf": unscaled_bones["r_calf"]
+                "head": unscaled_bones_fern["head"],
+                "torso": unscaled_bones_fern["torso"],
+                "thigh": unscaled_bones_fern["r_thigh"],
+                "calf": unscaled_bones_fern["r_calf"]
             }
             
             total_px = sum(bone_length_for_scaler.values())
