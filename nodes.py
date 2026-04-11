@@ -12713,7 +12713,6 @@ class PoseCalibrationV29:
 
         return (calib_data, "\n".join(log_messages))
 
-
 class PoseGlobalPerspectiveScalerV43:
     @classmethod
     def INPUT_TYPES(cls):
@@ -12727,7 +12726,7 @@ class PoseGlobalPerspectiveScalerV43:
                 "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "frontal_method": (["3D_NLF", "2D_Ratio"], {"default": "3D_NLF"}),
                 "frontal_2d_threshold": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
-                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 90.0, "step": 1.0}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 90.0, "step": 1.0}),
                 "scale_2d_axes": (["X and Y (Uniform)", "Only Y (Height)"], {"default": "X and Y (Uniform)"}),
             },
             "optional": {
@@ -12739,7 +12738,7 @@ class PoseGlobalPerspectiveScalerV43:
     RETURN_NAMES = ("scaled_pose_data", "log_output", "nlf_data", "nlf_render_config")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V43: V28 Pass-Filter + Skelett-Masken Tiefe + Dynamic Fullbody Knochensumme."
+    DESCRIPTION = "V44: Doppelter NLF-Check (Hüfte + Schultern) für unfehlbaren Frontal-Filter."
 
     def process(self, video_pose_data, calibration_data, video_depth_map, include_head, anchor_window, min_confidence, frontal_method, frontal_2d_threshold, frontal_3d_angle_tolerance, scale_2d_axes, video_nlf_data=None):
         import copy
@@ -12749,7 +12748,7 @@ class PoseGlobalPerspectiveScalerV43:
 
         pose_data_copy = copy.deepcopy(video_pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
-        log_messages = ["=== V43 GLOBAL SCALER LOG (STRICT PASS-FILTER + SKELETON DEPTH) ==="]
+        log_messages = ["=== V44 GLOBAL SCALER LOG (STRICT DOUBLE-ANGLE FILTER) ==="]
 
         if not pose_metas: 
             return (pose_data_copy, "Fehler: Keine Pose-Daten.", video_nlf_data, "{}")
@@ -12775,7 +12774,7 @@ class PoseGlobalPerspectiveScalerV43:
         def dist_2d(kps, i1, i2):
             return math.sqrt((kps[i1][0] - kps[i2][0])**2 + (kps[i1][1] - kps[i2][1])**2)
 
-        # --- SKELETT-MASKE (TIEFENAUSLESUNG) ---
+        # --- SKELETT-MASKE ---
         def get_skeleton_depth(kps, confs, depth_img, v_idx, W, H):
             skeleton_connections = [
                 (0,1), (1,2), (2,3), (3,4), (1,5), (5,6), (6,7),
@@ -12810,6 +12809,8 @@ class PoseGlobalPerspectiveScalerV43:
         frontal_indices = []
         pose_input_3d = video_nlf_data.get('joints3d_nonparam', [video_nlf_data])[0] if isinstance(video_nlf_data, dict) else video_nlf_data
 
+        log_messages.append("\n--- WINKEL-RADAR (3D NLF Check) ---")
+
         for i, meta in enumerate(pose_metas):
             kps = getattr(meta, "kps_body", [])
             confs = getattr(meta, "kps_body_p", None)
@@ -12819,8 +12820,6 @@ class PoseGlobalPerspectiveScalerV43:
             has_feet = any(is_val(kps, confs, x) for x in [18, 19, 20, 21, 22, 23, 24])
 
             valid_y = [kps[idx][1] for idx in range(len(kps)) if is_val(kps, confs, idx)]
-            valid_x = [kps[idx][0] for idx in range(len(kps)) if is_val(kps, confs, idx)]
-            
             top_y = min(valid_y) if valid_y else None
             bottom_y = max(valid_y) if valid_y else None
             if not include_head and valid_y:
@@ -12829,22 +12828,32 @@ class PoseGlobalPerspectiveScalerV43:
 
             is_frontal = False
             frontal_pts = 0.0
+            angle_h = 90.0
+            angle_s = 90.0
+            max_angle = 90.0
             
             if frontal_method == "3D_NLF" and pose_input_3d is not None and i < len(pose_input_3d):
                 pose_3d = pose_input_3d[i][0] if len(pose_input_3d[i]) > 0 else []
                 if len(pose_3d) > 11:
-                    dx, dz = pose_3d[11][0] - pose_3d[8][0], pose_3d[11][2] - pose_3d[8][2]
-                    angle = math.degrees(math.atan2(abs(dz), abs(dx)))
-                    if angle <= frontal_3d_angle_tolerance:
+                    # Hüfte (8 und 11)
+                    dx_h, dz_h = pose_3d[11][0] - pose_3d[8][0], pose_3d[11][2] - pose_3d[8][2]
+                    angle_h = math.degrees(math.atan2(abs(dz_h), abs(dx_h)))
+                    
+                    # Schultern (2 und 5)
+                    dx_s, dz_s = pose_3d[5][0] - pose_3d[2][0], pose_3d[5][2] - pose_3d[2][2]
+                    angle_s = math.degrees(math.atan2(abs(dz_s), abs(dx_s)))
+
+                    # Der strengste Wert zählt!
+                    max_angle = max(angle_h, angle_s)
+                    
+                    if max_angle <= frontal_3d_angle_tolerance:
                         is_frontal = True
-                        frontal_pts = max(0.0, (frontal_3d_angle_tolerance - angle) * 10.0)
-            elif frontal_method == "2D_Ratio":
-                if valid_y and valid_x:
-                    w = max(valid_x) - min(valid_x)
-                    ratio = w / length if length > 0 else 0.0
-                    if ratio >= frontal_2d_threshold:
-                        is_frontal = True
-                        frontal_pts = ratio * 100.0
+                        frontal_pts = max(0.0, (frontal_3d_angle_tolerance - max_angle) * 10.0)
+
+            # Wir protokollieren die ersten 5 Frames und alle, die als frontal gelten, um zu sehen, was passiert.
+            if i <= 5 or is_frontal:
+                status = "FRONTAL" if is_frontal else "SEITLICH"
+                log_messages.append(f"Frame {i}: Max-Winkel {max_angle:.1f}° (Hüfte: {angle_h:.1f}°, Schultern: {angle_s:.1f}°) -> {status}")
 
             frame_data = {'has_feet': has_feet, 'has_ankles': has_ankles, 'has_knees': has_knees, 'is_frontal': is_frontal, 'length': length, 'frontal_pts': frontal_pts}
             all_frames_data.append(frame_data)
@@ -12854,10 +12863,10 @@ class PoseGlobalPerspectiveScalerV43:
 
         log_messages.append("\n--- PASS-FILTER (DER TÜRSTEHER) ---")
         if len(frontal_indices) > 0:
-            log_messages.append(f">> PASS-FILTER AKTIV: {len(frontal_indices)} frontale Frames gefunden! Seitliche Frames fliegen raus.")
+            log_messages.append(f">> PASS-FILTER AKTIV: {len(frontal_indices)} echte frontale Frames gefunden! Alle anderen fliegen raus.")
             candidates = frontal_indices
         else:
-            log_messages.append(f">> PASS-FILTER INAKTIV: Kein einziger Frame innerhalb der Toleranz ({frontal_3d_angle_tolerance}°). Nutze alle Frames als Fallback.")
+            log_messages.append(f">> PASS-FILTER INAKTIV: Kein einziger Frame hat Hüfte UND Schultern unter {frontal_3d_angle_tolerance}°. Nutze alle Frames als Fallback.")
             candidates = list(range(len(pose_metas)))
 
         # --- STUFE 2: SCORING NUR FÜR KANDIDATEN ---
@@ -12893,26 +12902,20 @@ class PoseGlobalPerspectiveScalerV43:
             confs = getattr(pose_metas[i], "kps_body_p", None)
             
             frame_ist_px, frame_soll_m = 0.0, 0.0
-            visible_parts = []
 
             if include_head and is_val(kps, confs, 0) and is_val(kps, confs, 1):
                 frame_ist_px += dist_2d(kps, 0, 1); frame_soll_m += bone_m.get("head", 0)
-                visible_parts.append("Kopf")
             if is_val(kps, confs, 1) and is_val(kps, confs, 8) and is_val(kps, confs, 11):
                 mid_x, mid_y = (kps[8][0]+kps[11][0])/2, (kps[8][1]+kps[11][1])/2
                 frame_ist_px += math.sqrt((kps[1][0]-mid_x)**2 + (kps[1][1]-mid_y)**2)
                 frame_soll_m += bone_m.get("torso", 0)
-                visible_parts.append("Torso")
             if is_val(kps, confs, 8) and is_val(kps, confs, 9):
                 frame_ist_px += dist_2d(kps, 8, 9); frame_soll_m += bone_m.get("thigh", 0)
-                visible_parts.append("Oberschenkel")
             if is_val(kps, confs, 9) and is_val(kps, confs, 10):
                 frame_ist_px += dist_2d(kps, 9, 10); frame_soll_m += bone_m.get("calf", 0)
-                visible_parts.append("Wade")
 
             if frame_ist_px == 0 or frame_soll_m == 0: continue
 
-            # HIER WIRD DIE SKELETT MASKE ANGEWENDET
             v_idx = min(i, depth_np.shape[0] - 1)
             frame_depth = get_skeleton_depth(kps, confs, depth_np, v_idx, W, H)
             if is_inverted: frame_depth = 1.0 / max(frame_depth, 0.0001)
@@ -12921,13 +12924,6 @@ class PoseGlobalPerspectiveScalerV43:
             scale_factor = expected_px / frame_ist_px
             sum_scale_factors += scale_factor
             valid_frames += 1
-            
-            log_messages.append(f"\n  Frame {i} Analyse:")
-            log_messages.append(f"    Sichtbar: {', '.join(visible_parts)}")
-            log_messages.append(f"    Ist-Pixel (Knochensumme): {frame_ist_px:.1f} px")
-            log_messages.append(f"    Ist-Meter (Knochensumme): {frame_soll_m:.3f} m")
-            log_messages.append(f"    Skelett-Tiefe: {frame_depth:.3f} m -> Soll-Pixel: {expected_px:.1f} px")
-            log_messages.append(f"    Lokaler Faktor: {scale_factor:.3f}x")
 
         if valid_frames == 0:
             return (pose_data_copy, "Fehler: Keine validen Körperteile gefunden.", video_nlf_data, "{}")
@@ -12961,7 +12957,6 @@ class PoseGlobalPerspectiveScalerV43:
         })
 
         return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
-
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
