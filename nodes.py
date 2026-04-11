@@ -11957,14 +11957,14 @@ class PoseCalibrationV25:
     RETURN_NAMES = ("calibration_data", "log_output",)
     FUNCTION = "calibrate"
     CATEGORY = "WanAnimatePreprocess/Ultimate"
-    DESCRIPTION = "V26: V15 EXTRAPOLATION + Pinhole Math + Dynamic Bones."
+    DESCRIPTION = "V28: Nutzt das exakte Unscaled-Skelett als Maske für perfekte Tiefe."
 
     def calibrate(self, pose_nah_scaled, pose_nah_unscaled, depth_nah, pose_fern_scaled, pose_fern_unscaled, depth_fern, norm_method, min_confidence, invert_depth, use_pinhole_math=True, normalize_bones_to_100=True, intrinsics_json=None, nlf_data_nah=None, nlf_data_fern=None, config_data="{}"):
         import json
         import math
         import numpy as np
 
-        log_messages = ["=== V26 CALIBRATION LOG (V15 EXTRAPOLATION + PINHOLE) ==="]
+        log_messages = ["=== V28 CALIBRATION LOG (SKELETON MASK DEPTH) ==="]
 
         try:
             config = json.loads(config_data)
@@ -11977,6 +11977,43 @@ class PoseCalibrationV25:
             if pt is None or len(pt) < 2: return False
             c = float(confs[idx]) if confs is not None and idx < len(confs) else 1.0
             return c >= min_confidence
+
+        # --- DIE NEUE SKELETT-MASKE ---
+        def get_skeleton_depth(kps, confs, depth_img, v_idx, W, H):
+            skeleton_connections = [
+                (0,1), (1,2), (2,3), (3,4), (1,5), (5,6), (6,7),
+                (1,8), (8,9), (9,10), (1,11), (11,12), (12,13), (8,11)
+            ]
+            depth_vals = []
+            
+            for p1, p2 in skeleton_connections:
+                if is_val(kps, confs, p1) and is_val(kps, confs, p2):
+                    x1, y1 = int(kps[p1][0]), int(kps[p1][1])
+                    x2, y2 = int(kps[p2][0]), int(kps[p2][1])
+                    
+                    # Berechne die Pixel auf der Linie zwischen den Gelenken
+                    dist = max(abs(x2 - x1), abs(y2 - y1))
+                    if dist > 0:
+                        for step in range(dist + 1):
+                            t = step / dist
+                            px = int(x1 + t * (x2 - x1))
+                            py = int(y1 + t * (y2 - y1))
+                            if 0 <= px < W and 0 <= py < H:
+                                val = depth_img[v_idx, py, px]
+                                depth_vals.append(float(val[0] if isinstance(val, (np.ndarray, list)) else val))
+            
+            # Falls gar keine Knochen gefunden wurden (Fallback auf Einzelpunkte)
+            if not depth_vals:
+                for idx in range(len(kps)):
+                    if is_val(kps, confs, idx):
+                        px, py = int(kps[idx][0]), int(kps[idx][1])
+                        if 0 <= px < W and 0 <= py < H:
+                            val = depth_img[v_idx, py, px]
+                            depth_vals.append(float(val[0] if isinstance(val, (np.ndarray, list)) else val))
+            
+            if depth_vals:
+                return float(np.mean(depth_vals))
+            return 0.5
 
         def get_body_metrics(pose_s, pose_u, depth_map):
             meta_s = pose_s.get("pose_metas", [])[0] if pose_s.get("pose_metas") else None
@@ -12003,17 +12040,8 @@ class PoseCalibrationV25:
                 if valid_y and valid_x:
                     norm = math.sqrt((max(valid_x) - min(valid_x))**2 + (max(valid_y) - min(valid_y))**2)
 
-            depth = 0.5
-            valid_u_x = [kps_u[idx][0] for idx in [1, 8, 11] if is_val(kps_u, confs_u, idx)]
-            valid_u_y = [kps_u[idx][1] for idx in [1, 8, 11] if is_val(kps_u, confs_u, idx)]
-            
-            if valid_u_x and valid_u_y:
-                min_x = int(max(0, min(valid_u_x) * W))
-                max_x = int(min(W-1, max(valid_u_x) * W))
-                min_y = int(max(0, min(valid_u_y) * H))
-                max_y = int(min(H-1, max(valid_u_y) * H))
-                if max_x > min_x and max_y > min_y:
-                    depth = float(np.mean(depth_np[0, min_y:max_y, min_x:max_x]))
+            # Benutze die UNSCALED Pose für die Skelett-Maske
+            depth = get_skeleton_depth(kps_u, confs_u, depth_np, 0, W, H)
             
             return {"norm": norm, "depth": depth}
 
@@ -12065,7 +12093,6 @@ class PoseCalibrationV25:
 
         log_messages.append(f"Methode: {norm_method}")
 
-        # 1. Rohdaten holen
         data_nah = get_body_metrics(pose_nah_scaled, pose_nah_unscaled, depth_nah)
         data_fern = get_body_metrics(pose_fern_scaled, pose_fern_unscaled, depth_fern)
         norm_nah, norm_fern = data_nah['norm'], data_fern['norm']
@@ -12075,28 +12102,19 @@ class PoseCalibrationV25:
             depth_c = 1.0 / max(depth_c, 0.0001)
             depth_f = 1.0 / max(depth_f, 0.0001)
 
-        # 2. Knochen extrahieren für Extrapolation
         unscaled_bones_nah, _ = extract_2d_bones(pose_nah_scaled)
         unscaled_bones_fern, true_3d_bones = extract_2d_bones(pose_fern_scaled)
 
-        # --- 3. EXTRAPOLATION RECHENVORGANG (DER FEHLENDE V15 BLOCK) ---
         if unscaled_bones_nah and unscaled_bones_fern:
             torso_nah = unscaled_bones_nah["torso"]
             torso_fern = unscaled_bones_fern["torso"]
             if torso_fern > 0:
                 torso_faktor = torso_nah / torso_fern
-                log_messages.append("\n--- EXTRAPOLATION RECHENVORGANG ---")
-                log_messages.append(f"Torso-Faktor = Torso Nah ({torso_nah:.1f}) / Torso Fern ({torso_fern:.1f}) = {torso_faktor:.3f}")
-                log_messages.append("'Fern' zeigt mehr vom Körper (Ganzkörper).")
-                
-                # Nah-Norm künstlich reparieren
                 extrapolated_nah = norm_fern * torso_faktor
-                log_messages.append(f"Extrapoliere 'Nah' = Max_Len_Fern ({norm_fern:.1f}) * Torso-Faktor ({torso_faktor:.3f}) = {extrapolated_nah:.1f} px")
                 norm_nah = extrapolated_nah
         else:
             if not unscaled_bones_fern: unscaled_bones_fern, true_3d_bones = unscaled_bones_nah, _
 
-        # 4. Slope und Intercept (Jetzt mit reparierter Norm!)
         slope, intercept = 0.0, 1.0
         depth_diff = abs(depth_f - depth_c)
         if depth_diff > 0.05:
@@ -12106,7 +12124,6 @@ class PoseCalibrationV25:
             slope = -500.0 if invert_depth else 500.0
             intercept = norm_nah - (slope * depth_c)
 
-        # 5. Brennweite laden
         fx = 500.0
         if intrinsics_json:
             try:
@@ -12118,9 +12135,10 @@ class PoseCalibrationV25:
                         log_messages.append(f"\nBrennweite (fx) aus DA3 geladen: {fx:.2f}")
             except: pass
 
-        # --- 6. PINHOLE DELTA RECHNUNG ---
         delta_z = depth_f - depth_c
         log_messages.append("\n--- PINHOLE DELTA RECHNUNG ---")
+        log_messages.append(f"Skelett-Masken Tiefe Nah: {depth_c:.4f}m")
+        log_messages.append(f"Skelett-Masken Tiefe Fern: {depth_f:.4f}m")
         log_messages.append(f"Gemessene metrische Differenz (Delta Z): {delta_z:.3f}m")
 
         echte_groesse = 0.0
@@ -12135,7 +12153,6 @@ class PoseCalibrationV25:
         log_messages.append(f"Finale Norm Nah: {norm_nah:.1f} px | Tiefe Nah: {depth_c:.4f}m")
         log_messages.append(f"Finale Norm Fern: {norm_fern:.1f} px | Tiefe Fern: {depth_f:.4f}m")
 
-        # 7. Knochen-Verteilung für den neuen V41 Scaler
         bone_length_for_scaler = {}
         bone_lengths_in_meters = {}
 
@@ -12146,14 +12163,10 @@ class PoseCalibrationV25:
                 "thigh": unscaled_bones_fern["r_thigh"],
                 "calf": unscaled_bones_fern["r_calf"]
             }
-            
             total_px = sum(bone_length_for_scaler.values())
             if total_px > 0 and echte_groesse > 0:
-                log_messages.append("\n--- METRISCHE KNOCHEN VERTEILUNG ---")
                 for k, px_val in bone_length_for_scaler.items():
-                    meter_val = (px_val / total_px) * echte_groesse
-                    bone_lengths_in_meters[k] = meter_val
-                    log_messages.append(f"{k.capitalize()}: {px_val:.1f} px  =>  {meter_val:.3f} m")
+                    bone_lengths_in_meters[k] = (px_val / total_px) * echte_groesse
 
         calib_data = {
             "perspective_slope": slope, "perspective_intercept": intercept,
