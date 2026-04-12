@@ -15636,7 +15636,7 @@ class NLFDataToMaskV4:
         return {
             "required": {
                 "nlf_data_for_mask": ("NLF_MASK_DATA", {"tooltip": "Der Output aus Mimic 14"}),
-                "stick_width": ("INT", {"default": 15, "min": 1, "max": 100, "tooltip": "Dicke der Körper-Knochen"}),
+                "stick_width": ("INT", {"default": 15, "min": 1, "max": 300, "tooltip": "Dicke der Körper-Knochen"}),
                 
                 # ENTTRIEGELTER SLIDER: Werte im 100er-Bereich nötig wegen Z-Tiefe in Millimetern!
                 "head_circle_scale": ("FLOAT", {"default": 150.0, "min": 1.0, "max": 3000.0, "step": 5.0, "tooltip": "3D-Radius (Zentrum: DW-Nase XY, Tiefe: NLF-Hals Z)"}),
