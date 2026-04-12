@@ -16099,11 +16099,14 @@ class NLFDataHandDebugV4:
         return {
             "required": {
                 "nlf_data": ("NLFPRED",),
+                # Der Radius der Kugel in die Breite/Tiefe
                 "min_hand_dist_cm": ("FLOAT", {"default": 15.0, "min": 0.0, "max": 1000.0, "step": 0.1}),
+                # 1.0 = Kugel. Höher = Oval (nach unten gestreckt für den Oberschenkel)
+                "oval_vertical_stretch": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.1}),
                 "smooth_entry": ("BOOLEAN", {"default": True}),
                 # Wann fängt die Pufferzone an? (Prozent vom Oberkörper)
                 "smooth_zone_body_pct": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 100.0, "step": 0.1}),
-                # NEU: Wie stark/steil ist die Abstoßungskraft in der Pufferzone?
+                # Wie steil/kurvig ist die Abstoßungskraft? (1.0 = linear, höher = weicherer/runderer Einstieg)
                 "smooth_strength": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
                 "move_elbows": ("BOOLEAN", {"default": True}),
                 "elbow_move_percent": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 100.0, "step": 1.0}),
@@ -16141,7 +16144,7 @@ class NLFDataHandDebugV4:
         
         return new_e, new_w
 
-    def apply_collision(self, nlf_data, min_hand_dist_cm, smooth_entry, 
+    def apply_collision(self, nlf_data, min_hand_dist_cm, oval_vertical_stretch, smooth_entry, 
                         smooth_zone_body_pct, smooth_strength, move_elbows, 
                         elbow_move_percent, keep_arm_length):
         
@@ -16160,7 +16163,10 @@ class NLFDataHandDebugV4:
         else:
             frames = new_data
             
-        HIP = 0
+        # Joint 1 (Linke Hüfte) und Joint 2 (Rechte Hüfte) als Zentren
+        PELVIS = 0
+        L_HIP = 1 
+        R_HIP = 2
         L_SHOULDER, L_ELBOW, L_WRIST, L_HAND = 16, 18, 20, 22
         R_SHOULDER, R_ELBOW, R_WRIST, R_HAND = 17, 19, 21, 23
         
@@ -16187,7 +16193,7 @@ class NLFDataHandDebugV4:
                     continue
                 
                 mid_shoulder = (joints[L_SHOULDER] + joints[R_SHOULDER]) / 2.0
-                torso_length = np.linalg.norm(mid_shoulder - joints[HIP])
+                torso_length = np.linalg.norm(mid_shoulder - joints[PELVIS])
                 if torso_length < 0.001:
                     continue
                 
@@ -16195,35 +16201,50 @@ class NLFDataHandDebugV4:
                 trigger_dist = min_dist_m + smooth_zone_m
                 
                 def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand):
-                    hip_pos = joints[HIP]
                     wrist_pos = joints[idx_wrist]
                     
-                    vec = wrist_pos - hip_pos
-                    dist = np.linalg.norm(vec)
+                    vec_L = wrist_pos - joints[L_HIP]
+                    vec_R = wrist_pos - joints[R_HIP]
+                    
+                    # 3D-Form manipulieren (Kugel vs. Oval)
+                    vec_L_scaled = vec_L.copy()
+                    vec_L_scaled[1] /= max(0.1, oval_vertical_stretch) 
+                    
+                    vec_R_scaled = vec_R.copy()
+                    vec_R_scaled[1] /= max(0.1, oval_vertical_stretch)
+                    
+                    dist_L = np.linalg.norm(vec_L_scaled)
+                    dist_R = np.linalg.norm(vec_R_scaled)
+                    
+                    if dist_L < dist_R:
+                        dist = dist_L
+                        vec_real = vec_L 
+                    else:
+                        dist = dist_R
+                        vec_real = vec_R
                     
                     if dist < trigger_dist and dist > 0.001:
-                        dir_vec = vec / dist
+                        dir_vec = vec_real / (np.linalg.norm(vec_real) + 1e-8)
                         
                         if dist < min_dist_m:
                             target_dist = min_dist_m
                         else:
-                            # NEUE MATHEMATIK: Präzise Interpolation mit Steilheit
-                            t = (dist - min_dist_m) / smooth_zone_m # 0 an der Wand, 1 am Rand
-                            
-                            # smooth_strength wölbt die Kurve. Je höher, desto früher wird stark weggedrückt
+                            # Die sanfte Smooth-Entry Kurve (abhängig von smooth_strength)
+                            t = (dist - min_dist_m) / smooth_zone_m
                             t_curved = t ** (1.0 / smooth_strength)
-                            
                             target_dist = min_dist_m + smooth_zone_m * t_curved
                             
-                        push_amount = target_dist - dist
+                        push_amount = target_dist - dist 
                         
                         if push_amount > 0:
-                            target_wrist = joints[idx_wrist] + dir_vec * push_amount
-                            target_hand = joints[idx_hand] + dir_vec * push_amount 
+                            actual_push = push_amount * oval_vertical_stretch 
+                            
+                            target_wrist = joints[idx_wrist] + dir_vec * actual_push
+                            target_hand = joints[idx_hand] + dir_vec * actual_push
                             
                             target_elbow = joints[idx_elbow].copy()
                             if move_elbows:
-                                target_elbow += dir_vec * push_amount * (elbow_move_percent / 100.0)
+                                target_elbow += dir_vec * actual_push * (elbow_move_percent / 100.0)
                                 
                             if keep_arm_length:
                                 new_e, new_w = self.solve_fabrik(joints[idx_shoulder], target_elbow, target_wrist, target_wrist)
