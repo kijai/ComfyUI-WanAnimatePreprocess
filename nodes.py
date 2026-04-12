@@ -16093,7 +16093,7 @@ class NLFDataHandDebugV3:
         return (new_data,)
 
 
-class NLFProportionalRetargeterV11:
+class NLFProportionalRetargeterV12:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -16108,7 +16108,7 @@ class NLFProportionalRetargeterV11:
     RETURN_NAMES = ("nlf_data_retargeted", "log_output")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Retargeting"
-    DESCRIPTION = "V12: ECHTER Height Lock. Torso & Kopf werden jetzt aktiv geschrumpft/skaliert!"
+    DESCRIPTION = "V12: Echter Post-Scale Height Lock. Proportionen bleiben erhalten, Größe wird geklammert!"
 
     def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance):
         import copy
@@ -16116,7 +16116,7 @@ class NLFProportionalRetargeterV11:
         import math
         import torch
 
-        log_messages = ["=== NLF PROPORTIONAL RETARGETER V12 (FULL HEIGHT LOCK & GROUND ANCHOR) ==="]
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V12 (POST-SCALE HEIGHT LOCK) ==="]
         
         true_3d_bones = calibration_data.get("true_3d_bones", {})
         if not true_3d_bones:
@@ -16137,8 +16137,7 @@ class NLFProportionalRetargeterV11:
         else:
             log_messages.append("Modus: ABSOLUT V20 (Absolute Werte).\n")
 
-        # --- STUFE 1: TÜRSTEHER (RADAR) ---
-        log_messages.append("--- WINKEL-RADAR (Alle Frames werden protokolliert) ---")
+        # --- STUFE 1: TÜRSTEHER (RADAR) BLEIBT UNVERÄNDERT ---
         all_frames_data = []
         frontal_indices = []
 
@@ -16169,29 +16168,21 @@ class NLFProportionalRetargeterV11:
             if len(pts) >= 18:
                 dx_h, dz_h = pts[2][0] - pts[1][0], pts[2][2] - pts[1][2]
                 angle_h = math.degrees(math.atan2(abs(dz_h), abs(dx_h)))
-
                 dx_s, dz_s = pts[17][0] - pts[16][0], pts[17][2] - pts[16][2]
                 angle_s = math.degrees(math.atan2(abs(dz_s), abs(dx_s)))
-
                 max_angle = max(angle_h, angle_s)
 
                 if max_angle <= frontal_3d_angle_tolerance:
                     is_frontal = True
                     frontal_pts = max(0.0, (frontal_3d_angle_tolerance - max_angle) * 10.0)
 
-            status = "FRONTAL (Akzeptiert)" if is_frontal else "SEITLICH (Abgelehnt)"
-            log_messages.append(f"Frame {i}: Max-Winkel {max_angle:.1f}° (Hüfte: {angle_h:.1f}°, Schultern: {angle_s:.1f}°) -> {status}")
-
             all_frames_data.append({'has_feet': has_feet, 'has_ankles': has_ankles, 'has_knees': has_knees, 'is_frontal': is_frontal, 'length': length, 'frontal_pts': frontal_pts})
             if is_frontal: frontal_indices.append(i)
 
-        log_messages.append("\n--- PASS-FILTER (DER TÜRSTEHER) ---")
-        if len(frontal_indices) > 0:
-            candidates = frontal_indices
-        else:
-            candidates = list(range(len(raw_poses)))
+        if len(frontal_indices) > 0: candidates = frontal_indices
+        else: candidates = list(range(len(raw_poses)))
 
-        # --- STUFE 2: GEWINNER ERMITTELN ---
+        # --- STUFE 2: GEWINNER ERMITTELN (Nur für Referenzlänge) ---
         max_body_length = max([all_frames_data[idx]['length'] for idx in candidates]) if candidates else 1.0
         if max_body_length == 0: max_body_length = 1.0
 
@@ -16201,51 +16192,26 @@ class NLFProportionalRetargeterV11:
             waden_pts = 1000.0 if (data['has_feet'] or data['has_ankles']) else 0.0
             schenkel_pts = 500.0 if (waden_pts == 0 and data['has_knees']) else 0.0
             total_score = max(waden_pts, schenkel_pts) + (500.0 if (data['has_feet'] and data['is_frontal']) else 0.0) + data['frontal_pts'] + ((data['length'] / max_body_length) * 100.0)
-            if total_score > best_score:
-                best_score, best_idx = total_score, idx
+            if total_score > best_score: best_score, best_idx = total_score, idx
 
-        log_messages.append(f"\n-> Gewinner Frame für Basis-Torso: {best_idx} (Score: {best_score:.1f})")
+        log_messages.append(f"-> Gewinner Frame für Basis-Torso: {best_idx}")
 
-        # --- DIE MAGIE: ABSOLUTE HEIGHT LOCK (Verhindert das Wachsen) ---
+        # Referenz-Torso berechnen (wird für Normalisierung gebraucht)
         ref_frame_data = raw_poses[best_idx]
         is_t = isinstance(ref_frame_data, torch.Tensor)
         ref_pts = ref_frame_data[0].cpu().numpy() if is_t and ref_frame_data.dim() == 3 else (ref_frame_data.cpu().numpy() if is_t else (np.array(ref_frame_data)[0] if np.array(ref_frame_data).ndim == 3 else np.array(ref_frame_data)))
 
-        # 1. Originale vertikale Knochenlängen messen
         orig_torso = np.linalg.norm(ref_pts[12] - ref_pts[0]) if np.linalg.norm(ref_pts[12]) > 1e-5 else 0.0
-        orig_thigh = np.linalg.norm(ref_pts[5] - ref_pts[2]) if np.linalg.norm(ref_pts[5]) > 1e-5 else 0.0
-        orig_calf = np.linalg.norm(ref_pts[8] - ref_pts[5]) if np.linalg.norm(ref_pts[8]) > 1e-5 else 0.0
         head_val = true_3d_bones.get("head", 0.0)
-        
-        if is_normalized: missing_neck = orig_torso * (head_val / 100.0) / 2.0
-        else: missing_neck = head_val / 2.0
-            
+        missing_neck = orig_torso * (head_val / 100.0) / 2.0 if is_normalized else head_val / 2.0
         reference_torso_length = orig_torso + missing_neck
-        orig_vertical_sum = missing_neck + orig_torso + orig_thigh + orig_calf
 
-        # 2. Berechnen, was die Config "bauen" will
-        target_torso = (true_3d_bones.get("torso", 100.0) / 100.0) * reference_torso_length if is_normalized else true_3d_bones.get("torso", orig_torso)
-        target_thigh = (true_3d_bones.get("r_thigh", 0.0) / 100.0) * reference_torso_length if is_normalized else true_3d_bones.get("r_thigh", orig_thigh)
-        target_calf = (true_3d_bones.get("r_calf", 0.0) / 100.0) * reference_torso_length if is_normalized else true_3d_bones.get("r_calf", orig_calf)
-        target_head = (true_3d_bones.get("head", 0.0) / 100.0) * reference_torso_length / 2.0 if is_normalized else true_3d_bones.get("head", 0.0) / 2.0
-        
-        wanted_vertical_sum = target_head + target_torso + target_thigh + target_calf
-
-        # 3. Den Skalierungsfaktor für die Gesamthöhe berechnen
-        height_lock_factor = 1.0
-        if wanted_vertical_sum > 1e-5:
-            height_lock_factor = orig_vertical_sum / wanted_vertical_sum
-
-        log_messages.append("\n--- ABSOLUTE HEIGHT LOCK (Größen-Erhaltung) ---")
-        log_messages.append(f"Originale vertikale Länge (Hals+Torso+Beine): {orig_vertical_sum:.4f}")
-        log_messages.append(f"Gewünschte vertikale Länge laut Config:     {wanted_vertical_sum:.4f}")
-        log_messages.append(f"-> Height Lock Faktor angewandt:            {height_lock_factor:.4f}x (Korrigiert alle Knochen!)")
 
         # --- STUFE 3: SMPL 3D KINEMATISCHER BAUM RETARGETING ---
         tree = {
             0: [1, 2, 3],
-            1: [4], 4: [7], 7: [10],           
-            2: [5], 5: [8], 8: [11],           
+            1: [4], 4: [7], 7: [10],            
+            2: [5], 5: [8], 8: [11],            
             3: [6], 6: [9], 9: [12, 13, 14],   
             12: [15],                          
             13: [16], 16: [18], 18: [20], 20: [22], 
@@ -16260,7 +16226,6 @@ class NLFProportionalRetargeterV11:
                     desc.extend(get_all_descendants(child, tree_map))
             return desc
 
-        detailed_log_done = False
         frames_processed = 0
 
         for frame_idx in range(len(raw_poses)):
@@ -16271,58 +16236,45 @@ class NLFProportionalRetargeterV11:
             pts = frame_data[0].cpu().numpy().copy() if is_tensor and frame_data.dim() == 3 else (frame_data.cpu().numpy().copy() if is_tensor else (np.array(frame_data)[0].copy() if np.array(frame_data).ndim == 3 else np.array(frame_data).copy()))
             pts_new = pts.copy()
 
+            # --- A: VORHER-MESSUNG DER Y-HÖHE ---
+            valid_orig_y = [p[1] for p in pts if np.linalg.norm(p) > 1e-5]
+            orig_height = (max(valid_orig_y) - min(valid_orig_y)) if valid_orig_y else 0.0
+
+            # --- B: PROPORTIONALER UMBAU (OHNE VERFÄLSCHENDEN VORAB-FAKTOR) ---
             targets = {}
             for k, v in true_3d_bones.items():
                 targets[k] = (v / 100.0) * reference_torso_length if is_normalized else v
 
-            do_log_bones = (frame_idx == best_idx and not detailed_log_done)
-            if do_log_bones:
-                log_messages.append(f"\n--- BONE SCALING DETAILS (Gemessen am Anker-Frame {best_idx}) ---")
-
-            # === NEU IN V12: TORSO WIRD AKTIV SKALIERT ===
+            # 1. Torso Skalierung
             curr_torso_vec = pts_new[12] - pts_new[0]
             curr_torso_len = np.linalg.norm(curr_torso_vec)
             if curr_torso_len > 1e-5:
-                # Target anwenden UND mit Height Lock Factor verrechnen
-                target_torso_locked = targets.get("torso", curr_torso_len) * height_lock_factor
-                torso_factor = target_torso_locked / curr_torso_len
-                
-                if do_log_bones:
-                    log_messages.append(f"Knochen: torso          | Idx  0 -> 12 | Ist: {curr_torso_len:.4f} | Soll (Locked): {target_torso_locked:.4f} | Faktor: {torso_factor:.4f}x")
-                
-                # Die Wirbelsäule besteht aus Segmenten: 0->3, 3->6, 6->9, 9->12
+                target_torso = targets.get("torso", curr_torso_len)
+                torso_factor = target_torso / curr_torso_len
                 for p, c in [(0,3), (3,6), (6,9), (9,12)]:
                     if p >= len(pts_new) or c >= len(pts_new): continue
                     if np.linalg.norm(pts_new[p]) < 1e-5 or np.linalg.norm(pts_new[c]) < 1e-5: continue
-                    
                     vec = pts_new[c] - pts_new[p]
                     new_c = pts_new[p] + vec * torso_factor
                     delta = new_c - pts_new[c]
                     pts_new[c] += delta
-                    
-                    # Verschiebe alle Kinder (Arme, Kopf wandern mit!)
                     for d in get_all_descendants(c, tree):
                         if d < len(pts_new) and np.linalg.norm(pts_new[d]) > 1e-5:
                             pts_new[d] += delta
 
-            # === NEU IN V12: KOPF WIRD AKTIV SKALIERT ===
+            # 2. Kopf Skalierung (Poster NLF Mapping bleibt unangetastet: / 2.0)
             if 15 < len(pts_new):
                 curr_head_vec = pts_new[15] - pts_new[12]
                 curr_head_len = np.linalg.norm(curr_head_vec)
                 if curr_head_len > 1e-5:
-                    target_head_locked = targets.get("head", curr_head_len) * height_lock_factor
-                    head_factor = target_head_locked / curr_head_len
-                    
-                    if do_log_bones:
-                        log_messages.append(f"Knochen: head           | Idx 12 -> 15 | Ist: {curr_head_len:.4f} | Soll (Locked): {target_head_locked:.4f} | Faktor: {head_factor:.4f}x")
-                        
+                    target_head = targets.get("head", curr_head_len * 2.0) / 2.0  # Hält sich an deine Poster-Regel
+                    head_factor = target_head / curr_head_len
                     vec = pts_new[15] - pts_new[12]
                     new_c = pts_new[12] + vec * head_factor
                     delta = new_c - pts_new[15]
                     pts_new[15] += delta
-                    # (Kopf hat hier keine weiteren Kinder im einfachen NLF Baum)
 
-            # === RESTLICHE KNOCHEN (Arme, Beine, Hüften, Schultern) ===
+            # 3. Restliche Knochen (Beine, Arme)
             operations = [
                 ('shoulder_width', 12, 17), ('shoulder_width', 12, 16),
                 ('hip_width', 0, 2),        ('hip_width', 0, 1),        
@@ -16336,10 +16288,9 @@ class NLFProportionalRetargeterV11:
                 if bone_key not in targets: continue
                 if c_idx >= len(pts_new) or p_idx >= len(pts_new): continue
                 
-                # Height Lock Faktor wird auf alle Zielwerte angewendet!
-                target_len_normal = targets[bone_key] * height_lock_factor
+                target_len_normal = targets[bone_key]
                 calib_key = "calibration_" + bone_key
-                target_len_calib = targets.get(calib_key, targets[bone_key]) * height_lock_factor
+                target_len_calib = targets.get(calib_key, targets[bone_key])
 
                 if bone_key in ['shoulder_width', 'hip_width']:
                     target_len_normal /= 2.0
@@ -16352,57 +16303,58 @@ class NLFProportionalRetargeterV11:
 
                 vec = c_pos - p_pos
                 curr_len = np.linalg.norm(vec)
-                
                 if curr_len < 1e-5: continue
                 
-                scale_normal = target_len_normal / curr_len
-                scale_calib = target_len_calib / curr_len
-                
-                if do_log_bones:
-                    if scale_normal != scale_calib:
-                        log_messages.append(f"Knochen: {bone_key.ljust(15)} | Idx {str(p_idx).rjust(2)} -> {str(c_idx).rjust(2)} | Gelenk-Faktor: {scale_calib:.4f}x | Kinder-Faktor: {scale_normal:.4f}x")
-                    else:
-                        log_messages.append(f"Knochen: {bone_key.ljust(15)} | Idx {str(p_idx).rjust(2)} -> {str(c_idx).rjust(2)} | Ist: {curr_len:.4f} | Soll (Locked): {target_len_normal:.4f} | Faktor: {scale_normal:.4f}x")
-
                 dir_vec = vec / curr_len
                 
-                new_c_pos_normal = p_pos + (dir_vec * target_len_normal)
-                delta_normal = new_c_pos_normal - c_pos
-
+                # Wir wenden Calibration Overrides (z.B. vom ConfigScaler) auf das Gelenk an
                 new_c_pos_calib = p_pos + (dir_vec * target_len_calib)
                 delta_calib = new_c_pos_calib - c_pos
-                
                 pts_new[c_idx] += delta_calib
                 
-                descendants = get_all_descendants(c_idx, tree)
-                for d in descendants:
+                # Kinder wandern anhand der normalen Länge mit
+                new_c_pos_normal = p_pos + (dir_vec * target_len_normal)
+                delta_normal = new_c_pos_normal - c_pos
+                for d in get_all_descendants(c_idx, tree):
                     if d < len(pts_new) and np.linalg.norm(pts_new[d]) > 1e-5:
                         pts_new[d] += delta_normal
 
-            # --- GROUND ANCHOR LOGIK (Füße bleiben auf dem Boden) ---
+
+            # --- C: NACHHER-MESSUNG & UNIFORMER HEIGHT LOCK (X, Y, Z) ---
+            valid_new_y = [p[1] for p in pts_new if np.linalg.norm(p) > 1e-5]
+            new_height = (max(valid_new_y) - min(valid_new_y)) if valid_new_y else 0.0
+
+            if orig_height > 1e-5 and new_height > 1e-5:
+                # 1. Faktor berechnen
+                final_scale_factor = orig_height / new_height
+                
+                # 2. Auf X, Y und Z gleichzeitig anwenden, ausgehend vom Becken (Knoten 0)
+                root_pos = pts_new[0].copy()
+                for j in range(len(pts_new)):
+                    if np.linalg.norm(pts_new[j]) > 1e-5:
+                        pts_new[j] = root_pos + (pts_new[j] - root_pos) * final_scale_factor
+
+                if frame_idx == best_idx:
+                    log_messages.append(f"\n--- POST-SCALE HEIGHT LOCK (Frame {frame_idx}) ---")
+                    log_messages.append(f"Vorher-Größe (Y): {orig_height:.4f}")
+                    log_messages.append(f"Nachher-Größe (Y): {new_height:.4f}")
+                    log_messages.append(f"-> Wende globalen 3D-Scale (X,Y,Z) an: {final_scale_factor:.4f}x")
+
+
+            # --- D: GROUND ANCHOR LOGIK (Füße wieder auf den Boden setzen) ---
             lower_body_indices = [4, 5, 7, 8, 10, 11] 
+            v_orig_y_feet = [pts[idx][1] for idx in lower_body_indices if idx < len(pts) and np.linalg.norm(pts[idx]) > 1e-5]
+            v_new_y_feet = [pts_new[idx][1] for idx in lower_body_indices if idx < len(pts_new) and np.linalg.norm(pts_new[idx]) > 1e-5]
             
-            valid_original_y = [pts[idx][1] for idx in lower_body_indices if idx < len(pts) and np.linalg.norm(pts[idx]) > 1e-5]
-            valid_new_y = [pts_new[idx][1] for idx in lower_body_indices if idx < len(pts_new) and np.linalg.norm(pts_new[idx]) > 1e-5]
-            
-            if valid_original_y and valid_new_y:
-                lowest_y_original = max(valid_original_y)
-                lowest_y_new = max(valid_new_y)
-                
-                y_shift = lowest_y_original - lowest_y_new
-                
+            if v_orig_y_feet and v_new_y_feet:
+                y_shift = max(v_orig_y_feet) - max(v_new_y_feet)
                 if abs(y_shift) > 1e-4:
-                    if do_log_bones:
-                        log_messages.append(f"\n--> Ground Anchor aktiv: Verschiebe gesamtes Skelett um Y: {y_shift:.4f} (Füße bleiben am Boden)")
-                    
                     for j in range(len(pts_new)):
                         if np.linalg.norm(pts_new[j]) > 1e-5:
                             pts_new[j][1] += y_shift
 
-            if do_log_bones:
-                detailed_log_done = True
-                log_messages.append("------------------------------------------------------------------\n")
 
+            # ZURÜCKSCHREIBEN IN DEN TENSOR / ARRAY
             if is_tensor:
                 if frame_data.dim() == 3: raw_poses[frame_idx][0] = torch.from_numpy(pts_new).to(frame_data.device)
                 else: raw_poses[frame_idx] = torch.from_numpy(pts_new).to(frame_data.device)
@@ -16415,8 +16367,8 @@ class NLFProportionalRetargeterV11:
             
             frames_processed += 1
 
-        log_messages.append(f"--- ZUSAMMENFASSUNG ---")
-        log_messages.append(f"Erfolgreich skaliert: {frames_processed} Frames.")
+        log_messages.append(f"\n--- ZUSAMMENFASSUNG ---")
+        log_messages.append(f"Erfolgreich skaliert & locked: {frames_processed} Frames.")
         
         return (nlf_data_retargeted, "\n".join(log_messages))
 
@@ -16504,7 +16456,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFDataToMaskV3": NLFDataToMaskV3,
     "NLFDataToMaskV4": NLFDataToMaskV4,
     "NLFDataHandDebugV3": NLFDataHandDebugV3,
-    "NLFProportionalRetargeterV11": NLFProportionalRetargeterV11,
+    "NLFProportionalRetargeterV12": NLFProportionalRetargeterV12,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -16591,7 +16543,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFDataToMaskV3": "NLF Data to Mask V3",
     "NLFDataToMaskV4": "NLF Data to Mask V4",
     "NLFDataHandDebugV3": "NLF Data Hand Debug V3 (Collision / IK)",
-    "NLFProportionalRetargeterV11": "NLF Proportional Retargeter V11",
+    "NLFProportionalRetargeterV12": "NLF Proportional Retargeter V12",
     
 }
 
