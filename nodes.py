@@ -15630,7 +15630,6 @@ class NLFDataToMaskV3:
         mask_tensor = torch.from_numpy(np.stack(frames_mask, axis=0)).float() / 255.0
         return (mask_tensor,)
 
-
 class NLFDataToMaskV4:
     @classmethod
     def INPUT_TYPES(cls):
@@ -15639,8 +15638,8 @@ class NLFDataToMaskV4:
                 "nlf_data_for_mask": ("NLF_MASK_DATA", {"tooltip": "Der Output aus Mimic 14"}),
                 "stick_width": ("INT", {"default": 15, "min": 1, "max": 100, "tooltip": "Dicke der Körper-Knochen"}),
                 
-                # NEU: Kopfskalierung in echtem 3D (Z-Tiefe von NLF, XY von DW Pose)
-                "head_circle_scale": ("FLOAT", {"default": 0.15, "min": 0.01, "max": 5.0, "step": 0.01, "tooltip": "3D-Radius für den Kopf (Zentrum: DW-Nase, Tiefe: NLF-Kopf)"}),
+                # ENTTRIEGELTER SLIDER: Werte im 100er-Bereich nötig wegen Z-Tiefe in Millimetern!
+                "head_circle_scale": ("FLOAT", {"default": 150.0, "min": 1.0, "max": 3000.0, "step": 5.0, "tooltip": "3D-Radius (Zentrum: DW-Nase XY, Tiefe: NLF-Hals Z)"}),
                 
                 "draw_neck_polygon": ("BOOLEAN", {"default": True, "tooltip": "Verbindet DW-Ohren mit NLF-Schultern"}),
                 "draw_body_rectangle": ("BOOLEAN", {"default": True, "tooltip": "Viereck zwischen Schultern und Hüfte"}),
@@ -15648,9 +15647,7 @@ class NLFDataToMaskV4:
                 "hip_circle_scale": ("FLOAT", {"default": 0.4, "min": 0.05, "max": 5.0, "step": 0.05, "tooltip": "Größe basierend auf der Rumpflänge"}),
                 "draw_hands_and_face": ("BOOLEAN", {"default": True}),
                 "hands_face_dilate": ("INT", {"default": 8, "min": 0, "max": 50, "tooltip": "Bläht die Hände und Gesichtslinien auf"}),
-                
-                # NEU: Repariert nun auch Hände und Gesicht!
-                "interpolate_missing_frames": ("BOOLEAN", {"default": True, "tooltip": "Füllt Lücken linear auf (Körper, Gesicht & Hände!)"})
+                "interpolate_missing_frames": ("BOOLEAN", {"default": True, "tooltip": "Füllt Lücken linear auf (Körper, Gesicht & Hände)"})
             }
         }
 
@@ -15658,7 +15655,7 @@ class NLFDataToMaskV4:
     RETURN_NAMES = ("mask",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Masken Generator V3 (mit echter Hand-Interpolation und hybridem 3D-Kopfkreis)."
+    DESCRIPTION = "Masken Generator V3 (Hybrider 3D-Kopfkreis gefixt, entriegelter Scale-Slider)."
 
     def process(self, nlf_data_for_mask, stick_width, head_circle_scale, draw_neck_polygon, draw_body_rectangle, draw_hip_circles, hip_circle_scale, draw_hands_and_face, hands_face_dilate, interpolate_missing_frames):
         import numpy as np
@@ -15675,7 +15672,7 @@ class NLFDataToMaskV4:
         dw_pose_input = copy.deepcopy(nlf_data_for_mask["dw_pose_input"])
         width = nlf_data_for_mask["width"]
         height = nlf_data_for_mask["height"]
-        focal_length = nlf_data_for_mask["focal_length"] # Wichtig für die 3D Kopf-Berechnung
+        focal_length = nlf_data_for_mask["focal_length"]
 
         # ====================================================================
         # LINEARE INTERPOLATION FÜR KÖRPER, HÄNDE UND GESICHT
@@ -15683,7 +15680,7 @@ class NLFDataToMaskV4:
         if interpolate_missing_frames:
             max_people = max([len(f) for f in all_frames_pts]) if all_frames_pts else 0
             
-            # 1. NLF Punkte Interpolieren (Körper/Z-Tiefen)
+            # 1. NLF Punkte Interpolieren
             for p in range(max_people):
                 for j in range(18):
                     last_valid = -1
@@ -15712,10 +15709,9 @@ class NLFDataToMaskV4:
                                     all_frames_pts[last_valid+step][p][j] = [ix, iy, iz]
                             last_valid = i
 
-            # 2. DW Pose Interpolieren (Repariert Körper, Gesicht und HÄNDE als Array-Blöcke!)
+            # 2. DW Pose Interpolieren
             if dw_pose_input is not None:
                 for p in range(max_people):
-                    # A) DW Pose Body (18 Punkte)
                     for j in range(18):
                         last_valid = -1
                         for i in range(len(dw_pose_input)):
@@ -15744,7 +15740,6 @@ class NLFDataToMaskV4:
                                             step_cand[p][j] = [ix, iy]
                                 last_valid = i
 
-                    # B) DW Pose HÄNDE (Interpoliert komplette 21-Punkte-Arrays)
                     for h_idx in [0, 1]:
                         hand_offset = p * 2 + h_idx
                         last_valid = -1
@@ -15753,7 +15748,7 @@ class NLFDataToMaskV4:
                             valid = False
                             if len(dw_hands) > hand_offset:
                                 h_arr = np.array(dw_hands[hand_offset])
-                                if np.sum(np.abs(h_arr)) > 0.01: # Check ob die Hand überhaupt existiert
+                                if np.sum(np.abs(h_arr)) > 0.01:
                                     valid = True
                             
                             if valid:
@@ -15773,7 +15768,6 @@ class NLFDataToMaskV4:
                                         dw_pose_input[last_valid+step]["hands"][hand_offset] = interp_hand
                                 last_valid = i
 
-                    # C) DW Pose GESICHTER (Interpoliert komplette 68-Punkte-Arrays)
                     last_valid = -1
                     for i in range(len(dw_pose_input)):
                         dw_faces = dw_pose_input[i].get("faces", [])
@@ -15808,7 +15802,6 @@ class NLFDataToMaskV4:
 
         canvas_2d_frames = None
         if dw_pose_input is not None and draw_hands_and_face:
-            # Jetzt werden die perfekt interpolierten Hände und Gesichter an den Renderer geschickt!
             canvas_2d_frames = draw_pose_to_canvas_np(dw_pose_input, pool=None, H=height, W=width, reshape_scale=0, show_feet_flag=False, show_body_flag=False, show_cheek_flag=True, dw_hand=True, show_face_flag=True, show_hand_flag=True)
 
         frames_mask = []
@@ -15835,14 +15828,19 @@ class NLFDataToMaskV4:
                     if cand[16][0] > 0: r_ear = (int(cand[16][0]*width), int(cand[16][1]*height))
                     if cand[17][0] > 0: l_ear = (int(cand[17][0]*width), int(cand[17][1]*height))
 
-                # --- HYBRIDE 3D KOPF KUGEL (Dein Ansatz!) ---
-                # XY = dw_pose Nase (nose)
-                # Z = NLF Kopf (pts[0][2])
-                if head_circle_scale > 0 and nose is not None and pts[0] is not None:
-                    nose_z = pts[0][2]
-                    if nose_z > 0: # Verhindert Division durch 0
-                        pixel_r = max(2, int((head_circle_scale * focal_length) / nose_z))
-                        cv2.circle(mask_img, nose, pixel_r, 255, -1, lineType=cv2.LINE_AA)
+                # --- HYBRIDE 3D KOPF KUGEL (EXAKT WIE GEFORDERT) ---
+                # Priorisiere DW Pose Nase für XY
+                center_xy = nose
+                if center_xy is None and pts[0] is not None:
+                    center_xy = (pts[0][0], pts[0][1]) # Fallback auf NLF, falls DW fehlt
+                    
+                if head_circle_scale > 0 and center_xy is not None and pts[0] is not None:
+                    # NLF Z-Tiefe vom obersten Halspunkt (pts[0][2])
+                    z_depth = max(0.1, abs(pts[0][2])) # max() verhindert Crash bei Z=0
+                    
+                    # 3D Skalierung: Neuer Scale-Faktor erlaubt realistische Größen
+                    pixel_r = max(2, int((head_circle_scale * focal_length) / z_depth))
+                    cv2.circle(mask_img, center_xy, pixel_r, 255, -1, lineType=cv2.LINE_AA)
 
                 # Hals Polygon
                 if draw_neck_polygon and pts[2] is not None and pts[5] is not None:
@@ -15863,13 +15861,12 @@ class NLFDataToMaskV4:
                         rect_cnt = np.array([[pts[2][0], pts[2][1]], [pts[5][0], pts[5][1]], [pts[11][0], pts[11][1]], [pts[8][0], pts[8][1]]])
                         cv2.fillPoly(mask_img, [rect_cnt], 255)
 
-                # Hüft Kreise (Hinterteil)
+                # Hüft Kreise
                 if draw_hip_circles and pts[8] is not None and pts[11] is not None and pts[2] is not None and pts[5] is not None:
                     dist_r = math.hypot(pts[2][0] - pts[8][0], pts[2][1] - pts[8][1])
                     dist_l = math.hypot(pts[5][0] - pts[11][0], pts[5][1] - pts[11][1])
                     torso_len = (dist_r + dist_l) / 2.0
                     pixel_r = max(2, int(torso_len * hip_circle_scale))
-                    
                     cv2.circle(mask_img, (pts[8][0], pts[8][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
                     cv2.circle(mask_img, (pts[11][0], pts[11][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
 
@@ -15882,11 +15879,9 @@ class NLFDataToMaskV4:
             if canvas_2d_frames is not None and i < len(canvas_2d_frames):
                 canvas_img = canvas_2d_frames[i]
                 hf_mask = np.where(np.any(canvas_img > 0, axis=-1), 255, 0).astype(np.uint8)
-                
                 if hands_face_dilate > 0:
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hands_face_dilate, hands_face_dilate))
                     hf_mask = cv2.dilate(hf_mask, kernel, iterations=1)
-                
                 mask_img = np.maximum(mask_img, hf_mask)
 
             frames_mask.append(mask_img)
