@@ -16092,6 +16092,7 @@ class NLFDataHandDebugV3:
 
         return (new_data,)
 
+
 class NLFProportionalRetargeterV11:
     @classmethod
     def INPUT_TYPES(cls):
@@ -16107,7 +16108,7 @@ class NLFProportionalRetargeterV11:
     RETURN_NAMES = ("nlf_data_retargeted", "log_output")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Retargeting"
-    DESCRIPTION = "V11: Absolute Height Lock + Ground Anchor. Person wächst NICHT, sondern ändert nur Proportionen."
+    DESCRIPTION = "V12: ECHTER Height Lock. Torso & Kopf werden jetzt aktiv geschrumpft/skaliert!"
 
     def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance):
         import copy
@@ -16115,7 +16116,7 @@ class NLFProportionalRetargeterV11:
         import math
         import torch
 
-        log_messages = ["=== NLF PROPORTIONAL RETARGETER V11 (HEIGHT LOCK & GROUND ANCHOR) ==="]
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V12 (FULL HEIGHT LOCK & GROUND ANCHOR) ==="]
         
         true_3d_bones = calibration_data.get("true_3d_bones", {})
         if not true_3d_bones:
@@ -16153,8 +16154,7 @@ class NLFProportionalRetargeterV11:
                 arr = np.array(frame_data)
                 pts = arr[0] if arr.ndim == 3 else arr
 
-            def is_val(idx):
-                return idx < len(pts) and np.linalg.norm(pts[idx]) > 1e-5
+            def is_val(idx): return idx < len(pts) and np.linalg.norm(pts[idx]) > 1e-5
 
             has_knees = is_val(4) or is_val(5)
             has_ankles = is_val(7) or is_val(8)
@@ -16211,8 +16211,8 @@ class NLFProportionalRetargeterV11:
         is_t = isinstance(ref_frame_data, torch.Tensor)
         ref_pts = ref_frame_data[0].cpu().numpy() if is_t and ref_frame_data.dim() == 3 else (ref_frame_data.cpu().numpy() if is_t else (np.array(ref_frame_data)[0] if np.array(ref_frame_data).ndim == 3 else np.array(ref_frame_data)))
 
-        # 1. Originale vertikale Knochenlängen messen (Rechte Körperhälfte als Referenz)
-        orig_torso = np.linalg.norm(ref_pts[12] - ref_pts[0])
+        # 1. Originale vertikale Knochenlängen messen
+        orig_torso = np.linalg.norm(ref_pts[12] - ref_pts[0]) if np.linalg.norm(ref_pts[12]) > 1e-5 else 0.0
         orig_thigh = np.linalg.norm(ref_pts[5] - ref_pts[2]) if np.linalg.norm(ref_pts[5]) > 1e-5 else 0.0
         orig_calf = np.linalg.norm(ref_pts[8] - ref_pts[5]) if np.linalg.norm(ref_pts[8]) > 1e-5 else 0.0
         head_val = true_3d_bones.get("head", 0.0)
@@ -16221,8 +16221,6 @@ class NLFProportionalRetargeterV11:
         else: missing_neck = head_val / 2.0
             
         reference_torso_length = orig_torso + missing_neck
-        
-        # Das ist die ECHTE physikalische Größe des Modells in NLF-Einheiten
         orig_vertical_sum = missing_neck + orig_torso + orig_thigh + orig_calf
 
         # 2. Berechnen, was die Config "bauen" will
@@ -16239,9 +16237,9 @@ class NLFProportionalRetargeterV11:
             height_lock_factor = orig_vertical_sum / wanted_vertical_sum
 
         log_messages.append("\n--- ABSOLUTE HEIGHT LOCK (Größen-Erhaltung) ---")
-        log_messages.append(f"Originale vertikale Länge (Hals+Torso+Bein): {orig_vertical_sum:.4f}")
-        log_messages.append(f"Gewünschte vertikale Länge laut Config:    {wanted_vertical_sum:.4f}")
-        log_messages.append(f"-> Height Lock Faktor angewandt:           {height_lock_factor:.4f}x (Schrumpft/Wächst das Skelett passend)")
+        log_messages.append(f"Originale vertikale Länge (Hals+Torso+Beine): {orig_vertical_sum:.4f}")
+        log_messages.append(f"Gewünschte vertikale Länge laut Config:     {wanted_vertical_sum:.4f}")
+        log_messages.append(f"-> Height Lock Faktor angewandt:            {height_lock_factor:.4f}x (Korrigiert alle Knochen!)")
 
         # --- STUFE 3: SMPL 3D KINEMATISCHER BAUM RETARGETING ---
         tree = {
@@ -16277,6 +16275,54 @@ class NLFProportionalRetargeterV11:
             for k, v in true_3d_bones.items():
                 targets[k] = (v / 100.0) * reference_torso_length if is_normalized else v
 
+            do_log_bones = (frame_idx == best_idx and not detailed_log_done)
+            if do_log_bones:
+                log_messages.append(f"\n--- BONE SCALING DETAILS (Gemessen am Anker-Frame {best_idx}) ---")
+
+            # === NEU IN V12: TORSO WIRD AKTIV SKALIERT ===
+            curr_torso_vec = pts_new[12] - pts_new[0]
+            curr_torso_len = np.linalg.norm(curr_torso_vec)
+            if curr_torso_len > 1e-5:
+                # Target anwenden UND mit Height Lock Factor verrechnen
+                target_torso_locked = targets.get("torso", curr_torso_len) * height_lock_factor
+                torso_factor = target_torso_locked / curr_torso_len
+                
+                if do_log_bones:
+                    log_messages.append(f"Knochen: torso          | Idx  0 -> 12 | Ist: {curr_torso_len:.4f} | Soll (Locked): {target_torso_locked:.4f} | Faktor: {torso_factor:.4f}x")
+                
+                # Die Wirbelsäule besteht aus Segmenten: 0->3, 3->6, 6->9, 9->12
+                for p, c in [(0,3), (3,6), (6,9), (9,12)]:
+                    if p >= len(pts_new) or c >= len(pts_new): continue
+                    if np.linalg.norm(pts_new[p]) < 1e-5 or np.linalg.norm(pts_new[c]) < 1e-5: continue
+                    
+                    vec = pts_new[c] - pts_new[p]
+                    new_c = pts_new[p] + vec * torso_factor
+                    delta = new_c - pts_new[c]
+                    pts_new[c] += delta
+                    
+                    # Verschiebe alle Kinder (Arme, Kopf wandern mit!)
+                    for d in get_all_descendants(c, tree):
+                        if d < len(pts_new) and np.linalg.norm(pts_new[d]) > 1e-5:
+                            pts_new[d] += delta
+
+            # === NEU IN V12: KOPF WIRD AKTIV SKALIERT ===
+            if 15 < len(pts_new):
+                curr_head_vec = pts_new[15] - pts_new[12]
+                curr_head_len = np.linalg.norm(curr_head_vec)
+                if curr_head_len > 1e-5:
+                    target_head_locked = targets.get("head", curr_head_len) * height_lock_factor
+                    head_factor = target_head_locked / curr_head_len
+                    
+                    if do_log_bones:
+                        log_messages.append(f"Knochen: head           | Idx 12 -> 15 | Ist: {curr_head_len:.4f} | Soll (Locked): {target_head_locked:.4f} | Faktor: {head_factor:.4f}x")
+                        
+                    vec = pts_new[15] - pts_new[12]
+                    new_c = pts_new[12] + vec * head_factor
+                    delta = new_c - pts_new[15]
+                    pts_new[15] += delta
+                    # (Kopf hat hier keine weiteren Kinder im einfachen NLF Baum)
+
+            # === RESTLICHE KNOCHEN (Arme, Beine, Hüften, Schultern) ===
             operations = [
                 ('shoulder_width', 12, 17), ('shoulder_width', 12, 16),
                 ('hip_width', 0, 2),        ('hip_width', 0, 1),        
@@ -16285,10 +16331,6 @@ class NLFProportionalRetargeterV11:
                 ('r_thigh', 2, 5),          ('r_calf', 5, 8),           
                 ('l_thigh', 1, 4),          ('l_calf', 4, 7)            
             ]
-
-            do_log_bones = (frame_idx == best_idx and not detailed_log_done)
-            if do_log_bones:
-                log_messages.append(f"\n--- BONE SCALING DETAILS (Gemessen am Anker-Frame {best_idx}) ---")
 
             for bone_key, p_idx, c_idx in operations:
                 if bone_key not in targets: continue
