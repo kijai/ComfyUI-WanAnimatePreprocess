@@ -15395,13 +15395,13 @@ class NLFDataToMaskV3:
             "required": {
                 "nlf_data_for_mask": ("NLF_MASK_DATA", {"tooltip": "Der Output aus Mimic 14"}),
                 "stick_width": ("INT", {"default": 15, "min": 1, "max": 100, "tooltip": "Dicke der Körper-Knochen"}),
-                "head_circle_in_norm": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 10.0, "step": 0.1, "tooltip": "Radius des 3D-Kopfkreises (Nase)"}),
-                "draw_neck_polygon": ("BOOLEAN", {"default": True, "tooltip": "Füllt den Bereich zwischen DW-Ohren und Schultern"}),
+                "head_circle_radius": ("INT", {"default": 45, "min": 1, "max": 300, "tooltip": "Fester Pixel-Radius für den Kopf (Zentrum: DW-Pose Nase)"}),
+                "draw_neck_polygon": ("BOOLEAN", {"default": True, "tooltip": "Verbindet DW-Ohren mit NLF-Schultern"}),
                 "draw_body_rectangle": ("BOOLEAN", {"default": True, "tooltip": "Viereck zwischen Schultern und Hüfte"}),
-                "draw_hip_circles": ("BOOLEAN", {"default": True, "tooltip": "3D Kugeln fürs Hinterteil an den Hüften"}),
-                "hip_circle_in_norm": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1, "tooltip": "Radius der Hüft-Bubbles"}),
-                "draw_hands_and_face": ("BOOLEAN", {"default": True, "tooltip": "Zieht Hände & Gesichter aus DW-Pose"}),
-                "hands_face_dilate": ("INT", {"default": 8, "min": 0, "max": 50, "tooltip": "Bläht die Linien von Händen und Gesicht künstlich auf (ähnlich wie Stick Width)"})
+                "draw_hip_circles": ("BOOLEAN", {"default": True, "tooltip": "Kugeln fürs Hinterteil"}),
+                "hip_circle_scale": ("FLOAT", {"default": 1.2, "min": 0.1, "max": 5.0, "step": 0.1, "tooltip": "Größe der Hüft-Kreise basierend auf dem Hüftabstand (1.0 = Kreise berühren sich mittig)"}),
+                "draw_hands_and_face": ("BOOLEAN", {"default": True}),
+                "hands_face_dilate": ("INT", {"default": 8, "min": 0, "max": 50, "tooltip": "Bläht die Hände und Gesichtslinien auf (Wie Stick-Width für Hände)"})
             }
         }
 
@@ -15409,12 +15409,13 @@ class NLFDataToMaskV3:
     RETURN_NAMES = ("mask",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Masken Generator V3 (Zieht fertige Daten direkt aus Mimic 14, inkl. dicken Händen, Ohren-Polygon, Hüft-Bubbles)."
+    DESCRIPTION = "Masken Generator V3 (Robuste 2D/3D Kreise, DW-Ohren Hals, dynamische Hüften, dicke Hände)."
 
-    def process(self, nlf_data_for_mask, stick_width, head_circle_in_norm, draw_neck_polygon, draw_body_rectangle, draw_hip_circles, hip_circle_in_norm, draw_hands_and_face, hands_face_dilate):
+    def process(self, nlf_data_for_mask, stick_width, head_circle_radius, draw_neck_polygon, draw_body_rectangle, draw_hip_circles, hip_circle_scale, draw_hands_and_face, hands_face_dilate):
         import numpy as np
         import torch
         import cv2
+        import math
         from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
 
         if not nlf_data_for_mask:
@@ -15424,53 +15425,69 @@ class NLFDataToMaskV3:
         dw_pose_input = nlf_data_for_mask["dw_pose_input"]
         width = nlf_data_for_mask["width"]
         height = nlf_data_for_mask["height"]
-        focal_length = nlf_data_for_mask["focal_length"]
 
         mimic_limb_seq = [
             [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8], [8, 9], [9, 10], 
             [1, 11], [11, 12], [12, 13], [1, 0], [0, 14], [14, 16], [0, 15], [15, 17]
         ]
 
-        # VORAB: Die Hände und Gesichter als feine Linien generieren lassen
+        # Hände und Gesichter als feine Linien vor-rendern
         canvas_2d_frames = None
         if dw_pose_input is not None and draw_hands_and_face:
             canvas_2d_frames = draw_pose_to_canvas_np(dw_pose_input, pool=None, H=height, W=width, reshape_scale=0, show_feet_flag=False, show_body_flag=False, show_cheek_flag=True, dw_hand=True, show_face_flag=True, show_hand_flag=True)
 
         frames_mask = []
 
-        # Hilfsfunktion für 3D-Radius (verhindert unsichtbare Kreise bei hohen Z-Werten)
-        def get_pixel_radius(norm_val, z_val, focal):
-            safe_z = max(0.5, abs(z_val)) # Verhindert extreme Schrumpfung oder Division durch 0
-            return max(2, int((norm_val * focal) / safe_z))
-
         for i in range(len(all_frames_pts)):
             mask_img = np.zeros((height, width), dtype=np.uint8)
             pts_list = all_frames_pts[i]
+            
+            # Lese DW Pose Daten für diesen Frame aus
+            candidate = []
+            if dw_pose_input is not None and i < len(dw_pose_input):
+                dw_bodies = dw_pose_input[i].get("bodies", {})
+                candidate = dw_bodies.get("candidate", [])
 
-            for pts in pts_list:
-                # 1. Knochen (Sticks)
-                for limb in mimic_limb_seq:
-                    if pts[limb[0]] is not None and pts[limb[1]] is not None:
-                        pt1 = (pts[limb[0]][0], pts[limb[0]][1])
-                        pt2 = (pts[limb[1]][0], pts[limb[1]][1])
-                        cv2.line(mask_img, pt1, pt2, 255, stick_width, lineType=cv2.LINE_AA)
+            for p, pts in enumerate(pts_list):
+                # --- 1. DW Pose Kopf/Gesicht Daten extrahieren ---
+                cand = None
+                if isinstance(candidate, list) and p < len(candidate):
+                    cand = candidate[p]
+                elif isinstance(candidate, np.ndarray) and p < candidate.shape[0]:
+                    cand = candidate[p]
 
-                # 2. Ohren -> Schultern (Hals-Polygon)
-                if draw_neck_polygon:
-                    # pts[16] = DW Rechtes Ohr, pts[17] = DW Linkes Ohr
-                    # pts[2] = R Schulter, pts[5] = L Schulter
-                    if pts[16] is not None and pts[17] is not None and pts[2] is not None and pts[5] is not None:
-                        neck_cnt = np.array([
-                            [pts[16][0], pts[16][1]], # R Ohr
-                            [pts[17][0], pts[17][1]], # L Ohr
-                            [pts[5][0],  pts[5][1]],  # L Schulter
-                            [pts[2][0],  pts[2][1]]   # R Schulter
-                        ])
-                        cv2.fillPoly(mask_img, [neck_cnt], 255)
+                nose, r_ear, l_ear = None, None, None
+                if cand is not None and len(cand) >= 18:
+                    if cand[0][0] > 0: nose = (int(cand[0][0]*width), int(cand[0][1]*height))
+                    if cand[16][0] > 0: r_ear = (int(cand[16][0]*width), int(cand[16][1]*height))
+                    if cand[17][0] > 0: l_ear = (int(cand[17][0]*width), int(cand[17][1]*height))
 
-                # 3. Viereck Schultern -> Hüften
+                # --- 2. Kopf-Kreis (DW Nase als Zentrum) ---
+                if head_circle_radius > 0 and nose is not None:
+                    cv2.circle(mask_img, nose, head_circle_radius, 255, -1, lineType=cv2.LINE_AA)
+
+                # --- 3. Hals Polygon (DW Ohren -> NLF Schultern) ---
+                if draw_neck_polygon and pts[2] is not None and pts[5] is not None:
+                    r_shoulder = (pts[2][0], pts[2][1])
+                    l_shoulder = (pts[5][0], pts[5][1])
+                    
+                    poly_pts = []
+                    # Zuerst die Ohren (oder Fallback auf Nase, falls Ohr verdeckt ist)
+                    if r_ear: poly_pts.append(r_ear)
+                    elif nose: poly_pts.append(nose)
+                    
+                    if l_ear: poly_pts.append(l_ear)
+                    elif nose and not poly_pts: poly_pts.append(nose) # Nur Nase, falls gar keine Ohren da sind
+                    
+                    # Dann runter zu den Schultern
+                    poly_pts.append(l_shoulder)
+                    poly_pts.append(r_shoulder)
+                    
+                    if len(poly_pts) >= 3:
+                        cv2.fillPoly(mask_img, [np.array(poly_pts)], 255)
+
+                # --- 4. Viereck Schultern -> Hüften ---
                 if draw_body_rectangle:
-                    # pts[11] = L Hüfte, pts[8] = R Hüfte
                     if pts[2] is not None and pts[5] is not None and pts[11] is not None and pts[8] is not None:
                         rect_cnt = np.array([
                             [pts[2][0],  pts[2][1]],  # R Schulter
@@ -15480,38 +15497,43 @@ class NLFDataToMaskV3:
                         ])
                         cv2.fillPoly(mask_img, [rect_cnt], 255)
 
-                # 4. Kopf-Kreis (ausgehend von der DW-Pose Nase = pts[0])
-                if head_circle_in_norm > 0 and pts[0] is not None:
-                    nose_z = pts[0][2]
-                    pixel_r = get_pixel_radius(head_circle_in_norm, nose_z, focal_length)
-                    cv2.circle(mask_img, (pts[0][0], pts[0][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
+                # --- 5. Hüft-Kreise (Dynamischer 3D-Radius über Pixel-Abstand) ---
+                if draw_hip_circles and pts[8] is not None and pts[11] is not None:
+                    # Brillanter Trick: Wir messen den Pixelabstand zwischen linker und rechter Hüfte.
+                    # Wenn die Figur nach hinten geht, schrumpft der Abstand -> Die Kreise schrumpfen mit!
+                    hip_dist = math.hypot(pts[8][0] - pts[11][0], pts[8][1] - pts[11][1])
+                    
+                    # Radius berechnen (hip_dist / 2 bedeutet die Kreise berühren sich bei Scale 1.0 genau in der Mitte)
+                    pixel_r = max(2, int((hip_dist / 2.0) * hip_circle_scale))
+                    
+                    cv2.circle(mask_img, (pts[8][0], pts[8][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
+                    cv2.circle(mask_img, (pts[11][0], pts[11][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
 
-                # 5. Hüft-Kreise (Hinterteil Bubbles)
-                if draw_hip_circles and hip_circle_in_norm > 0:
-                    for hip_idx in [8, 11]:
-                        if pts[hip_idx] is not None:
-                            hip_z = pts[hip_idx][2]
-                            pixel_r = get_pixel_radius(hip_circle_in_norm, hip_z, focal_length)
-                            cv2.circle(mask_img, (pts[hip_idx][0], pts[hip_idx][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
+                # --- 6. Knochen (Sticks) ---
+                for limb in mimic_limb_seq:
+                    if pts[limb[0]] is not None and pts[limb[1]] is not None:
+                        pt1 = (pts[limb[0]][0], pts[limb[0]][1])
+                        pt2 = (pts[limb[1]][0], pts[limb[1]][1])
+                        cv2.line(mask_img, pt1, pt2, 255, stick_width, lineType=cv2.LINE_AA)
 
-            # 6. Hände & Gesicht aus dem Mimic-Datenstrom einbrennen (mit künstlicher Verdickung!)
+            # --- 7. Dicke Hände & Gesicht aus DW Pose brennen ---
             if canvas_2d_frames is not None and i < len(canvas_2d_frames):
                 canvas_img = canvas_2d_frames[i]
                 
-                # Erstelle eine binäre Maske (alles was nicht Schwarz ist, wird Weiß)
+                # Mache alles, was im Canvas nicht schwarz ist, zu einer weißen Maske
                 hf_mask = np.where(np.any(canvas_img > 0, axis=-1), 255, 0).astype(np.uint8)
                 
-                # Verdicke die Hände/Gesichter mit cv2.dilate (wirkt wie der Stick Width!)
+                # Hier wenden wir den "Stick Width" für Hände an (Dilate bläht die Pixel auf)
                 if hands_face_dilate > 0:
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hands_face_dilate, hands_face_dilate))
                     hf_mask = cv2.dilate(hf_mask, kernel, iterations=1)
                 
-                # Lege die dicken Hände/Gesichter über die restliche Körpermaske
+                # Überlagere die dicken Hände/Gesichter mit dem restlichen Körper
                 mask_img = np.maximum(mask_img, hf_mask)
 
             frames_mask.append(mask_img)
 
-        # In ComfyUI Masken Tensor konvertieren (0.0 - 1.0)
+        # In ComfyUI Tensor konvertieren
         mask_tensor = torch.from_numpy(np.stack(frames_mask, axis=0)).float() / 255.0
         return (mask_tensor,)
 
