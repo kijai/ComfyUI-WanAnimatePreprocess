@@ -15761,7 +15761,22 @@ class NLFDataToMaskV4:
 
                 for limb in mimic_limb_seq:
                     if pts[limb[0]] is not None and pts[limb[1]] is not None:
-                        cv2.line(mask_img, (pts[limb[0]][0], pts[limb[0]][1]), (pts[limb[1]][0], pts
+                        cv2.line(mask_img, (pts[limb[0]][0], pts[limb[0]][1]), (pts[limb[1]][0], pts[limb[1]][1]), 255, stick_width, lineType=cv2.LINE_AA)
+
+            if canvas_2d_frames is not None and i < len(canvas_2d_frames):
+                canvas_img = canvas_2d_frames[i]
+                hf_mask = np.where(np.any(canvas_img > 0, axis=-1), 255, 0).astype(np.uint8)
+                
+                if hands_face_dilate > 0:
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hands_face_dilate, hands_face_dilate))
+                    hf_mask = cv2.dilate(hf_mask, kernel, iterations=1)
+                
+                mask_img = np.maximum(mask_img, hf_mask)
+
+            frames_mask.append(mask_img)
+
+        mask_tensor = torch.from_numpy(np.stack(frames_mask, axis=0)).float() / 255.0
+        return (mask_tensor,)
 
 
 class NLFDataHandDebugV3:
