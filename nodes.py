@@ -16108,7 +16108,7 @@ class NLFProportionalRetargeterV13:
     RETURN_NAMES = ("nlf_data_retargeted", "log_output")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Retargeting"
-    DESCRIPTION = "V13: 2-Phasen Build + Detail Logging. Stabile Schulter-Messung. Schützt Breiten vor Verzerrung."
+    DESCRIPTION = "V15: Pure XZ-Width Scaling. Stabiler Hals-Anker. Kein Torso-Wachsen bei Hip-Scale!"
 
     def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance):
         import copy
@@ -16116,7 +16116,7 @@ class NLFProportionalRetargeterV13:
         import math
         import torch
 
-        log_messages = ["=== NLF PROPORTIONAL RETARGETER V13 (DETAIL LOGGING & WIDTH PROTECTION) ==="]
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V15 (PURE XZ-WIDTH & NECK ANCHOR) ==="]
         
         true_3d_bones = calibration_data.get("true_3d_bones", {})
         if not true_3d_bones:
@@ -16176,7 +16176,6 @@ class NLFProportionalRetargeterV13:
 
         log_messages.append(f"-> Referenz-Frame für Messung: {best_idx}")
 
-        # Basis-Längen für Normalisierung am Referenz-Frame messen
         ref_frame_data = raw_poses[best_idx]
         is_t = isinstance(ref_frame_data, torch.Tensor)
         ref_pts = ref_frame_data[0].cpu().numpy() if is_t and ref_frame_data.dim() == 3 else (ref_frame_data.cpu().numpy() if is_t else np.array(ref_frame_data))
@@ -16198,12 +16197,13 @@ class NLFProportionalRetargeterV13:
             return desc
 
         def get_height_stable(p_array):
-            if 16 < len(p_array) and 17 < len(p_array) and np.linalg.norm(p_array[16]) > 1e-5:
-                shoulder_y = (p_array[16][1] + p_array[17][1]) / 2.0
-            elif 12 < len(p_array): shoulder_y = p_array[12][1]
+            # V15: Wir messen exakt ab Knoten 12 (Neck Base), damit Schulterbreiten die Messung nicht mehr stören!
+            if 12 < len(p_array) and np.linalg.norm(p_array[12]) > 1e-5:
+                top_y = p_array[12][1]
             else: return 0.0
+            
             feet_y = [p_array[idx][1] for idx in [7,8,10,11,4,5] if idx < len(p_array) and np.linalg.norm(p_array[idx]) > 1e-5]
-            return (max(feet_y) - shoulder_y) if feet_y else 0.0
+            return (max(feet_y) - top_y) if feet_y else 0.0
 
         # --- VERARBEITUNG ---
         for frame_idx in range(len(raw_poses)):
@@ -16234,7 +16234,7 @@ class NLFProportionalRetargeterV13:
                         for d in get_all_descendants(c, tree):
                             if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5: pts_b[d] += delta
 
-                # 2. Kopf (Poster Mapping / 2.0 bleibt!)
+                # 2. Kopf
                 if 15 < len(pts_b):
                     cv = pts_b[15] - pts_b[12]; cl = np.linalg.norm(cv)
                     if cl > 1e-5:
@@ -16251,25 +16251,40 @@ class NLFProportionalRetargeterV13:
 
                 for key, p_idx, c_idx in ops:
                     if key not in targets or c_idx >= len(pts_b): continue
-                    t_n = targets[key]; cal_k = "calibration_" + key; t_c = targets.get(cal_k, t_n)
                     
-                    if key in ['shoulder_width', 'hip_width']:
-                        t_n /= 2.0; t_c /= 2.0 # Breiten werden NICHT mit factor skaliert
-                        status = "(Width-Protected)"
-                    else:
-                        if final_mode: t_n *= factor; t_c *= factor
-                        status = ""
-
+                    t_len_normal = targets[key]
+                    cal_k = "calibration_" + key
+                    t_len_final = targets.get(cal_k, t_len_normal)
+                    
                     cv = pts_b[c_idx] - pts_b[p_idx]; cl = np.linalg.norm(cv)
                     if cl < 1e-5: continue
-                    
-                    if do_log and key not in ['shoulder_width', 'hip_width'] or (do_log and "width" in key and p_idx==0):
-                        log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Soll: {t_c:.4f} {status}")
 
-                    pts_b[c_idx] = pts_b[p_idx] + (cv / cl * t_c)
-                    delta_n = (pts_b[p_idx] + (cv / cl * t_n)) - (pts_b[p_idx] + cv)
+                    if key in ['shoulder_width', 'hip_width']:
+                        t_len_final /= 2.0
+                        status = "(Pure XZ Width Scale)"
+                        
+                        # V15 PURE XZ SCALING: Y wird absolut unangetastet gelassen!
+                        scale_xz = t_len_final / cl
+                        new_c_pos = pts_b[p_idx].copy()
+                        new_c_pos[0] += cv[0] * scale_xz
+                        new_c_pos[1] += cv[1]  # <- Absoluter Y-Lock! Die Hüfte/Schulter sackt nicht ab.
+                        new_c_pos[2] += cv[2] * scale_xz
+                    else:
+                        if final_mode: t_len_final *= factor
+                        status = ""
+                        dir_vec = cv / cl
+                        new_c_pos = pts_b[p_idx] + (dir_vec * t_len_final)
+
+                    if do_log and key not in ['shoulder_width', 'hip_width'] or (do_log and "width" in key and p_idx==0):
+                        log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Soll: {t_len_final:.4f} {status}")
+
+                    delta_shift = new_c_pos - pts_b[c_idx]
+                    pts_b[c_idx] = new_c_pos
+
                     for d in get_all_descendants(c_idx, tree):
-                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5: pts_b[d] += delta_n
+                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
+                            pts_b[d] += delta_shift
+                            
                 return pts_b
 
             # PHASE 1: Messung
@@ -16283,7 +16298,7 @@ class NLFProportionalRetargeterV13:
                 log_messages.append(f"\n--- SKALIERUNGS-LOG (Frame {frame_idx}) ---")
                 log_messages.append(f"Gemessene Ziel-Skalierung: {f_scale:.4f}x")
 
-            # PHASE 2: Finaler Build mit Logging
+            # PHASE 2: Finaler Build
             pts_final = build_and_log(pts, f_scale, final_mode=True)
 
             # GROUND ANCHOR
@@ -16302,7 +16317,6 @@ class NLFProportionalRetargeterV13:
                 raw_poses[frame_idx] = pts_final.tolist()
 
         return (nlf_data_retargeted, "\n".join(log_messages))
-
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
