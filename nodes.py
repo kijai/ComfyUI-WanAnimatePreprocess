@@ -14661,7 +14661,7 @@ class PoseGlobalPerspectiveScalerV48:
         return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
 
 
-class PoseGlobalPerspectiveScalerV48:
+class PoseGlobalPerspectiveScalerV49:
     @classmethod
     def INPUT_TYPES(cls):
         return {
