@@ -15970,88 +15970,125 @@ class NLFDataHandDebugV3:
                         smooth_threshold_body_pct, move_elbows, 
                         elbow_move_percent, keep_arm_length):
         
+        import copy
+        import numpy as np
+        import torch
+        
         # Regel 1: Keine Originaldaten zerstören
         new_data = copy.deepcopy(nlf_data)
         
+        # Datenstruktur entpacken (NLFPRED Format in deinem Repo)
+        is_dict = isinstance(new_data, dict)
+        if is_dict:
+            if 'joints3d_nonparam' in new_data:
+                frames = new_data['joints3d_nonparam'][0]
+            else:
+                return (new_data,) # Keine 3D-Daten gefunden, sicher abbrechen
+        else:
+            frames = new_data
+            
         # SMPL 3D Indizes (Standard)
         HIP = 0
         L_SHOULDER, L_ELBOW, L_WRIST, L_HAND = 16, 18, 20, 22
         R_SHOULDER, R_ELBOW, R_WRIST, R_HAND = 17, 19, 21, 23
-        NECK = 12 # Wird für Torso-Berechnung oft genutzt, wir nehmen aber Mid-Shoulder
         
         # Umrechnung Zentimeter in Meter (NLF-Einheiten)
         min_dist_m = min_hand_dist_cm / 100.0
         
-        for frame_idx in range(len(new_data)):
-            if 'joints_3d' not in new_data[frame_idx]:
+        for frame_idx in range(len(frames)):
+            if frames[frame_idx] is None or len(frames[frame_idx]) == 0:
                 continue
-            
-            # Numpy Array erzwingen für Vektor-Mathematik
-            joints = np.array(new_data[frame_idx]['joints_3d'], dtype=np.float32)
-            
-            # 1. Dynamische Körperberechnung (Torso-Länge)
-            mid_shoulder = (joints[L_SHOULDER] + joints[R_SHOULDER]) / 2.0
-            torso_length = np.linalg.norm(mid_shoulder - joints[HIP])
-            
-            # Smooth Zone in Metern, abhängig von der Körpergröße des Charakters!
-            smooth_zone_m = (smooth_threshold_body_pct / 100.0) * torso_length if smooth_entry else 0.0
-            trigger_dist = min_dist_m + smooth_zone_m
-            
-            def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand):
-                hip_pos = joints[HIP]
-                wrist_pos = joints[idx_wrist]
                 
-                vec = wrist_pos - hip_pos
-                dist = np.linalg.norm(vec)
+            # Wir bearbeiten alle Personen in diesem Frame
+            for person_idx in range(len(frames[frame_idx])):
+                person_data = frames[frame_idx][person_idx]
                 
-                # Wenn das Handgelenk innerhalb der Gefahrenzone (oder Pufferzone) ist
-                if dist < trigger_dist and dist > 0.001:
-                    dir_vec = vec / dist
+                # Numpy Array erzwingen für Vektor-Mathematik (unterstützt PyTorch Tensoren)
+                is_tensor = isinstance(person_data, torch.Tensor)
+                if is_tensor:
+                    joints = person_data.cpu().numpy().copy()
+                else:
+                    joints = np.array(person_data, dtype=np.float32).copy()
                     
-                    # 2. Smooth Entry Logik berechnen
-                    if dist < min_dist_m:
-                        # Hartes Limit überschritten: Schiebe es auf Minimum + die halbe Pufferzone zurück
-                        push_amount = (min_dist_m - dist) + (smooth_zone_m * 0.5)
-                    else:
-                        # In der Pufferzone: weiche parabolische Kurve (C1 stetig)
-                        t = (trigger_dist - dist) / smooth_zone_m
-                        push_amount = (smooth_zone_m * 0.5) * (t ** 2)
-                        
-                    # 3. Offsets anwenden
-                    target_wrist = joints[idx_wrist] + dir_vec * push_amount
-                    target_hand = joints[idx_hand] + dir_vec * push_amount # Finger gehen einfach mit
+                # NLF packt die Tensoren oft nochmal in eine extra Dimension (z.B. [1, 24, 3])
+                has_extra_dim = joints.ndim == 3
+                if has_extra_dim:
+                    joints = joints[0]
                     
-                    target_elbow = joints[idx_elbow]
-                    if move_elbows:
-                        target_elbow += dir_vec * push_amount * (elbow_move_percent / 100.0)
+                if joints.shape[0] < 24:
+                    continue # Zu wenig Joints
+                
+                # 1. Dynamische Körperberechnung (Torso-Länge)
+                mid_shoulder = (joints[L_SHOULDER] + joints[R_SHOULDER]) / 2.0
+                torso_length = np.linalg.norm(mid_shoulder - joints[HIP])
+                if torso_length < 0.001:
+                    continue
+                
+                # Smooth Zone in Metern, abhängig von der Körpergröße des Charakters!
+                smooth_zone_m = (smooth_threshold_body_pct / 100.0) * torso_length if smooth_entry else 0.0
+                trigger_dist = min_dist_m + smooth_zone_m
+                
+                def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand):
+                    hip_pos = joints[HIP]
+                    wrist_pos = joints[idx_wrist]
+                    
+                    vec = wrist_pos - hip_pos
+                    dist = np.linalg.norm(vec)
+                    
+                    # Wenn das Handgelenk innerhalb der Gefahrenzone (oder Pufferzone) ist
+                    if dist < trigger_dist and dist > 0.001:
+                        dir_vec = vec / dist
                         
-                    # 4. Skelett-Länge korrigieren (Skelett-Erhaltung an/aus)
-                    if keep_arm_length:
-                        # Berechne perfekten Ellbogen und Handgelenk mit FABRIK
-                        new_e, new_w = self.solve_fabrik(joints[idx_shoulder], target_elbow, target_wrist, target_wrist)
+                        # 2. Smooth Entry Logik berechnen
+                        if dist < min_dist_m:
+                            # Hartes Limit überschritten: Schiebe es auf Minimum + die halbe Pufferzone zurück
+                            push_amount = (min_dist_m - dist) + (smooth_zone_m * 0.5)
+                        else:
+                            # In der Pufferzone: weiche parabolische Kurve (C1 stetig)
+                            t = (trigger_dist - dist) / smooth_zone_m
+                            push_amount = (smooth_zone_m * 0.5) * (t ** 2)
+                            
+                        # 3. Offsets anwenden
+                        target_wrist = joints[idx_wrist] + dir_vec * push_amount
+                        target_hand = joints[idx_hand] + dir_vec * push_amount # Finger gehen einfach mit
                         
-                        # Finger (Hand) ans neue Handgelenk anhängen (gleicher relativer Abstand)
-                        hand_offset = joints[idx_hand] - joints[idx_wrist]
-                        joints[idx_hand] = new_w + hand_offset
-                        
-                        # Finale Zuweisung
-                        joints[idx_elbow] = new_e
-                        joints[idx_wrist] = new_w
-                    else:
-                        # Einfaches "Stretching" (Knochen werden länger)
-                        joints[idx_wrist] = target_wrist
-                        joints[idx_hand] = target_hand
-                        joints[idx_elbow] = target_elbow
+                        target_elbow = joints[idx_elbow].copy()
+                        if move_elbows:
+                            target_elbow += dir_vec * push_amount * (elbow_move_percent / 100.0)
+                            
+                        # 4. Skelett-Länge korrigieren (Skelett-Erhaltung an/aus)
+                        if keep_arm_length:
+                            # Berechne perfekten Ellbogen und Handgelenk mit FABRIK
+                            new_e, new_w = self.solve_fabrik(joints[idx_shoulder], target_elbow, target_wrist, target_wrist)
+                            
+                            # Finger (Hand) ans neue Handgelenk anhängen (gleicher relativer Abstand)
+                            hand_offset = joints[idx_hand] - joints[idx_wrist]
+                            joints[idx_hand] = new_w + hand_offset
+                            
+                            # Finale Zuweisung
+                            joints[idx_elbow] = new_e
+                            joints[idx_wrist] = new_w
+                        else:
+                            # Einfaches "Stretching" (Knochen werden länger)
+                            joints[idx_wrist] = target_wrist
+                            joints[idx_hand] = target_hand
+                            joints[idx_elbow] = target_elbow
 
-            # Beide Arme prüfen
-            process_arm(L_SHOULDER, L_ELBOW, L_WRIST, L_HAND)
-            process_arm(R_SHOULDER, R_ELBOW, R_WRIST, R_HAND)
-            
-            # Wieder in das Original-Format des Backends umwandeln (Liste, falls es eine Liste war)
-            if isinstance(new_data[frame_idx]['joints_3d'], list):
-                new_data[frame_idx]['joints_3d'] = joints.tolist()
-            else:
-                new_data[frame_idx]['joints_3d'] = joints
+                # Beide Arme prüfen
+                process_arm(L_SHOULDER, L_ELBOW, L_WRIST, L_HAND)
+                process_arm(R_SHOULDER, R_ELBOW, R_WRIST, R_HAND)
+                
+                # Wieder in das Original-Format zurückschreiben (als Tensor oder Liste)
+                if is_tensor:
+                    if has_extra_dim:
+                        frames[frame_idx][person_idx][0] = torch.from_numpy(joints).to(person_data.device)
+                    else:
+                        frames[frame_idx][person_idx] = torch.from_numpy(joints).to(person_data.device)
+                else:
+                    if has_extra_dim:
+                        frames[frame_idx][person_idx][0] = joints.tolist()
+                    else:
+                        frames[frame_idx][person_idx] = joints.tolist()
 
         return (new_data,)
 
