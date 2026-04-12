@@ -15918,7 +15918,7 @@ class NLFDataHandDebugV3:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "nlf_data": ("NLF_DATA",),
+                "nlf_data": ("NLFPRED",),
                 # Zentimeter-Angabe mit extrem hoher Grenze für maximale Freiheit
                 "min_hand_dist_cm": ("FLOAT", {"default": 15.0, "min": 0.0, "max": 1000.0, "step": 0.1}),
                 "smooth_entry": ("BOOLEAN", {"default": True}),
@@ -15932,7 +15932,7 @@ class NLFDataHandDebugV3:
             },
         }
 
-    RETURN_TYPES = ("NLF_DATA",)
+    RETURN_TYPES = ("NLFPRED",)
     FUNCTION = "apply_collision"
     CATEGORY = "WanAnimate/NLF"
 
