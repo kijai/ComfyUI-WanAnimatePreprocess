@@ -16108,7 +16108,7 @@ class NLFProportionalRetargeterV13:
     RETURN_NAMES = ("nlf_data_retargeted", "log_output")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Retargeting"
-    DESCRIPTION = "V17: Korrekte Reihenfolge! Erst globaler Stance-Scale (Beine), dann lokaler Bone-Config (nur Gelenk)."
+    DESCRIPTION = "V18: Exaktes Mapping! Base-Width = Ganzes Bein (Stance), Calibration-Width = Nur Gelenk (Config)."
 
     def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance):
         import copy
@@ -16116,7 +16116,7 @@ class NLFProportionalRetargeterV13:
         import math
         import torch
 
-        log_messages = ["=== NLF PROPORTIONAL RETARGETER V17 (SCALE THEN CONFIG) ==="]
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V18 (BASE STANCE -> CALIBRATION JOINT) ==="]
         
         true_3d_bones = calibration_data.get("true_3d_bones", {})
         if not true_3d_bones:
@@ -16200,7 +16200,6 @@ class NLFProportionalRetargeterV13:
             if 12 < len(p_array) and np.linalg.norm(p_array[12]) > 1e-5:
                 top_y = p_array[12][1]
             else: return 0.0
-            
             feet_y = [p_array[idx][1] for idx in [7,8,10,11,4,5] if idx < len(p_array) and np.linalg.norm(p_array[idx]) > 1e-5]
             return (max(feet_y) - top_y) if feet_y else 0.0
 
@@ -16253,23 +16252,14 @@ class NLFProportionalRetargeterV13:
                     if cl < 1e-5: continue
 
                     if key in ['shoulder_width', 'hip_width']:
-                        # --- V17 LOGIK: ERST SCALE (Bein bewegen), DANN CONFIG (nur Gelenk) ---
+                        # --- V18 LOGIK: KLARE TRENNUNG BASIS vs CALIBRATION ---
                         
-                        # 1. Finde den globalen Stance Scale (z.B. aus 'calibration_hip_width_scale' oder 'calibration_hip_width')
-                        stance_target = None
-                        for k_scale in [f"calibration_{key}_scale", f"calibration_{key}", key]:
-                            if k_scale in targets:
-                                stance_target = targets[k_scale] / 2.0
-                                break
-                        if stance_target is None: stance_target = cl
+                        # 1. Stance Target (Ganzes Bein wandert) -> Nimmt den Standard Config Wert (z.B. 43.97)
+                        stance_target = targets.get(key, cl * 2.0) / 2.0
                         
-                        # 2. Finde die anatomische Bone-Config
-                        bone_target = None
-                        for k_config in [f"calibration_{key}_config", f"{key}_config"]:
-                            if k_config in targets:
-                                bone_target = targets[k_config] / 2.0
-                                break
-                        if bone_target is None: bone_target = stance_target # Standard: Config entspricht Scale
+                        # 2. Bone Target (Nur Gelenk wandert) -> Nimmt den Calibration Wert (z.B. 77.84)
+                        calib_key = f"calibration_{key}"
+                        bone_target = targets.get(calib_key, stance_target * 2.0) / 2.0
 
                         # SCHRITT A: STANCE SCALE ANWENDEN (Bewegt Gelenk UND Beine!)
                         scale_xz_stance = stance_target / cl
@@ -16279,27 +16269,24 @@ class NLFProportionalRetargeterV13:
                         pos_stance[2] += cv[2] * scale_xz_stance
                         
                         delta_stance = pos_stance - pts_b[c_idx]
-                        
-                        # Hüfte bewegen
-                        pts_b[c_idx] += delta_stance
-                        # Gesamtes Bein/Arm mitverschieben
+                        pts_b[c_idx] += delta_stance # Gelenk verschieben
                         for d in get_all_descendants(c_idx, tree):
                             if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
-                                pts_b[d] += delta_stance
+                                pts_b[d] += delta_stance # Beine mitverschieben
 
-                        # SCHRITT B: BONE CONFIG ANWENDEN (Bewegt NUR die Hüfte anatomisch!)
+                        # SCHRITT B: BONE CONFIG ANWENDEN (Bewegt NUR das Gelenk nach!)
                         scale_xz_config = bone_target / cl
                         pos_config = pts_b[p_idx].copy()
                         pos_config[0] += cv[0] * scale_xz_config
                         pos_config[1] += cv[1] # Y-Lock
                         pos_config[2] += cv[2] * scale_xz_config
                         
-                        delta_config = pos_config - pts_b[c_idx] # Differenz zwischen Stance-Position und Config-Position
-                        
-                        # Hüfte an ihre finale anatomische Position rücken (Kinder bleiben stehen!)
-                        pts_b[c_idx] += delta_config
+                        # Wir berechnen die Differenz von der Stance-Position zur neuen Bone-Position
+                        delta_config = pos_config - pts_b[c_idx]
+                        pts_b[c_idx] += delta_config # NUR das Gelenk verschieben, Beine bleiben stehen!
                                 
-                        if do_log and p_idx == 0: 
+                        # Log-Fix: Wird nur für die rechte Seite (Index 2 bei Hip, 17 bei Schulter) ausgedruckt, damit es übersichtlich bleibt
+                        if do_log and (c_idx == 2 or c_idx == 17): 
                             log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Scale (ganzes Bein): {stance_target:.4f} -> Config (nur Gelenk): {bone_target:.4f}")
 
                     else:
@@ -16313,7 +16300,8 @@ class NLFProportionalRetargeterV13:
                         dir_vec = cv / cl
                         new_c_pos = pts_b[p_idx] + (dir_vec * t_len_final)
 
-                        if do_log:
+                        # Log-Fix: Nur rechts loggen
+                        if do_log and key.startswith('r_'):
                             log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Soll: {t_len_final:.4f}")
 
                         delta_shift = new_c_pos - pts_b[c_idx]
@@ -16355,7 +16343,6 @@ class NLFProportionalRetargeterV13:
                 raw_poses[frame_idx] = pts_final.tolist()
 
         return (nlf_data_retargeted, "\n".join(log_messages))
-
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
