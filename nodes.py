@@ -15389,248 +15389,7 @@ class RenderNLFPosesDirectPoseDataMimic15:
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}", None)
 
 
-
 class NLFDataToMaskV3:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "nlf_data_for_mask": ("NLF_MASK_DATA", {"tooltip": "Der Output aus Mimic 14"}),
-                "stick_width": ("INT", {"default": 15, "min": 1, "max": 100, "tooltip": "Dicke der Körper-Knochen"}),
-                "head_circle_radius": ("INT", {"default": 45, "min": 1, "max": 300, "tooltip": "Fester Pixel-Radius für den Kopf"}),
-                "draw_neck_polygon": ("BOOLEAN", {"default": True, "tooltip": "Verbindet DW-Ohren mit NLF-Schultern"}),
-                "draw_body_rectangle": ("BOOLEAN", {"default": True, "tooltip": "Viereck zwischen Schultern und Hüfte"}),
-                "draw_hip_circles": ("BOOLEAN", {"default": True, "tooltip": "Kugeln fürs Hinterteil"}),
-                "hip_circle_scale": ("FLOAT", {"default": 0.4, "min": 0.05, "max": 5.0, "step": 0.05, "tooltip": "Größe basierend auf der Rumpflänge"}),
-                "draw_hands_and_face": ("BOOLEAN", {"default": True}),
-                "hands_face_dilate": ("INT", {"default": 8, "min": 0, "max": 50, "tooltip": "Bläht die Hände und Gesichtslinien auf"}),
-                "interpolate_missing_frames": ("BOOLEAN", {"default": True, "tooltip": "Füllt Lücken linear auf, wenn Körper, Gesicht oder Hände verschwinden"})
-            }
-        }
-
-    RETURN_TYPES = ("MASK",)
-    RETURN_NAMES = ("mask",)
-    FUNCTION = "process"
-    CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Masken Generator V3 (mit linearer Interpolation für Körper, GESICHT & HÄNDE)."
-
-    def process(self, nlf_data_for_mask, stick_width, head_circle_radius, draw_neck_polygon, draw_body_rectangle, draw_hip_circles, hip_circle_scale, draw_hands_and_face, hands_face_dilate, interpolate_missing_frames):
-        import numpy as np
-        import torch
-        import cv2
-        import math
-        import copy
-        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
-
-        if not nlf_data_for_mask:
-            return (torch.zeros((1, 512, 512)),)
-
-        all_frames_pts = copy.deepcopy(nlf_data_for_mask["all_frames_pts"])
-        dw_pose_input = copy.deepcopy(nlf_data_for_mask["dw_pose_input"])
-        width = nlf_data_for_mask["width"]
-        height = nlf_data_for_mask["height"]
-
-        # ====================================================================
-        # LINEARE INTERPOLATION FÜR KÖRPER, HÄNDE UND GESICHT
-        # ====================================================================
-        if interpolate_missing_frames:
-            max_people = max([len(f) for f in all_frames_pts]) if all_frames_pts else 0
-            
-            # 1. NLF Punkte Interpolieren (Repariert den Torso, Beine, Handgelenk-Ansätze)
-            for p in range(max_people):
-                for j in range(18):
-                    last_valid = -1
-                    for i in range(len(all_frames_pts)):
-                        valid = False
-                        if p < len(all_frames_pts[i]) and len(all_frames_pts[i][p]) > j:
-                            if all_frames_pts[i][p][j] is not None:
-                                valid = True
-                                
-                        if valid:
-                            if last_valid != -1 and i - last_valid > 1:
-                                start_pt = all_frames_pts[last_valid][p][j]
-                                end_pt = all_frames_pts[i][p][j]
-                                steps = i - last_valid
-                                for step in range(1, steps):
-                                    frac = step / steps
-                                    ix = int(start_pt[0] + (end_pt[0] - start_pt[0]) * frac)
-                                    iy = int(start_pt[1] + (end_pt[1] - start_pt[1]) * frac)
-                                    iz = start_pt[2] + (end_pt[2] - start_pt[2]) * frac
-                                    
-                                    while len(all_frames_pts[last_valid+step]) <= p:
-                                        all_frames_pts[last_valid+step].append([None]*18)
-                                    while len(all_frames_pts[last_valid+step][p]) <= j:
-                                        all_frames_pts[last_valid+step][p].append(None)
-                                        
-                                    all_frames_pts[last_valid+step][p][j] = [ix, iy, iz]
-                            last_valid = i
-
-            # 2. DW Pose Interpolieren (Repariert Körper, Gesicht und HÄNDE!)
-            if dw_pose_input is not None:
-                for p in range(max_people):
-                    # A) DW Pose Body (18 Punkte)
-                    for j in range(18):
-                        last_valid = -1
-                        for i in range(len(dw_pose_input)):
-                            cand = dw_pose_input[i].get("bodies", {}).get("candidate", [])
-                            valid, pt = False, None
-                            
-                            if isinstance(cand, list) and p < len(cand) and len(cand[p]) > j and cand[p][j][0] > 0:
-                                valid, pt = True, cand[p][j]
-                            elif isinstance(cand, np.ndarray) and p < cand.shape[0] and len(cand[p]) > j and cand[p][j][0] > 0:
-                                valid, pt = True, cand[p][j]
-                                    
-                            if valid:
-                                if last_valid != -1 and i - last_valid > 1:
-                                    start_cand = dw_pose_input[last_valid]["bodies"]["candidate"]
-                                    start_pt = start_cand[p][j] if isinstance(start_cand, list) else start_cand[p][j]
-                                    steps = i - last_valid
-                                    for step in range(1, steps):
-                                        frac = step / steps
-                                        ix = start_pt[0] + (pt[0] - start_pt[0]) * frac
-                                        iy = start_pt[1] + (pt[1] - start_pt[1]) * frac
-                                        
-                                        step_cand = dw_pose_input[last_valid+step].get("bodies", {}).get("candidate", [])
-                                        if isinstance(step_cand, list) and p < len(step_cand) and len(step_cand[p]) > j:
-                                            step_cand[p][j] = [ix, iy]
-                                        elif isinstance(step_cand, np.ndarray) and p < step_cand.shape[0] and len(step_cand[p]) > j:
-                                            step_cand[p][j] = [ix, iy]
-                                last_valid = i
-
-                    # B) DW Pose HÄNDE (21 Punkte pro Hand, Links und Rechts)
-                    for h_idx in [0, 1]:
-                        hand_offset = p * 2 + h_idx
-                        for j in range(21):
-                            last_valid = -1
-                            for i in range(len(dw_pose_input)):
-                                dw_hands = dw_pose_input[i].get("hands", [])
-                                valid, pt = False, None
-                                if len(dw_hands) > hand_offset:
-                                    h_arr = dw_hands[hand_offset]
-                                    if len(h_arr) > j and h_arr[j][0] > 0:
-                                        valid, pt = True, h_arr[j]
-                                
-                                if valid:
-                                    if last_valid != -1 and i - last_valid > 1:
-                                        start_pt = dw_pose_input[last_valid]["hands"][hand_offset][j]
-                                        steps = i - last_valid
-                                        for step in range(1, steps):
-                                            frac = step / steps
-                                            ix = start_pt[0] + (pt[0] - start_pt[0]) * frac
-                                            iy = start_pt[1] + (pt[1] - start_pt[1]) * frac
-                                            if len(dw_pose_input[last_valid+step].get("hands", [])) > hand_offset:
-                                                dw_pose_input[last_valid+step]["hands"][hand_offset][j][0] = ix
-                                                dw_pose_input[last_valid+step]["hands"][hand_offset][j][1] = iy
-                                    last_valid = i
-
-                    # C) DW Pose GESICHTER (68 Punkte)
-                    for j in range(68):
-                        last_valid = -1
-                        for i in range(len(dw_pose_input)):
-                            dw_faces = dw_pose_input[i].get("faces", [])
-                            valid, pt = False, None
-                            if len(dw_faces) > p:
-                                f_arr = dw_faces[p]
-                                if len(f_arr) > j and f_arr[j][0] > 0:
-                                    valid, pt = True, f_arr[j]
-                            
-                            if valid:
-                                if last_valid != -1 and i - last_valid > 1:
-                                    start_pt = dw_pose_input[last_valid]["faces"][p][j]
-                                    steps = i - last_valid
-                                    for step in range(1, steps):
-                                        frac = step / steps
-                                        ix = start_pt[0] + (pt[0] - start_pt[0]) * frac
-                                        iy = start_pt[1] + (pt[1] - start_pt[1]) * frac
-                                        if len(dw_pose_input[last_valid+step].get("faces", [])) > p:
-                                            dw_pose_input[last_valid+step]["faces"][p][j][0] = ix
-                                            dw_pose_input[last_valid+step]["faces"][p][j][1] = iy
-                                last_valid = i
-        # ====================================================================
-
-        mimic_limb_seq = [
-            [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8], [8, 9], [9, 10], 
-            [1, 11], [11, 12], [12, 13], [1, 0], [0, 14], [14, 16], [0, 15], [15, 17]
-        ]
-
-        canvas_2d_frames = None
-        if dw_pose_input is not None and draw_hands_and_face:
-            # Hier nutzt draw_pose_to_canvas_np jetzt die wunderbar aufgefüllten Hände!
-            canvas_2d_frames = draw_pose_to_canvas_np(dw_pose_input, pool=None, H=height, W=width, reshape_scale=0, show_feet_flag=False, show_body_flag=False, show_cheek_flag=True, dw_hand=True, show_face_flag=True, show_hand_flag=True)
-
-        frames_mask = []
-
-        for i in range(len(all_frames_pts)):
-            mask_img = np.zeros((height, width), dtype=np.uint8)
-            pts_list = all_frames_pts[i]
-            
-            candidate = []
-            if dw_pose_input is not None and i < len(dw_pose_input):
-                dw_bodies = dw_pose_input[i].get("bodies", {})
-                candidate = dw_bodies.get("candidate", [])
-
-            for p, pts in enumerate(pts_list):
-                cand = None
-                if isinstance(candidate, list) and p < len(candidate):
-                    cand = candidate[p]
-                elif isinstance(candidate, np.ndarray) and p < candidate.shape[0]:
-                    cand = candidate[p]
-
-                nose, r_ear, l_ear = None, None, None
-                if cand is not None and len(cand) >= 18:
-                    if cand[0][0] > 0: nose = (int(cand[0][0]*width), int(cand[0][1]*height))
-                    if cand[16][0] > 0: r_ear = (int(cand[16][0]*width), int(cand[16][1]*height))
-                    if cand[17][0] > 0: l_ear = (int(cand[17][0]*width), int(cand[17][1]*height))
-
-                if head_circle_radius > 0 and nose is not None:
-                    cv2.circle(mask_img, nose, head_circle_radius, 255, -1, lineType=cv2.LINE_AA)
-
-                if draw_neck_polygon and pts[2] is not None and pts[5] is not None:
-                    r_shoulder, l_shoulder = (pts[2][0], pts[2][1]), (pts[5][0], pts[5][1])
-                    poly_pts = []
-                    if r_ear: poly_pts.append(r_ear)
-                    elif nose: poly_pts.append(nose)
-                    if l_ear: poly_pts.append(l_ear)
-                    elif nose and not poly_pts: poly_pts.append(nose)
-                    poly_pts.extend([l_shoulder, r_shoulder])
-                    
-                    if len(poly_pts) >= 3:
-                        cv2.fillPoly(mask_img, [np.array(poly_pts)], 255)
-
-                if draw_body_rectangle:
-                    if pts[2] is not None and pts[5] is not None and pts[11] is not None and pts[8] is not None:
-                        rect_cnt = np.array([[pts[2][0], pts[2][1]], [pts[5][0], pts[5][1]], [pts[11][0], pts[11][1]], [pts[8][0], pts[8][1]]])
-                        cv2.fillPoly(mask_img, [rect_cnt], 255)
-
-                if draw_hip_circles and pts[8] is not None and pts[11] is not None and pts[2] is not None and pts[5] is not None:
-                    dist_r = math.hypot(pts[2][0] - pts[8][0], pts[2][1] - pts[8][1])
-                    dist_l = math.hypot(pts[5][0] - pts[11][0], pts[5][1] - pts[11][1])
-                    torso_len = (dist_r + dist_l) / 2.0
-                    pixel_r = max(2, int(torso_len * hip_circle_scale))
-                    
-                    cv2.circle(mask_img, (pts[8][0], pts[8][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
-                    cv2.circle(mask_img, (pts[11][0], pts[11][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
-
-                for limb in mimic_limb_seq:
-                    if pts[limb[0]] is not None and pts[limb[1]] is not None:
-                        cv2.line(mask_img, (pts[limb[0]][0], pts[limb[0]][1]), (pts[limb[1]][0], pts[limb[1]][1]), 255, stick_width, lineType=cv2.LINE_AA)
-
-            if canvas_2d_frames is not None and i < len(canvas_2d_frames):
-                canvas_img = canvas_2d_frames[i]
-                hf_mask = np.where(np.any(canvas_img > 0, axis=-1), 255, 0).astype(np.uint8)
-                
-                if hands_face_dilate > 0:
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hands_face_dilate, hands_face_dilate))
-                    hf_mask = cv2.dilate(hf_mask, kernel, iterations=1)
-                
-                mask_img = np.maximum(mask_img, hf_mask)
-
-            frames_mask.append(mask_img)
-
-        mask_tensor = torch.from_numpy(np.stack(frames_mask, axis=0)).float() / 255.0
-        return (mask_tensor,)
-
-class NLFDataToMaskV4:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -15888,6 +15647,271 @@ class NLFDataToMaskV4:
 
         mask_tensor = torch.from_numpy(np.stack(frames_mask, axis=0)).float() / 255.0
         return (mask_tensor,)
+
+
+
+class NLFDataToMaskV4:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "nlf_data_for_mask": ("NLF_MASK_DATA", {"tooltip": "Der Output aus Mimic 14"}),
+                
+                # NEU: 3D Skalierung für die Körper-Sticks
+                "stick_3d_scale": ("FLOAT", {"default": 50.0, "min": 1.0, "max": 3000.0, "step": 1.0, "tooltip": "3D-Dicke der Knochen (skaliert mit Z-Tiefe)"}),
+                
+                "head_circle_scale": ("FLOAT", {"default": 150.0, "min": 1.0, "max": 3000.0, "step": 5.0, "tooltip": "3D-Radius (Zentrum: DW-Nase XY, Tiefe: NLF-Hals Z)"}),
+                "draw_neck_polygon": ("BOOLEAN", {"default": True, "tooltip": "Verbindet DW-Ohren mit NLF-Schultern"}),
+                "draw_body_rectangle": ("BOOLEAN", {"default": True, "tooltip": "Viereck zwischen Schultern und Hüfte"}),
+                "draw_hip_circles": ("BOOLEAN", {"default": True, "tooltip": "Kugeln fürs Hinterteil"}),
+                "hip_circle_scale": ("FLOAT", {"default": 0.4, "min": 0.05, "max": 5.0, "step": 0.05, "tooltip": "Größe basierend auf der Rumpflänge"}),
+                "draw_hands_and_face": ("BOOLEAN", {"default": True}),
+                
+                # NEU: 3D Skalierung für das Aufblähen der Hände
+                "hands_face_dilate_scale": ("FLOAT", {"default": 15.0, "min": 0.0, "max": 1000.0, "step": 1.0, "tooltip": "3D-Skalierung für die Dicke von Händen und Gesicht"}),
+                
+                "interpolate_missing_frames": ("BOOLEAN", {"default": True, "tooltip": "Füllt Lücken linear auf (Körper, Gesicht & Hände)"})
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/SCAIL"
+    DESCRIPTION = "Masken Generator V3 (Vollständiges 3D-Volumen: Sticks und Hände skalieren jetzt mit Z-Tiefe!)."
+
+    def process(self, nlf_data_for_mask, stick_3d_scale, head_circle_scale, draw_neck_polygon, draw_body_rectangle, draw_hip_circles, hip_circle_scale, draw_hands_and_face, hands_face_dilate_scale, interpolate_missing_frames):
+        import numpy as np
+        import torch
+        import cv2
+        import math
+        import copy
+        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+
+        if not nlf_data_for_mask:
+            return (torch.zeros((1, 512, 512)),)
+
+        all_frames_pts = copy.deepcopy(nlf_data_for_mask["all_frames_pts"])
+        dw_pose_input = copy.deepcopy(nlf_data_for_mask["dw_pose_input"])
+        width = nlf_data_for_mask["width"]
+        height = nlf_data_for_mask["height"]
+        focal_length = nlf_data_for_mask["focal_length"]
+
+        # ====================================================================
+        # LINEARE INTERPOLATION FÜR KÖRPER, HÄNDE UND GESICHT
+        # ====================================================================
+        if interpolate_missing_frames:
+            max_people = max([len(f) for f in all_frames_pts]) if all_frames_pts else 0
+            
+            # 1. NLF Punkte Interpolieren
+            for p in range(max_people):
+                for j in range(18):
+                    last_valid = -1
+                    for i in range(len(all_frames_pts)):
+                        valid = False
+                        if p < len(all_frames_pts[i]) and len(all_frames_pts[i][p]) > j:
+                            if all_frames_pts[i][p][j] is not None:
+                                valid = True
+                                
+                        if valid:
+                            if last_valid != -1 and i - last_valid > 1:
+                                start_pt = all_frames_pts[last_valid][p][j]
+                                end_pt = all_frames_pts[i][p][j]
+                                steps = i - last_valid
+                                for step in range(1, steps):
+                                    frac = step / steps
+                                    ix = int(start_pt[0] + (end_pt[0] - start_pt[0]) * frac)
+                                    iy = int(start_pt[1] + (end_pt[1] - start_pt[1]) * frac)
+                                    iz = start_pt[2] + (end_pt[2] - start_pt[2]) * frac
+                                    
+                                    while len(all_frames_pts[last_valid+step]) <= p:
+                                        all_frames_pts[last_valid+step].append([None]*18)
+                                    while len(all_frames_pts[last_valid+step][p]) <= j:
+                                        all_frames_pts[last_valid+step][p].append(None)
+                                        
+                                    all_frames_pts[last_valid+step][p][j] = [ix, iy, iz]
+                            last_valid = i
+
+            # 2. DW Pose Interpolieren
+            if dw_pose_input is not None:
+                for p in range(max_people):
+                    for j in range(18):
+                        last_valid = -1
+                        for i in range(len(dw_pose_input)):
+                            cand = dw_pose_input[i].get("bodies", {}).get("candidate", [])
+                            valid, pt = False, None
+                            if isinstance(cand, list) and p < len(cand) and len(cand[p]) > j and cand[p][j][0] > 0:
+                                valid, pt = True, cand[p][j]
+                            elif isinstance(cand, np.ndarray) and p < cand.shape[0] and len(cand[p]) > j and cand[p][j][0] > 0:
+                                valid, pt = True, cand[p][j]
+                            if valid:
+                                if last_valid != -1 and i - last_valid > 1:
+                                    start_cand = dw_pose_input[last_valid]["bodies"]["candidate"]
+                                    start_pt = start_cand[p][j] if isinstance(start_cand, list) else start_cand[p][j]
+                                    steps = i - last_valid
+                                    for step in range(1, steps):
+                                        frac = step / steps
+                                        ix = start_pt[0] + (pt[0] - start_pt[0]) * frac
+                                        iy = start_pt[1] + (pt[1] - start_pt[1]) * frac
+                                        step_cand = dw_pose_input[last_valid+step].get("bodies", {}).get("candidate", [])
+                                        if isinstance(step_cand, list) and p < len(step_cand) and len(step_cand[p]) > j: step_cand[p][j] = [ix, iy]
+                                        elif isinstance(step_cand, np.ndarray) and p < step_cand.shape[0] and len(step_cand[p]) > j: step_cand[p][j] = [ix, iy]
+                                last_valid = i
+
+                    for h_idx in [0, 1]:
+                        hand_offset = p * 2 + h_idx
+                        last_valid = -1
+                        for i in range(len(dw_pose_input)):
+                            dw_hands = dw_pose_input[i].get("hands", [])
+                            valid = False
+                            if len(dw_hands) > hand_offset:
+                                h_arr = np.array(dw_hands[hand_offset])
+                                if np.sum(np.abs(h_arr)) > 0.01: valid = True
+                            if valid:
+                                if last_valid != -1 and i - last_valid > 1:
+                                    start_hand = np.array(dw_pose_input[last_valid]["hands"][hand_offset])
+                                    end_hand = np.array(dw_pose_input[i]["hands"][hand_offset])
+                                    steps = i - last_valid
+                                    for step in range(1, steps):
+                                        frac = step / steps
+                                        interp_hand = start_hand + (end_hand - start_hand) * frac
+                                        if len(dw_pose_input[last_valid+step].get("hands", [])) <= hand_offset:
+                                            if "hands" not in dw_pose_input[last_valid+step]: dw_pose_input[last_valid+step]["hands"] = []
+                                            while len(dw_pose_input[last_valid+step]["hands"]) <= hand_offset: dw_pose_input[last_valid+step]["hands"].append(np.zeros_like(start_hand))
+                                        dw_pose_input[last_valid+step]["hands"][hand_offset] = interp_hand
+                                last_valid = i
+
+                    last_valid = -1
+                    for i in range(len(dw_pose_input)):
+                        dw_faces = dw_pose_input[i].get("faces", [])
+                        valid = False
+                        if len(dw_faces) > p:
+                            f_arr = np.array(dw_faces[p])
+                            if np.sum(np.abs(f_arr)) > 0.01: valid = True
+                        if valid:
+                            if last_valid != -1 and i - last_valid > 1:
+                                start_face = np.array(dw_pose_input[last_valid]["faces"][p])
+                                end_face = np.array(dw_pose_input[i]["faces"][p])
+                                steps = i - last_valid
+                                for step in range(1, steps):
+                                    frac = step / steps
+                                    interp_face = start_face + (end_face - start_face) * frac
+                                    if len(dw_pose_input[last_valid+step].get("faces", [])) <= p:
+                                        if "faces" not in dw_pose_input[last_valid+step]: dw_pose_input[last_valid+step]["faces"] = []
+                                        while len(dw_pose_input[last_valid+step]["faces"]) <= p: dw_pose_input[last_valid+step]["faces"].append(np.zeros_like(start_face))
+                                    dw_pose_input[last_valid+step]["faces"][p] = interp_face
+                            last_valid = i
+        # ====================================================================
+
+        mimic_limb_seq = [
+            [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8], [8, 9], [9, 10], 
+            [1, 11], [11, 12], [12, 13], [1, 0], [0, 14], [14, 16], [0, 15], [15, 17]
+        ]
+
+        canvas_2d_frames = None
+        if dw_pose_input is not None and draw_hands_and_face:
+            canvas_2d_frames = draw_pose_to_canvas_np(dw_pose_input, pool=None, H=height, W=width, reshape_scale=0, show_feet_flag=False, show_body_flag=False, show_cheek_flag=True, dw_hand=True, show_face_flag=True, show_hand_flag=True)
+
+        frames_mask = []
+
+        for i in range(len(all_frames_pts)):
+            mask_img = np.zeros((height, width), dtype=np.uint8)
+            pts_list = all_frames_pts[i]
+            
+            # Sammle durchschnittliche Z-Tiefe dieses Frames (für Hände/Gesichts-Skalierung)
+            frame_z_depths = []
+            
+            candidate = []
+            if dw_pose_input is not None and i < len(dw_pose_input):
+                dw_bodies = dw_pose_input[i].get("bodies", {})
+                candidate = dw_bodies.get("candidate", [])
+
+            for p, pts in enumerate(pts_list):
+                if pts[0] is not None:
+                    frame_z_depths.append(abs(pts[0][2]))
+                
+                cand = None
+                if isinstance(candidate, list) and p < len(candidate): cand = candidate[p]
+                elif isinstance(candidate, np.ndarray) and p < candidate.shape[0]: cand = candidate[p]
+
+                nose, r_ear, l_ear = None, None, None
+                if cand is not None and len(cand) >= 18:
+                    if cand[0][0] > 0: nose = (int(cand[0][0]*width), int(cand[0][1]*height))
+                    if cand[16][0] > 0: r_ear = (int(cand[16][0]*width), int(cand[16][1]*height))
+                    if cand[17][0] > 0: l_ear = (int(cand[17][0]*width), int(cand[17][1]*height))
+
+                # HYBRIDE 3D KOPF KUGEL
+                center_xy = nose
+                if center_xy is None and pts[0] is not None: center_xy = (pts[0][0], pts[0][1])
+                if head_circle_scale > 0 and center_xy is not None and pts[0] is not None:
+                    z_depth = max(0.1, abs(pts[0][2]))
+                    pixel_r = max(2, int((head_circle_scale * focal_length) / z_depth))
+                    cv2.circle(mask_img, center_xy, pixel_r, 255, -1, lineType=cv2.LINE_AA)
+
+                # Hals Polygon
+                if draw_neck_polygon and pts[2] is not None and pts[5] is not None:
+                    r_shoulder, l_shoulder = (pts[2][0], pts[2][1]), (pts[5][0], pts[5][1])
+                    poly_pts = []
+                    if r_ear: poly_pts.append(r_ear)
+                    elif nose: poly_pts.append(nose)
+                    if l_ear: poly_pts.append(l_ear)
+                    elif nose and not poly_pts: poly_pts.append(nose)
+                    poly_pts.extend([l_shoulder, r_shoulder])
+                    if len(poly_pts) >= 3:
+                        cv2.fillPoly(mask_img, [np.array(poly_pts)], 255)
+
+                # Rumpf Viereck
+                if draw_body_rectangle:
+                    if pts[2] is not None and pts[5] is not None and pts[11] is not None and pts[8] is not None:
+                        rect_cnt = np.array([[pts[2][0], pts[2][1]], [pts[5][0], pts[5][1]], [pts[11][0], pts[11][1]], [pts[8][0], pts[8][1]]])
+                        cv2.fillPoly(mask_img, [rect_cnt], 255)
+
+                # Hüft Kreise
+                if draw_hip_circles and pts[8] is not None and pts[11] is not None and pts[2] is not None and pts[5] is not None:
+                    dist_r = math.hypot(pts[2][0] - pts[8][0], pts[2][1] - pts[8][1])
+                    dist_l = math.hypot(pts[5][0] - pts[11][0], pts[5][1] - pts[11][1])
+                    torso_len = (dist_r + dist_l) / 2.0
+                    pixel_r = max(2, int(torso_len * hip_circle_scale))
+                    cv2.circle(mask_img, (pts[8][0], pts[8][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
+                    cv2.circle(mask_img, (pts[11][0], pts[11][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
+
+                # --- NEU: Körper Sticks in echtem 3D ---
+                for limb in mimic_limb_seq:
+                    if pts[limb[0]] is not None and pts[limb[1]] is not None:
+                        pt1, pt2 = pts[limb[0]], pts[limb[1]]
+                        
+                        # Durchschnittliche Z-Tiefe dieses spezifischen Knochens
+                        limb_z_depth = max(0.1, (abs(pt1[2]) + abs(pt2[2])) / 2.0)
+                        
+                        # 3D Pixel-Dicke berechnen
+                        thickness = max(1, int((stick_3d_scale * focal_length) / limb_z_depth))
+                        
+                        cv2.line(mask_img, (pt1[0], pt1[1]), (pt2[0], pt2[1]), 255, thickness, lineType=cv2.LINE_AA)
+
+            # --- NEU: Dicke Hände & Gesicht in echtem 3D ---
+            if canvas_2d_frames is not None and i < len(canvas_2d_frames):
+                canvas_img = canvas_2d_frames[i]
+                hf_mask = np.where(np.any(canvas_img > 0, axis=-1), 255, 0).astype(np.uint8)
+                
+                if hands_face_dilate_scale > 0:
+                    # Nimm die durchschnittliche Z-Tiefe der Figuren in diesem Frame (Fallback 1000)
+                    avg_z_depth = sum(frame_z_depths) / len(frame_z_depths) if frame_z_depths else 1000.0
+                    avg_z_depth = max(0.1, avg_z_depth)
+                    
+                    # 3D Skalierung der Dilatation
+                    dilate_size = max(1, int((hands_face_dilate_scale * focal_length) / avg_z_depth))
+                    
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
+                    hf_mask = cv2.dilate(hf_mask, kernel, iterations=1)
+                    
+                mask_img = np.maximum(mask_img, hf_mask)
+
+            frames_mask.append(mask_img)
+
+        mask_tensor = torch.from_numpy(np.stack(frames_mask, axis=0)).float() / 255.0
+        return (mask_tensor,)
+
+
 
 class NLFDataHandDebugV3:
     @classmethod
