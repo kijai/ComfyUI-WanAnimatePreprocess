@@ -15660,7 +15660,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV48": "Pose Global Perspective Scaler V48",
     "PoseGlobalPerspectiveScalerV49": "Pose Global Perspective Scaler V49",
     "NLFDataToMaskV2": "NLF Data to Mask V2 (3D)",
-    "RenderNLFPosesDirectPoseDataMimic15: "Render NLF Poses Mimic 15 (Flat 3D PoseData)",
+    "RenderNLFPosesDirectPoseDataMimic15": "Render NLF Poses Mimic 15 (Flat 3D PoseData)",
     "NLFDataToMaskV3": "NLF Data to Mask V3",
     
 }
