@@ -15399,7 +15399,7 @@ class NLFDataToMaskV3:
                 "draw_neck_polygon": ("BOOLEAN", {"default": True, "tooltip": "Verbindet DW-Ohren mit NLF-Schultern"}),
                 "draw_body_rectangle": ("BOOLEAN", {"default": True, "tooltip": "Viereck zwischen Schultern und Hüfte"}),
                 "draw_hip_circles": ("BOOLEAN", {"default": True, "tooltip": "Kugeln fürs Hinterteil"}),
-                "hip_circle_scale": ("FLOAT", {"default": 1.2, "min": 0.1, "max": 5.0, "step": 0.1, "tooltip": "Größe der Hüft-Kreise basierend auf dem Hüftabstand (1.0 = Kreise berühren sich mittig)"}),
+                "hip_circle_scale": ("FLOAT", {"default": 0.4, "min": 0.05, "max": 5.0, "step": 0.05, "tooltip": "Größe basierend auf der Rumpflänge (Verschwindet NICHT in der Seitenansicht!)"}),
                 "draw_hands_and_face": ("BOOLEAN", {"default": True}),
                 "hands_face_dilate": ("INT", {"default": 8, "min": 0, "max": 50, "tooltip": "Bläht die Hände und Gesichtslinien auf (Wie Stick-Width für Hände)"})
             }
@@ -15409,7 +15409,7 @@ class NLFDataToMaskV3:
     RETURN_NAMES = ("mask",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Masken Generator V3 (Robuste 2D/3D Kreise, DW-Ohren Hals, dynamische Hüften, dicke Hände)."
+    DESCRIPTION = "Masken Generator V3 (Robuste 3D-Kugeln für Hüften über Rumpflänge, fester DW-Kopfkreis, dicke Hände)."
 
     def process(self, nlf_data_for_mask, stick_width, head_circle_radius, draw_neck_polygon, draw_body_rectangle, draw_hip_circles, hip_circle_scale, draw_hands_and_face, hands_face_dilate):
         import numpy as np
@@ -15497,14 +15497,15 @@ class NLFDataToMaskV3:
                         ])
                         cv2.fillPoly(mask_img, [rect_cnt], 255)
 
-                # --- 5. Hüft-Kreise (Dynamischer 3D-Radius über Pixel-Abstand) ---
-                if draw_hip_circles and pts[8] is not None and pts[11] is not None:
-                    # Brillanter Trick: Wir messen den Pixelabstand zwischen linker und rechter Hüfte.
-                    # Wenn die Figur nach hinten geht, schrumpft der Abstand -> Die Kreise schrumpfen mit!
-                    hip_dist = math.hypot(pts[8][0] - pts[11][0], pts[8][1] - pts[11][1])
+                # --- 5. Hüft-Kreise (Skalierung über Rumpflänge - Verschwindet nicht von der Seite!) ---
+                if draw_hip_circles and pts[8] is not None and pts[11] is not None and pts[2] is not None and pts[5] is not None:
+                    # Rumpflänge messen (Schulter bis Hüfte vertikal)
+                    dist_r = math.hypot(pts[2][0] - pts[8][0], pts[2][1] - pts[8][1])
+                    dist_l = math.hypot(pts[5][0] - pts[11][0], pts[5][1] - pts[11][1])
+                    torso_len = (dist_r + dist_l) / 2.0
                     
-                    # Radius berechnen (hip_dist / 2 bedeutet die Kreise berühren sich bei Scale 1.0 genau in der Mitte)
-                    pixel_r = max(2, int((hip_dist / 2.0) * hip_circle_scale))
+                    # Radius anhand der Rumpflänge berechnen
+                    pixel_r = max(2, int(torso_len * hip_circle_scale))
                     
                     cv2.circle(mask_img, (pts[8][0], pts[8][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
                     cv2.circle(mask_img, (pts[11][0], pts[11][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
