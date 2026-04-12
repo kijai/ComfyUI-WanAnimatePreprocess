@@ -15516,6 +15516,149 @@ class NLFDataToMaskV3:
         return (mask_tensor,)
 
 
+class NLFDataHandDebugV3:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "nlf_data": ("NLF_DATA",),
+                # Zentimeter-Angabe mit extrem hoher Grenze für maximale Freiheit
+                "min_hand_dist_cm": ("FLOAT", {"default": 15.0, "min": 0.0, "max": 1000.0, "step": 0.1}),
+                "smooth_entry": ("BOOLEAN", {"default": True}),
+                # Prozentualer Anteil der Torso-Länge für den sanften Übergang
+                "smooth_threshold_body_pct": ("FLOAT", {"default": 15.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "move_elbows": ("BOOLEAN", {"default": True}),
+                # Wie viel Prozent der Hand-Verschiebung soll auf den Ellbogen übertragen werden?
+                "elbow_move_percent": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 100.0, "step": 1.0}),
+                # Der magische Toggle: Behält die exakten Knochenlängen bei (Anti-Stretching)
+                "keep_arm_length": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("NLF_DATA",)
+    FUNCTION = "apply_collision"
+    CATEGORY = "WanAnimate/NLF"
+
+    def solve_fabrik(self, p_shoulder, p_elbow, p_wrist, target_wrist):
+        """ Leichtgewichtiges FABRIK (Inverse Kinematik) um Knochenlängen exakt zu erhalten """
+        L1 = np.linalg.norm(p_elbow - p_shoulder)
+        L2 = np.linalg.norm(p_wrist - p_elbow)
+        max_reach = L1 + L2
+        
+        reach_vec = target_wrist - p_shoulder
+        reach_dist = np.linalg.norm(reach_vec)
+        
+        # Wenn die Hand weiter weggezogen wird, als der Arm lang ist -> Arm komplett durchstrecken
+        if reach_dist >= max_reach:
+            dir_w = reach_vec / (reach_dist + 1e-8)
+            new_e = p_shoulder + dir_w * L1
+            new_w = new_e + dir_w * L2
+            return new_e, new_w
+            
+        # 1-Pass FABRIK für korrekte Gelenk-Winkel
+        # Rückwärtsgang (Ziel zur Schulter)
+        w_prime = target_wrist
+        dir_e = p_elbow - w_prime
+        e_prime = w_prime + (dir_e / (np.linalg.norm(dir_e) + 1e-8)) * L2
+        
+        # Vorwärtsgang (Schulter zum Ziel)
+        dir_e2 = e_prime - p_shoulder
+        new_e = p_shoulder + (dir_e2 / (np.linalg.norm(dir_e2) + 1e-8)) * L1
+        dir_w2 = w_prime - new_e
+        new_w = new_e + (dir_w2 / (np.linalg.norm(dir_w2) + 1e-8)) * L2
+        
+        return new_e, new_w
+
+    def apply_collision(self, nlf_data, min_hand_dist_cm, smooth_entry, 
+                        smooth_threshold_body_pct, move_elbows, 
+                        elbow_move_percent, keep_arm_length):
+        
+        # Regel 1: Keine Originaldaten zerstören
+        new_data = copy.deepcopy(nlf_data)
+        
+        # SMPL 3D Indizes (Standard)
+        HIP = 0
+        L_SHOULDER, L_ELBOW, L_WRIST, L_HAND = 16, 18, 20, 22
+        R_SHOULDER, R_ELBOW, R_WRIST, R_HAND = 17, 19, 21, 23
+        NECK = 12 # Wird für Torso-Berechnung oft genutzt, wir nehmen aber Mid-Shoulder
+        
+        # Umrechnung Zentimeter in Meter (NLF-Einheiten)
+        min_dist_m = min_hand_dist_cm / 100.0
+        
+        for frame_idx in range(len(new_data)):
+            if 'joints_3d' not in new_data[frame_idx]:
+                continue
+            
+            # Numpy Array erzwingen für Vektor-Mathematik
+            joints = np.array(new_data[frame_idx]['joints_3d'], dtype=np.float32)
+            
+            # 1. Dynamische Körperberechnung (Torso-Länge)
+            mid_shoulder = (joints[L_SHOULDER] + joints[R_SHOULDER]) / 2.0
+            torso_length = np.linalg.norm(mid_shoulder - joints[HIP])
+            
+            # Smooth Zone in Metern, abhängig von der Körpergröße des Charakters!
+            smooth_zone_m = (smooth_threshold_body_pct / 100.0) * torso_length if smooth_entry else 0.0
+            trigger_dist = min_dist_m + smooth_zone_m
+            
+            def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand):
+                hip_pos = joints[HIP]
+                wrist_pos = joints[idx_wrist]
+                
+                vec = wrist_pos - hip_pos
+                dist = np.linalg.norm(vec)
+                
+                # Wenn das Handgelenk innerhalb der Gefahrenzone (oder Pufferzone) ist
+                if dist < trigger_dist and dist > 0.001:
+                    dir_vec = vec / dist
+                    
+                    # 2. Smooth Entry Logik berechnen
+                    if dist < min_dist_m:
+                        # Hartes Limit überschritten: Schiebe es auf Minimum + die halbe Pufferzone zurück
+                        push_amount = (min_dist_m - dist) + (smooth_zone_m * 0.5)
+                    else:
+                        # In der Pufferzone: weiche parabolische Kurve (C1 stetig)
+                        t = (trigger_dist - dist) / smooth_zone_m
+                        push_amount = (smooth_zone_m * 0.5) * (t ** 2)
+                        
+                    # 3. Offsets anwenden
+                    target_wrist = joints[idx_wrist] + dir_vec * push_amount
+                    target_hand = joints[idx_hand] + dir_vec * push_amount # Finger gehen einfach mit
+                    
+                    target_elbow = joints[idx_elbow]
+                    if move_elbows:
+                        target_elbow += dir_vec * push_amount * (elbow_move_percent / 100.0)
+                        
+                    # 4. Skelett-Länge korrigieren (Skelett-Erhaltung an/aus)
+                    if keep_arm_length:
+                        # Berechne perfekten Ellbogen und Handgelenk mit FABRIK
+                        new_e, new_w = self.solve_fabrik(joints[idx_shoulder], target_elbow, target_wrist, target_wrist)
+                        
+                        # Finger (Hand) ans neue Handgelenk anhängen (gleicher relativer Abstand)
+                        hand_offset = joints[idx_hand] - joints[idx_wrist]
+                        joints[idx_hand] = new_w + hand_offset
+                        
+                        # Finale Zuweisung
+                        joints[idx_elbow] = new_e
+                        joints[idx_wrist] = new_w
+                    else:
+                        # Einfaches "Stretching" (Knochen werden länger)
+                        joints[idx_wrist] = target_wrist
+                        joints[idx_hand] = target_hand
+                        joints[idx_elbow] = target_elbow
+
+            # Beide Arme prüfen
+            process_arm(L_SHOULDER, L_ELBOW, L_WRIST, L_HAND)
+            process_arm(R_SHOULDER, R_ELBOW, R_WRIST, R_HAND)
+            
+            # Wieder in das Original-Format des Backends umwandeln (Liste, falls es eine Liste war)
+            if isinstance(new_data[frame_idx]['joints_3d'], list):
+                new_data[frame_idx]['joints_3d'] = joints.tolist()
+            else:
+                new_data[frame_idx]['joints_3d'] = joints
+
+        return (new_data,)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -15598,6 +15741,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFDataToMaskV2": NLFDataToMaskV2,
     "RenderNLFPosesDirectPoseDataMimic15": RenderNLFPosesDirectPoseDataMimic15,
     "NLFDataToMaskV3": NLFDataToMaskV3,
+    "NLFDataHandDebugV3": NLFDataHandDebugV3,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -15682,6 +15826,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFDataToMaskV2": "NLF Data to Mask V2 (3D)",
     "RenderNLFPosesDirectPoseDataMimic15": "Render NLF Poses Mimic 15 (Flat 3D PoseData)",
     "NLFDataToMaskV3": "NLF Data to Mask V3",
+    "NLFDataHandDebugV3": "NLF Data Hand Debug V3 (Collision / IK)",
     
 }
 
