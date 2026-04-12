@@ -14954,6 +14954,117 @@ class PoseGlobalPerspectiveScalerV49:
         return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
 
 
+class NLFDataToMaskV2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "scaled_nlf_poses": ("NLFPRED", {"tooltip": "Der 'scaled_nlf_poses' Output aus Mimic 14"}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "stick_width": ("INT", {"default": 15, "min": 1, "max": 100, "tooltip": "Dicke der Knochenlinien in Pixeln"}),
+                "head_circle_in_norm": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 2.0, "step": 0.01, "tooltip": "3D-Radius für den Kopf (skaliert mit der Tiefe)"}),
+                "draw_head_shoulder_triangle": ("BOOLEAN", {"default": True, "tooltip": "Füllt das Dreieck zwischen Kopf und Schultern aus"}),
+                "draw_hip_circles": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet 3D Kugeln an den Hüften für das Hinterteil"}),
+                "hip_circle_in_norm": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.01, "tooltip": "3D-Radius für die Hüft-Kugeln"}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/SCAIL"
+    DESCRIPTION = "Erstellt eine Maske aus NLF Daten mit echten 3D-skalierten Kugeln (Kopf, Hüfte) und Schulter-Dreieck."
+
+    def process(self, scaled_nlf_poses, width, height, stick_width, head_circle_in_norm, draw_head_shoulder_triangle, draw_hip_circles, hip_circle_in_norm):
+        import numpy as np
+        import torch
+        import cv2
+        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
+
+        pose_input = scaled_nlf_poses['joints3d_nonparam'][0] if isinstance(scaled_nlf_poses, dict) else scaled_nlf_poses
+        intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
+        focal_length = intrinsic_matrix[0, 0] # fx für die 3D Skalierung der Kreise
+
+        # COCO Format Mapping (für den Zugriff auf Kopf, Schultern, Hüften)
+        mimic_limb_seq = [
+            [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8], [8, 9], [9, 10], 
+            [1, 11], [11, 12], [12, 13], [1, 0], [0, 14], [14, 16], [0, 15], [15, 17]
+        ]
+
+        frames_mask = []
+
+        for i in range(len(pose_input)):
+            # Schwarzer Hintergrund für die Maske
+            mask_img = np.zeros((height, width), dtype=np.uint8)
+            
+            if pose_input[i] is not None:
+                joints3d_batch = pose_input[i]
+                people = joints3d_batch if joints3d_batch.dim() == 3 else [joints3d_batch] if joints3d_batch.dim() == 2 else []
+
+                all_pts_2d_with_z = []
+                for joints3d in people:
+                    j3d_np = joints3d.cpu().numpy() if isinstance(joints3d, torch.Tensor) else joints3d
+                    if np.sum(np.abs(j3d_np)) > 0.01:
+                        j3d_coco = process_data_to_COCO_format(j3d_np)
+                        pts_2d_with_z = []
+                        for pt3d in j3d_coco:
+                            if np.sum(np.abs(pt3d)) > 0:
+                                pt2d = p3d_single_p2d(pt3d, intrinsic_matrix)
+                                # Speichere X, Y und die Z-Tiefe!
+                                pts_2d_with_z.append([int(pt2d[0]), int(pt2d[1]), float(pt3d[2])])
+                            else:
+                                pts_2d_with_z.append(None)
+                                
+                        # Schultern mitteln für den Hals (wie in Mimic)
+                        if len(pts_2d_with_z) > 5 and pts_2d_with_z[2] is not None and pts_2d_with_z[5] is not None:
+                            if pts_2d_with_z[1] is not None:
+                                pts_2d_with_z[1][0] = int((pts_2d_with_z[2][0] + pts_2d_with_z[5][0]) / 2)
+                                pts_2d_with_z[1][1] = int((pts_2d_with_z[2][1] + pts_2d_with_z[5][1]) / 2)
+
+                        all_pts_2d_with_z.append(pts_2d_with_z)
+
+                for pts in all_pts_2d_with_z:
+                    # 1. Knochen (Sticks) zeichnen
+                    for limb in mimic_limb_seq:
+                        if pts[limb[0]] is not None and pts[limb[1]] is not None:
+                            pt1 = (pts[limb[0]][0], pts[limb[0]][1])
+                            pt2 = (pts[limb[1]][0], pts[limb[1]][1])
+                            cv2.line(mask_img, pt1, pt2, 255, stick_width, lineType=cv2.LINE_AA)
+
+                    # 2. Dreieck (Nase/Kopf -> Rechte Schulter -> Linke Schulter)
+                    if draw_head_shoulder_triangle:
+                        if pts[0] is not None and pts[2] is not None and pts[5] is not None:
+                            triangle_cnt = np.array([
+                                [pts[0][0], pts[0][1]],  # Nase
+                                [pts[2][0], pts[2][1]],  # Schulter R
+                                [pts[5][0], pts[5][1]]   # Schulter L
+                            ])
+                            cv2.fillPoly(mask_img, [triangle_cnt], 255)
+
+                    # 3. Head Circle (Nase = Index 0) mit echtem 3D-Radius
+                    if head_circle_in_norm > 0 and pts[0] is not None:
+                        nose_z = pts[0][2]
+                        if nose_z > 0:
+                            # 3D Skalierung: Radius in Pixeln = Norm_Radius * Focal_Length / Tiefe (Z)
+                            pixel_r = int((head_circle_in_norm * focal_length) / nose_z)
+                            cv2.circle(mask_img, (pts[0][0], pts[0][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
+
+                    # 4. Hip Circles / Hinterteil (R_Hip = Index 8, L_Hip = Index 11)
+                    if draw_hip_circles and hip_circle_in_norm > 0:
+                        for hip_idx in [8, 11]:
+                            if pts[hip_idx] is not None:
+                                hip_z = pts[hip_idx][2]
+                                if hip_z > 0:
+                                    pixel_r = int((hip_circle_in_norm * focal_length) / hip_z)
+                                    cv2.circle(mask_img, (pts[hip_idx][0], pts[hip_idx][1]), pixel_r, 255, -1, lineType=cv2.LINE_AA)
+
+            frames_mask.append(mask_img)
+
+        # Konvertiere Numpy Array (0-255) in ComfyUI Masken Tensor (B, H, W) im Bereich 0.0 - 1.0
+        mask_tensor = torch.from_numpy(np.stack(frames_mask, axis=0)).float() / 255.0
+        return (mask_tensor,)
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -15033,6 +15144,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFProportionalRetargeterV9": NLFProportionalRetargeterV9,
     "PoseGlobalPerspectiveScalerV48": PoseGlobalPerspectiveScalerV48,
     "PoseGlobalPerspectiveScalerV49": PoseGlobalPerspectiveScalerV49,
+    "NLFDataToMaskV2": NLFDataToMaskV2,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -15114,6 +15226,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFProportionalRetargeterV9": "NLF Proportional Retargeter V9",
     "PoseGlobalPerspectiveScalerV48": "Pose Global Perspective Scaler V48",
     "PoseGlobalPerspectiveScalerV49": "Pose Global Perspective Scaler V49",
+    "NLFDataToMaskV2": "NLF Data to Mask V2 (3D)",
     
 }
 
