@@ -16093,6 +16093,166 @@ class NLFDataHandDebugV3:
         return (new_data,)
 
 
+class NLFDataHandDebugV4:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "nlf_data": ("NLFPRED",),
+                "min_hand_dist_cm": ("FLOAT", {"default": 15.0, "min": 0.0, "max": 1000.0, "step": 0.1}),
+                "smooth_entry": ("BOOLEAN", {"default": True}),
+                # Wann fängt die Pufferzone an? (Prozent vom Oberkörper)
+                "smooth_zone_body_pct": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                # NEU: Wie stark/steil ist die Abstoßungskraft in der Pufferzone?
+                "smooth_strength": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
+                "move_elbows": ("BOOLEAN", {"default": True}),
+                "elbow_move_percent": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 100.0, "step": 1.0}),
+                "keep_arm_length": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("NLFPRED",)
+    FUNCTION = "apply_collision"
+    CATEGORY = "WanAnimate/NLF"
+
+    def solve_fabrik(self, p_shoulder, p_elbow, p_wrist, target_wrist):
+        import numpy as np
+        L1 = np.linalg.norm(p_elbow - p_shoulder)
+        L2 = np.linalg.norm(p_wrist - p_elbow)
+        max_reach = L1 + L2
+        
+        reach_vec = target_wrist - p_shoulder
+        reach_dist = np.linalg.norm(reach_vec)
+        
+        if reach_dist >= max_reach:
+            dir_w = reach_vec / (reach_dist + 1e-8)
+            new_e = p_shoulder + dir_w * L1
+            new_w = new_e + dir_w * L2
+            return new_e, new_w
+            
+        w_prime = target_wrist
+        dir_e = p_elbow - w_prime
+        e_prime = w_prime + (dir_e / (np.linalg.norm(dir_e) + 1e-8)) * L2
+        
+        dir_e2 = e_prime - p_shoulder
+        new_e = p_shoulder + (dir_e2 / (np.linalg.norm(dir_e2) + 1e-8)) * L1
+        dir_w2 = w_prime - new_e
+        new_w = new_e + (dir_w2 / (np.linalg.norm(dir_w2) + 1e-8)) * L2
+        
+        return new_e, new_w
+
+    def apply_collision(self, nlf_data, min_hand_dist_cm, smooth_entry, 
+                        smooth_zone_body_pct, smooth_strength, move_elbows, 
+                        elbow_move_percent, keep_arm_length):
+        
+        import copy
+        import numpy as np
+        import torch
+        
+        new_data = copy.deepcopy(nlf_data)
+        
+        is_dict = isinstance(new_data, dict)
+        if is_dict:
+            if 'joints3d_nonparam' in new_data:
+                frames = new_data['joints3d_nonparam'][0]
+            else:
+                return (new_data,)
+        else:
+            frames = new_data
+            
+        HIP = 0
+        L_SHOULDER, L_ELBOW, L_WRIST, L_HAND = 16, 18, 20, 22
+        R_SHOULDER, R_ELBOW, R_WRIST, R_HAND = 17, 19, 21, 23
+        
+        min_dist_m = min_hand_dist_cm / 100.0
+        
+        for frame_idx in range(len(frames)):
+            if frames[frame_idx] is None or len(frames[frame_idx]) == 0:
+                continue
+                
+            for person_idx in range(len(frames[frame_idx])):
+                person_data = frames[frame_idx][person_idx]
+                
+                is_tensor = isinstance(person_data, torch.Tensor)
+                if is_tensor:
+                    joints = person_data.cpu().numpy().copy()
+                else:
+                    joints = np.array(person_data, dtype=np.float32).copy()
+                    
+                has_extra_dim = joints.ndim == 3
+                if has_extra_dim:
+                    joints = joints[0]
+                    
+                if joints.shape[0] < 24:
+                    continue
+                
+                mid_shoulder = (joints[L_SHOULDER] + joints[R_SHOULDER]) / 2.0
+                torso_length = np.linalg.norm(mid_shoulder - joints[HIP])
+                if torso_length < 0.001:
+                    continue
+                
+                smooth_zone_m = (smooth_zone_body_pct / 100.0) * torso_length if smooth_entry else 0.0
+                trigger_dist = min_dist_m + smooth_zone_m
+                
+                def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand):
+                    hip_pos = joints[HIP]
+                    wrist_pos = joints[idx_wrist]
+                    
+                    vec = wrist_pos - hip_pos
+                    dist = np.linalg.norm(vec)
+                    
+                    if dist < trigger_dist and dist > 0.001:
+                        dir_vec = vec / dist
+                        
+                        if dist < min_dist_m:
+                            target_dist = min_dist_m
+                        else:
+                            # NEUE MATHEMATIK: Präzise Interpolation mit Steilheit
+                            t = (dist - min_dist_m) / smooth_zone_m # 0 an der Wand, 1 am Rand
+                            
+                            # smooth_strength wölbt die Kurve. Je höher, desto früher wird stark weggedrückt
+                            t_curved = t ** (1.0 / smooth_strength)
+                            
+                            target_dist = min_dist_m + smooth_zone_m * t_curved
+                            
+                        push_amount = target_dist - dist
+                        
+                        if push_amount > 0:
+                            target_wrist = joints[idx_wrist] + dir_vec * push_amount
+                            target_hand = joints[idx_hand] + dir_vec * push_amount 
+                            
+                            target_elbow = joints[idx_elbow].copy()
+                            if move_elbows:
+                                target_elbow += dir_vec * push_amount * (elbow_move_percent / 100.0)
+                                
+                            if keep_arm_length:
+                                new_e, new_w = self.solve_fabrik(joints[idx_shoulder], target_elbow, target_wrist, target_wrist)
+                                hand_offset = joints[idx_hand] - joints[idx_wrist]
+                                joints[idx_hand] = new_w + hand_offset
+                                joints[idx_elbow] = new_e
+                                joints[idx_wrist] = new_w
+                            else:
+                                joints[idx_wrist] = target_wrist
+                                joints[idx_hand] = target_hand
+                                joints[idx_elbow] = target_elbow
+
+                process_arm(L_SHOULDER, L_ELBOW, L_WRIST, L_HAND)
+                process_arm(R_SHOULDER, R_ELBOW, R_WRIST, R_HAND)
+                
+                if is_tensor:
+                    if has_extra_dim:
+                        frames[frame_idx][person_idx][0] = torch.from_numpy(joints).to(person_data.device)
+                    else:
+                        frames[frame_idx][person_idx] = torch.from_numpy(joints).to(person_data.device)
+                else:
+                    if has_extra_dim:
+                        frames[frame_idx][person_idx][0] = joints.tolist()
+                    else:
+                        frames[frame_idx][person_idx] = joints.tolist()
+
+        return (new_data,)
+
+
 class NLFProportionalRetargeterV13:
     @classmethod
     def INPUT_TYPES(cls):
@@ -16428,6 +16588,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFDataToMaskV3": NLFDataToMaskV3,
     "NLFDataToMaskV4": NLFDataToMaskV4,
     "NLFDataHandDebugV3": NLFDataHandDebugV3,
+    "NLFDataHandDebugV4": NLFDataHandDebugV4,
     "NLFProportionalRetargeterV13": NLFProportionalRetargeterV13,
 }
 
@@ -16515,6 +16676,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFDataToMaskV3": "NLF Data to Mask V3",
     "NLFDataToMaskV4": "NLF Data to Mask V4",
     "NLFDataHandDebugV3": "NLF Data Hand Debug V3 (Collision / IK)",
+    "NLFDataHandDebugV4": "NLF Data Hand Debug V4 (Collision / IK)",
     "NLFProportionalRetargeterV13": "NLF Proportional Retargeter V13",
     
 }
