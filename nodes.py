@@ -16108,7 +16108,7 @@ class NLFProportionalRetargeterV13:
     RETURN_NAMES = ("nlf_data_retargeted", "log_output")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Retargeting"
-    DESCRIPTION = "V15: Pure XZ-Width Scaling. Stabiler Hals-Anker. Kein Torso-Wachsen bei Hip-Scale!"
+    DESCRIPTION = "V17: Korrekte Reihenfolge! Erst globaler Stance-Scale (Beine), dann lokaler Bone-Config (nur Gelenk)."
 
     def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance):
         import copy
@@ -16116,7 +16116,7 @@ class NLFProportionalRetargeterV13:
         import math
         import torch
 
-        log_messages = ["=== NLF PROPORTIONAL RETARGETER V15 (PURE XZ-WIDTH & NECK ANCHOR) ==="]
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V17 (SCALE THEN CONFIG) ==="]
         
         true_3d_bones = calibration_data.get("true_3d_bones", {})
         if not true_3d_bones:
@@ -16197,7 +16197,6 @@ class NLFProportionalRetargeterV13:
             return desc
 
         def get_height_stable(p_array):
-            # V15: Wir messen exakt ab Knoten 12 (Neck Base), damit Schulterbreiten die Messung nicht mehr stören!
             if 12 < len(p_array) and np.linalg.norm(p_array[12]) > 1e-5:
                 top_y = p_array[12][1]
             else: return 0.0
@@ -16239,7 +16238,7 @@ class NLFProportionalRetargeterV13:
                     cv = pts_b[15] - pts_b[12]; cl = np.linalg.norm(cv)
                     if cl > 1e-5:
                         t_len = targets.get("head", cl * 2.0) / 2.0
-                        if do_log: log_messages.append(f"Knochen: Kopf (NLF-Map)  | Ist: {cl:.4f} -> Soll: {t_len:.4f} (Protected)")
+                        if do_log: log_messages.append(f"Knochen: Kopf (NLF-Map)  | Ist: {cl:.4f} -> Soll: {t_len:.4f}")
                         f_node = t_len / cl
                         delta = (pts_b[12] + (cv / cl * t_len)) - pts_b[15]
                         pts_b[15] += delta
@@ -16250,40 +16249,79 @@ class NLFProportionalRetargeterV13:
                        ('r_thigh',2,5), ('r_calf',5,8), ('l_thigh',1,4), ('l_calf',4,7)]
 
                 for key, p_idx, c_idx in ops:
-                    if key not in targets or c_idx >= len(pts_b): continue
-                    
-                    t_len_normal = targets[key]
-                    cal_k = "calibration_" + key
-                    t_len_final = targets.get(cal_k, t_len_normal)
-                    
                     cv = pts_b[c_idx] - pts_b[p_idx]; cl = np.linalg.norm(cv)
                     if cl < 1e-5: continue
 
                     if key in ['shoulder_width', 'hip_width']:
-                        t_len_final /= 2.0
-                        status = "(Pure XZ Width Scale)"
+                        # --- V17 LOGIK: ERST SCALE (Bein bewegen), DANN CONFIG (nur Gelenk) ---
                         
-                        # V15 PURE XZ SCALING: Y wird absolut unangetastet gelassen!
-                        scale_xz = t_len_final / cl
-                        new_c_pos = pts_b[p_idx].copy()
-                        new_c_pos[0] += cv[0] * scale_xz
-                        new_c_pos[1] += cv[1]  # <- Absoluter Y-Lock! Die Hüfte/Schulter sackt nicht ab.
-                        new_c_pos[2] += cv[2] * scale_xz
+                        # 1. Finde den globalen Stance Scale (z.B. aus 'calibration_hip_width_scale' oder 'calibration_hip_width')
+                        stance_target = None
+                        for k_scale in [f"calibration_{key}_scale", f"calibration_{key}", key]:
+                            if k_scale in targets:
+                                stance_target = targets[k_scale] / 2.0
+                                break
+                        if stance_target is None: stance_target = cl
+                        
+                        # 2. Finde die anatomische Bone-Config
+                        bone_target = None
+                        for k_config in [f"calibration_{key}_config", f"{key}_config"]:
+                            if k_config in targets:
+                                bone_target = targets[k_config] / 2.0
+                                break
+                        if bone_target is None: bone_target = stance_target # Standard: Config entspricht Scale
+
+                        # SCHRITT A: STANCE SCALE ANWENDEN (Bewegt Gelenk UND Beine!)
+                        scale_xz_stance = stance_target / cl
+                        pos_stance = pts_b[p_idx].copy()
+                        pos_stance[0] += cv[0] * scale_xz_stance
+                        pos_stance[1] += cv[1] # Y-Lock
+                        pos_stance[2] += cv[2] * scale_xz_stance
+                        
+                        delta_stance = pos_stance - pts_b[c_idx]
+                        
+                        # Hüfte bewegen
+                        pts_b[c_idx] += delta_stance
+                        # Gesamtes Bein/Arm mitverschieben
+                        for d in get_all_descendants(c_idx, tree):
+                            if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
+                                pts_b[d] += delta_stance
+
+                        # SCHRITT B: BONE CONFIG ANWENDEN (Bewegt NUR die Hüfte anatomisch!)
+                        scale_xz_config = bone_target / cl
+                        pos_config = pts_b[p_idx].copy()
+                        pos_config[0] += cv[0] * scale_xz_config
+                        pos_config[1] += cv[1] # Y-Lock
+                        pos_config[2] += cv[2] * scale_xz_config
+                        
+                        delta_config = pos_config - pts_b[c_idx] # Differenz zwischen Stance-Position und Config-Position
+                        
+                        # Hüfte an ihre finale anatomische Position rücken (Kinder bleiben stehen!)
+                        pts_b[c_idx] += delta_config
+                                
+                        if do_log and p_idx == 0: 
+                            log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Scale (ganzes Bein): {stance_target:.4f} -> Config (nur Gelenk): {bone_target:.4f}")
+
                     else:
+                        # Normale Arme / Beine
+                        if key not in targets: continue
+                        t_len_normal = targets[key]
+                        cal_k = "calibration_" + key
+                        t_len_final = targets.get(cal_k, t_len_normal)
+                        
                         if final_mode: t_len_final *= factor
-                        status = ""
                         dir_vec = cv / cl
                         new_c_pos = pts_b[p_idx] + (dir_vec * t_len_final)
 
-                    if do_log and key not in ['shoulder_width', 'hip_width'] or (do_log and "width" in key and p_idx==0):
-                        log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Soll: {t_len_final:.4f} {status}")
+                        if do_log:
+                            log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Soll: {t_len_final:.4f}")
 
-                    delta_shift = new_c_pos - pts_b[c_idx]
-                    pts_b[c_idx] = new_c_pos
+                        delta_shift = new_c_pos - pts_b[c_idx]
+                        pts_b[c_idx] = new_c_pos
 
-                    for d in get_all_descendants(c_idx, tree):
-                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
-                            pts_b[d] += delta_shift
+                        for d in get_all_descendants(c_idx, tree):
+                            if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
+                                pts_b[d] += delta_shift
                             
                 return pts_b
 
@@ -16317,6 +16355,8 @@ class NLFProportionalRetargeterV13:
                 raw_poses[frame_idx] = pts_final.tolist()
 
         return (nlf_data_retargeted, "\n".join(log_messages))
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
