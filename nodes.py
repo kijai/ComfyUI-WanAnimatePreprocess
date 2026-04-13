@@ -16480,6 +16480,267 @@ class NLFDataHandDebugV5:
         return (new_data, final_log_string,)
 
 
+class NLFDataHandDebugV6:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "nlf_data": ("NLFPRED",),
+                "min_radius_body_pct": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 200.0, "step": 1.0}),
+                "oval_vertical_stretch": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.1}),
+                "smooth_entry": ("BOOLEAN", {"default": True}),
+                "smooth_zone_body_pct": ("FLOAT", {"default": 30.0, "min": 0.0, "max": 100.0, "step": 1.0}),
+                "smooth_strength": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
+                "move_elbows": ("BOOLEAN", {"default": True}),
+                "elbow_move_percent": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 100.0, "step": 1.0}),
+                "keep_arm_length": ("BOOLEAN", {"default": True}),
+                "generate_log_output": ("BOOLEAN", {"default": True}),
+                # --- NEUE VISUALISIERUNGS-INPUTS ---
+                "viz_frame_idx": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                "bone_thickness": ("INT", {"default": 2, "min": 1, "max": 10}),
+                "draw_scale_factor": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01}),
+            },
+            "optional": {
+                "optional_image": ("IMAGE",), # Optionales Hintergrundbild
+            }
+        }
+
+    # NEU: 3 Outputs (NLF, Text-Log, Bild)
+    RETURN_TYPES = ("NLFPRED", "STRING", "IMAGE",)
+    RETURN_NAMES = ("nlf_data", "debug_log", "debug_image",)
+    FUNCTION = "apply_collision"
+    CATEGORY = "WanAnimate/NLF"
+
+    def solve_fabrik(self, p_shoulder, p_elbow, p_wrist, target_wrist):
+        import numpy as np
+        L1 = np.linalg.norm(p_elbow - p_shoulder)
+        L2 = np.linalg.norm(p_wrist - p_elbow)
+        max_reach = L1 + L2
+        
+        reach_vec = target_wrist - p_shoulder
+        reach_dist = np.linalg.norm(reach_vec)
+        
+        if reach_dist >= max_reach:
+            dir_w = reach_vec / (reach_dist + 1e-8)
+            new_e = p_shoulder + dir_w * L1
+            new_w = new_e + dir_w * L2
+            return new_e, new_w
+            
+        w_prime = target_wrist
+        dir_e = p_elbow - w_prime
+        e_prime = w_prime + (dir_e / (np.linalg.norm(dir_e) + 1e-8)) * L2
+        
+        dir_e2 = e_prime - p_shoulder
+        new_e = p_shoulder + (dir_e2 / (np.linalg.norm(dir_e2) + 1e-8)) * L1
+        dir_w2 = w_prime - new_e
+        new_w = new_e + (dir_w2 / (np.linalg.norm(dir_w2) + 1e-8)) * L2
+        
+        return new_e, new_w
+
+    def apply_collision(self, nlf_data, min_radius_body_pct, oval_vertical_stretch, smooth_entry, 
+                        smooth_zone_body_pct, smooth_strength, move_elbows, 
+                        elbow_move_percent, keep_arm_length, generate_log_output,
+                        viz_frame_idx, bone_thickness, draw_scale_factor, optional_image=None):
+        
+        import copy
+        import numpy as np
+        import torch
+        import cv2 # Für das Zeichnen des Bildes
+        
+        new_data = copy.deepcopy(nlf_data)
+        log_lines = []
+        
+        # 1. BILD VORBEREITEN
+        if optional_image is not None:
+            # ComfyUI Tensor [B, H, W, C] zu Numpy OpenCV [H, W, BGR]
+            img_np = (optional_image[0].cpu().numpy() * 255).astype(np.uint8)
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        else:
+            # Schwarze Leinwand als Fallback
+            img_bgr = np.zeros((1024, 1024, 3), dtype=np.uint8)
+            
+        # Layer für transparente Zeichnungen
+        overlay = img_bgr.copy()
+        
+        is_dict = isinstance(new_data, dict)
+        if is_dict:
+            if 'joints3d_nonparam' in new_data:
+                frames = new_data['joints3d_nonparam'][0]
+            else:
+                out_tensor = torch.from_numpy(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0).unsqueeze(0)
+                return (new_data, "No joints3d_nonparam found.", out_tensor,)
+        else:
+            frames = new_data
+            
+        PELVIS, L_HIP, R_HIP = 0, 1, 2
+        L_SHOULDER, L_ELBOW, L_WRIST, L_HAND = 16, 18, 20, 22
+        R_SHOULDER, R_ELBOW, R_WRIST, R_HAND = 17, 19, 21, 23
+        
+        # SMPL Verbindungen für das Skelett-Zeichnen
+        smpl_bones = [(0,1), (0,2), (0,3), (1,4), (2,5), (3,6), (4,7), (5,8), (6,9), (7,10), (8,11), (9,12), (9,13), (9,14), (12,15), (13,16), (14,17), (16,18), (17,19), (18,20), (19,21), (20,22), (21,23)]
+        
+        if generate_log_output:
+            log_lines.append("="*50)
+            log_lines.append("🟢 NLF HAND COLLISION DEBUG LOG")
+            log_lines.append("="*50)
+        
+        for frame_idx in range(len(frames)):
+            if frames[frame_idx] is None or len(frames[frame_idx]) == 0:
+                continue
+                
+            for person_idx in range(len(frames[frame_idx])):
+                person_data = frames[frame_idx][person_idx]
+                
+                is_tensor = isinstance(person_data, torch.Tensor)
+                if is_tensor:
+                    joints = person_data.cpu().numpy().copy()
+                else:
+                    joints = np.array(person_data, dtype=np.float32).copy()
+                    
+                has_extra_dim = joints.ndim == 3
+                if has_extra_dim:
+                    joints = joints[0]
+                    
+                if joints.shape[0] < 24:
+                    continue
+                
+                mid_shoulder = (joints[L_SHOULDER] + joints[R_SHOULDER]) / 2.0
+                torso_length = np.linalg.norm(mid_shoulder - joints[PELVIS])
+                if torso_length < 0.001:
+                    continue
+                
+                min_dist_units = (min_radius_body_pct / 100.0) * torso_length
+                smooth_zone_units = (smooth_zone_body_pct / 100.0) * torso_length if smooth_entry else 0.0
+                trigger_dist = min_dist_units + smooth_zone_units
+                
+                # BILD ZEICHNEN (Nur für das ausgewählte Frame und Person 0)
+                if frame_idx == viz_frame_idx and person_idx == 0:
+                    
+                    # 1. Transparente Zonen zeichnen
+                    for hip_idx in [L_HIP, R_HIP]:
+                        cx = int(joints[hip_idx][0] * draw_scale_factor)
+                        cy = int(joints[hip_idx][1] * draw_scale_factor)
+                        
+                        # Radien berechnen
+                        r_hard_x = int(min_dist_units * draw_scale_factor)
+                        r_hard_y = int((min_dist_units * oval_vertical_stretch) * draw_scale_factor)
+                        
+                        r_smooth_x = int(trigger_dist * draw_scale_factor)
+                        r_smooth_y = int((trigger_dist * oval_vertical_stretch) * draw_scale_factor)
+                        
+                        # Smooth Zone füllen (Gelb BGR: 0, 255, 255)
+                        cv2.ellipse(overlay, (cx, cy), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), -1)
+                        # Hard Limit füllen (Rot BGR: 0, 0, 255)
+                        cv2.ellipse(overlay, (cx, cy), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), -1)
+
+                    # Overlay mit dem Bild verschmelzen (Transparenz)
+                    alpha = 0.3 # Wie durchsichtig die Kugeln sind
+                    cv2.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0, img_bgr)
+                    
+                    # 2. Feste Outlines & Skelett über die Transparenz zeichnen
+                    for hip_idx in [L_HIP, R_HIP]:
+                        cx = int(joints[hip_idx][0] * draw_scale_factor)
+                        cy = int(joints[hip_idx][1] * draw_scale_factor)
+                        r_hard_x, r_hard_y = int(min_dist_units * draw_scale_factor), int((min_dist_units * oval_vertical_stretch) * draw_scale_factor)
+                        r_smooth_x, r_smooth_y = int(trigger_dist * draw_scale_factor), int((trigger_dist * oval_vertical_stretch) * draw_scale_factor)
+                        
+                        # Dicke Outlines
+                        cv2.ellipse(img_bgr, (cx, cy), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), 2)
+                        cv2.ellipse(img_bgr, (cx, cy), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), 2)
+                        
+                    # 3. Das blaue Skelett zeichnen (Bones)
+                    for (i, j) in smpl_bones:
+                        if i < len(joints) and j < len(joints):
+                            x1, y1 = int(joints[i][0] * draw_scale_factor), int(joints[i][1] * draw_scale_factor)
+                            x2, y2 = int(joints[j][0] * draw_scale_factor), int(joints[j][1] * draw_scale_factor)
+                            # OpenCV nutzt BGR, also ist (255, 0, 0) pures Blau
+                            cv2.line(img_bgr, (x1, y1), (x2, y2), (255, 0, 0), bone_thickness)
+
+
+                # --- DIE PHYSIKALISCHE KOLLISIONSLOGIK (Unverändert) ---
+                def process_arm(arm_name, idx_shoulder, idx_elbow, idx_wrist, idx_hand):
+                    wrist_pos = joints[idx_wrist]
+                    
+                    vec_L = wrist_pos - joints[L_HIP]
+                    vec_R = wrist_pos - joints[R_HIP]
+                    
+                    vec_L_scaled = vec_L.copy()
+                    vec_L_scaled[1] /= max(0.1, oval_vertical_stretch) 
+                    
+                    vec_R_scaled = vec_R.copy()
+                    vec_R_scaled[1] /= max(0.1, oval_vertical_stretch)
+                    
+                    dist_L = np.linalg.norm(vec_L_scaled)
+                    dist_R = np.linalg.norm(vec_R_scaled)
+                    
+                    if dist_L < dist_R:
+                        dist = dist_L
+                        vec_real = vec_L 
+                    else:
+                        dist = dist_R
+                        vec_real = vec_R
+                    
+                    if dist < trigger_dist and dist > 0.001:
+                        dir_vec = vec_real / (np.linalg.norm(vec_real) + 1e-8)
+                        
+                        if dist < min_dist_units:
+                            target_dist = min_dist_units
+                        else:
+                            t = (dist - min_dist_units) / smooth_zone_units
+                            t_curved = t ** (1.0 / smooth_strength)
+                            target_dist = min_dist_units + smooth_zone_units * t_curved
+                            
+                        push_amount = target_dist - dist 
+                        
+                        if push_amount > 0:
+                            actual_push = push_amount * oval_vertical_stretch 
+                            
+                            target_wrist = joints[idx_wrist] + dir_vec * actual_push
+                            target_hand = joints[idx_hand] + dir_vec * actual_push
+                            
+                            target_elbow = joints[idx_elbow].copy()
+                            if move_elbows:
+                                target_elbow += dir_vec * actual_push * (elbow_move_percent / 100.0)
+                                
+                            if keep_arm_length:
+                                new_e, new_w = self.solve_fabrik(joints[idx_shoulder], target_elbow, target_wrist, target_wrist)
+                                hand_offset = joints[idx_hand] - joints[idx_wrist]
+                                joints[idx_hand] = new_w + hand_offset
+                                joints[idx_elbow] = new_e
+                                joints[idx_wrist] = new_w
+                            else:
+                                joints[idx_wrist] = target_wrist
+                                joints[idx_hand] = target_hand
+                                joints[idx_elbow] = target_elbow
+
+                process_arm("Linker Arm", L_SHOULDER, L_ELBOW, L_WRIST, L_HAND)
+                process_arm("Rechter Arm", R_SHOULDER, R_ELBOW, R_WRIST, R_HAND)
+                
+                if is_tensor:
+                    if has_extra_dim:
+                        frames[frame_idx][person_idx][0] = torch.from_numpy(joints).to(person_data.device)
+                    else:
+                        frames[frame_idx][person_idx] = torch.from_numpy(joints).to(person_data.device)
+                else:
+                    if has_extra_dim:
+                        frames[frame_idx][person_idx][0] = joints.tolist()
+                    else:
+                        frames[frame_idx][person_idx] = joints.tolist()
+
+        if generate_log_output:
+            log_lines.append("="*50)
+            log_lines.append("🔴 LOG END")
+            log_lines.append("="*50)
+
+        final_log_string = "\n".join(log_lines) if generate_log_output else "Log output is disabled."
+
+        # Bild wieder in ComfyUI Tensor umwandeln [1, H, W, RGB]
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        out_image_tensor = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).unsqueeze(0)
+
+        return (new_data, final_log_string, out_image_tensor,)
+
+
 class NLFProportionalRetargeterV13:
     @classmethod
     def INPUT_TYPES(cls):
@@ -16817,7 +17078,9 @@ NODE_CLASS_MAPPINGS = {
     "NLFDataHandDebugV3": NLFDataHandDebugV3,
     "NLFDataHandDebugV4": NLFDataHandDebugV4,
     "NLFDataHandDebugV5": NLFDataHandDebugV5,
+    "NLFDataHandDebugV6": NLFDataHandDebugV6,
     "NLFProportionalRetargeterV13": NLFProportionalRetargeterV13,
+    
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -16906,6 +17169,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFDataHandDebugV3": "NLF Data Hand Debug V3 (Collision / IK)",
     "NLFDataHandDebugV4": "NLF Data Hand Debug V4 (Collision / IK)",
     "NLFDataHandDebugV5": "NLF Data Hand Debug V5 (Collision / IK)",
+    "NLFDataHandDebugV6": "NLF Data Hand Debug V6 (Collision / IK)",
     "NLFProportionalRetargeterV13": "NLF Proportional Retargeter V13",
     
 }
