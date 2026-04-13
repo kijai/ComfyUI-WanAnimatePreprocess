@@ -16779,11 +16779,9 @@ class NLFDataHandDebugV7:
                 "smooth_zone_body_pct": ("FLOAT", {"default": 30.0, "min": 0.0, "max": 100.0, "step": 1.0}),
                 "smooth_strength": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
                 
-                # --- NEU: Hand-spezifische Skalierungen ---
                 "hand_effect_radius_pct": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 200.0, "step": 1.0}),
                 "hand_smooth_zone_pct": ("FLOAT", {"default": 100.0, "min": 0.0, "max": 200.0, "step": 1.0}),
                 
-                # --- NEU: 3D-Illusion aufheben ---
                 "ignore_z_axis": ("BOOLEAN", {"default": False}),
                 
                 "move_elbows": ("BOOLEAN", {"default": True}),
@@ -16906,42 +16904,33 @@ class NLFDataHandDebugV7:
                 if torso_length < 0.001:
                     continue
                 
-                # Handgelenk Zonen
                 min_dist_units = (min_radius_body_pct / 100.0) * torso_length
                 smooth_zone_units = (smooth_zone_body_pct / 100.0) * torso_length if smooth_entry else 0.0
                 trigger_dist = min_dist_units + smooth_zone_units
                 
-                # Hand Zonen
                 hand_min_dist = min_dist_units * (hand_effect_radius_pct / 100.0)
                 hand_smooth_zone = smooth_zone_units * (hand_smooth_zone_pct / 100.0) if smooth_entry else 0.0
                 hand_trigger = hand_min_dist + hand_smooth_zone
                 
                 orig_joints = joints.copy()
 
-                def get_dist_and_dir(pos):
-                    vec_L = pos - joints[L_HIP]
-                    vec_R = pos - joints[R_HIP]
+                # --- NEU: ZENTRIERTE ABFRAGE (NUR NOCH DIE EIGENE HÜFTE!) ---
+                def get_dist_and_dir(pos, hip_idx):
+                    vec = pos - joints[hip_idx]
                     
                     if ignore_z_axis:
-                        vec_L[2] = 0.0
-                        vec_R[2] = 0.0
+                        vec[2] = 0.0
                         
-                    vec_L_scaled = vec_L.copy()
-                    vec_L_scaled[1] /= max(0.1, oval_vertical_stretch) 
-                    vec_R_scaled = vec_R.copy()
-                    vec_R_scaled[1] /= max(0.1, oval_vertical_stretch)
+                    vec_scaled = vec.copy()
+                    vec_scaled[1] /= max(0.1, oval_vertical_stretch) 
                     
-                    dist_L = np.linalg.norm(vec_L_scaled)
-                    dist_R = np.linalg.norm(vec_R_scaled)
-                    
-                    if dist_L < dist_R:
-                        return dist_L, vec_L
-                    else:
-                        return dist_R, vec_R
+                    dist = np.linalg.norm(vec_scaled)
+                    return dist, vec
 
-                def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand):
+                def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand, target_hip_idx):
                     # --- 1. Handgelenk berechnen ---
-                    dist_W, vec_real_W = get_dist_and_dir(joints[idx_wrist])
+                    # Wir geben jetzt target_hip_idx mit, damit der Arm NUR SEINE EIGENE Hüfte checkt
+                    dist_W, vec_real_W = get_dist_and_dir(joints[idx_wrist], target_hip_idx)
                     push_amount_W = 0
                     
                     if dist_W < trigger_dist and dist_W > 0.001:
@@ -16954,7 +16943,6 @@ class NLFDataHandDebugV7:
                             target_dist_W = min_dist_units + smooth_zone_units * t_curved
                         push_amount_W = target_dist_W - dist_W 
                         
-                    # Handgelenk und Ellbogen verschieben
                     if push_amount_W > 0:
                         actual_push_W = push_amount_W * oval_vertical_stretch 
                         target_wrist = joints[idx_wrist] + dir_vec_W * actual_push_W
@@ -16969,7 +16957,6 @@ class NLFDataHandDebugV7:
                             joints[idx_elbow] = target_elbow
 
                     # --- 2. Echte Hand berechnen ---
-                    # Wo wäre die Hand jetzt (abhängig vom neuen Handgelenk)?
                     if push_amount_W > 0 and keep_arm_length:
                         tentative_hand = joints[idx_wrist] + (orig_joints[idx_hand] - orig_joints[idx_wrist])
                     elif push_amount_W > 0:
@@ -16977,7 +16964,7 @@ class NLFDataHandDebugV7:
                     else:
                         tentative_hand = orig_joints[idx_hand].copy()
                         
-                    dist_H, vec_real_H = get_dist_and_dir(tentative_hand)
+                    dist_H, vec_real_H = get_dist_and_dir(tentative_hand, target_hip_idx)
                     push_amount_H = 0
                     
                     if dist_H < hand_trigger and dist_H > 0.001:
@@ -16990,22 +16977,21 @@ class NLFDataHandDebugV7:
                             target_dist_H = hand_min_dist + hand_smooth_zone * t_curved
                         push_amount_H = target_dist_H - dist_H
                         
-                    # Hand ggf. nochmal extra wegschieben
                     if push_amount_H > 0:
                         actual_push_H = push_amount_H * oval_vertical_stretch
                         joints[idx_hand] = tentative_hand + dir_vec_H * actual_push_H
                     else:
                         joints[idx_hand] = tentative_hand
 
-                process_arm(L_SHOULDER, L_ELBOW, L_WRIST, L_HAND)
-                process_arm(R_SHOULDER, R_ELBOW, R_WRIST, R_HAND)
+                # --- NEU: Wir übergeben fest L_HIP an den linken Arm und R_HIP an den rechten Arm ---
+                process_arm(L_SHOULDER, L_ELBOW, L_WRIST, L_HAND, L_HIP)
+                process_arm(R_SHOULDER, R_ELBOW, R_WRIST, R_HAND, R_HIP)
                 
                 # --- VISUALISIERUNG ZEICHNEN ---
                 if frame_idx == viz_frame_idx and person_idx == 0:
                     orig_u, orig_v = project_3d_to_2d(orig_joints)
                     new_u, new_v = project_3d_to_2d(joints)
                     
-                    # 1. LAYER: Gelbe Smooth-Zonen (Handgelenk)
                     for hip_idx in [L_HIP, R_HIP]:
                         hz = max(orig_joints[hip_idx][2], 1e-5) 
                         cx, cy = int(orig_u[hip_idx]), int(orig_v[hip_idx])
@@ -17013,7 +16999,6 @@ class NLFDataHandDebugV7:
                         r_smooth_y = int((focal_length * trigger_dist * oval_vertical_stretch) / hz)
                         cv2.ellipse(overlay, (cx, cy), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), -1)
                         
-                    # 2. LAYER: Rote Hard-Limit-Zonen (Handgelenk)
                     for hip_idx in [L_HIP, R_HIP]:
                         hz = max(orig_joints[hip_idx][2], 1e-5)
                         cx, cy = int(orig_u[hip_idx]), int(orig_v[hip_idx])
@@ -17024,7 +17009,6 @@ class NLFDataHandDebugV7:
                     alpha = 0.3
                     cv2.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0, img_bgr)
                     
-                    # 3. LAYER: Outlines Handgelenk
                     for hip_idx in [L_HIP, R_HIP]:
                         hz = max(orig_joints[hip_idx][2], 1e-5)
                         cx, cy = int(orig_u[hip_idx]), int(orig_v[hip_idx])
@@ -17037,7 +17021,6 @@ class NLFDataHandDebugV7:
                         cv2.ellipse(img_bgr, (cx, cy), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), 2)
                         cv2.ellipse(img_bgr, (cx, cy), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), 2)
                         
-                    # 4. LAYER: Dünne Outlines für die HAND-Zonen (Grün = Hard, Hellblau = Smooth)
                     for hip_idx in [L_HIP, R_HIP]:
                         hz = max(orig_joints[hip_idx][2], 1e-5)
                         cx, cy = int(orig_u[hip_idx]), int(orig_v[hip_idx])
@@ -17050,14 +17033,12 @@ class NLFDataHandDebugV7:
                         cv2.ellipse(img_bgr, (cx, cy), (rh_smooth_x, rh_smooth_y), 0, 0, 360, (255, 255, 0), 1)
                         cv2.ellipse(img_bgr, (cx, cy), (rh_hard_x, rh_hard_y), 0, 0, 360, (0, 255, 0), 1)
 
-                    # 5. LAYER: Originales blaues Skelett
                     for (i, j) in smpl_bones:
                         if i < len(orig_joints) and j < len(orig_joints):
                             x1, y1 = int(orig_u[i]), int(orig_v[i])
                             x2, y2 = int(orig_u[j]), int(orig_v[j])
                             cv2.line(img_bgr, (x1, y1), (x2, y2), (255, 0, 0), bone_thickness)
 
-                    # 6. LAYER: Lila verschobene Arme & Pfeile
                     arm_bones = [(L_SHOULDER, L_ELBOW), (L_ELBOW, L_WRIST), (L_WRIST, L_HAND),
                                  (R_SHOULDER, R_ELBOW), (R_ELBOW, R_WRIST), (R_WRIST, R_HAND)]
                     
