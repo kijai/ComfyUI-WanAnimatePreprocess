@@ -16495,17 +16495,18 @@ class NLFDataHandDebugV6:
                 "elbow_move_percent": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 100.0, "step": 1.0}),
                 "keep_arm_length": ("BOOLEAN", {"default": True}),
                 "generate_log_output": ("BOOLEAN", {"default": True}),
-                # --- NEUE VISUALISIERUNGS-INPUTS ---
                 "viz_frame_idx": ("INT", {"default": 0, "min": 0, "max": 100000}),
                 "bone_thickness": ("INT", {"default": 2, "min": 1, "max": 10}),
                 "draw_scale_factor": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01}),
+                # --- NEUE INPUTS FÜR DIE KAMERA-AUFLÖSUNG ---
+                "width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
             },
             "optional": {
-                "optional_image": ("IMAGE",), # Optionales Hintergrundbild
+                "optional_image": ("IMAGE",), 
             }
         }
 
-    # NEU: 3 Outputs (NLF, Text-Log, Bild)
     RETURN_TYPES = ("NLFPRED", "STRING", "IMAGE",)
     RETURN_NAMES = ("nlf_data", "debug_log", "debug_image",)
     FUNCTION = "apply_collision"
@@ -16540,12 +16541,12 @@ class NLFDataHandDebugV6:
     def apply_collision(self, nlf_data, min_radius_body_pct, oval_vertical_stretch, smooth_entry, 
                         smooth_zone_body_pct, smooth_strength, move_elbows, 
                         elbow_move_percent, keep_arm_length, generate_log_output,
-                        viz_frame_idx, bone_thickness, draw_scale_factor, optional_image=None):
+                        viz_frame_idx, bone_thickness, draw_scale_factor, width, height, optional_image=None):
         
         import copy
         import numpy as np
         import torch
-        import cv2 # Für das Zeichnen des Bildes
+        import cv2
         
         new_data = copy.deepcopy(nlf_data)
         log_lines = []
@@ -16556,10 +16557,9 @@ class NLFDataHandDebugV6:
             img_np = (optional_image[0].cpu().numpy() * 255).astype(np.uint8)
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         else:
-            # Schwarze Leinwand als Fallback
-            img_bgr = np.zeros((1024, 1024, 3), dtype=np.uint8)
+            # Schwarze Leinwand als Fallback mit den eingestellten Dimensionen!
+            img_bgr = np.zeros((height, width, 3), dtype=np.uint8)
             
-        # Layer für transparente Zeichnungen
         overlay = img_bgr.copy()
         
         is_dict = isinstance(new_data, dict)
@@ -16576,7 +16576,6 @@ class NLFDataHandDebugV6:
         L_SHOULDER, L_ELBOW, L_WRIST, L_HAND = 16, 18, 20, 22
         R_SHOULDER, R_ELBOW, R_WRIST, R_HAND = 17, 19, 21, 23
         
-        # SMPL Verbindungen für das Skelett-Zeichnen
         smpl_bones = [(0,1), (0,2), (0,3), (1,4), (2,5), (3,6), (4,7), (5,8), (6,9), (7,10), (8,11), (9,12), (9,13), (9,14), (12,15), (13,16), (14,17), (16,18), (17,19), (18,20), (19,21), (20,22), (21,23)]
         
         if generate_log_output:
@@ -16613,51 +16612,41 @@ class NLFDataHandDebugV6:
                 smooth_zone_units = (smooth_zone_body_pct / 100.0) * torso_length if smooth_entry else 0.0
                 trigger_dist = min_dist_units + smooth_zone_units
                 
-                # BILD ZEICHNEN (Nur für das ausgewählte Frame und Person 0)
+                # BILD ZEICHNEN
                 if frame_idx == viz_frame_idx and person_idx == 0:
-                    
-                    # 1. Transparente Zonen zeichnen
                     for hip_idx in [L_HIP, R_HIP]:
                         cx = int(joints[hip_idx][0] * draw_scale_factor)
                         cy = int(joints[hip_idx][1] * draw_scale_factor)
                         
-                        # Radien berechnen
                         r_hard_x = int(min_dist_units * draw_scale_factor)
                         r_hard_y = int((min_dist_units * oval_vertical_stretch) * draw_scale_factor)
                         
                         r_smooth_x = int(trigger_dist * draw_scale_factor)
                         r_smooth_y = int((trigger_dist * oval_vertical_stretch) * draw_scale_factor)
                         
-                        # Smooth Zone füllen (Gelb BGR: 0, 255, 255)
                         cv2.ellipse(overlay, (cx, cy), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), -1)
-                        # Hard Limit füllen (Rot BGR: 0, 0, 255)
                         cv2.ellipse(overlay, (cx, cy), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), -1)
 
-                    # Overlay mit dem Bild verschmelzen (Transparenz)
-                    alpha = 0.3 # Wie durchsichtig die Kugeln sind
+                    alpha = 0.3
                     cv2.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0, img_bgr)
                     
-                    # 2. Feste Outlines & Skelett über die Transparenz zeichnen
                     for hip_idx in [L_HIP, R_HIP]:
                         cx = int(joints[hip_idx][0] * draw_scale_factor)
                         cy = int(joints[hip_idx][1] * draw_scale_factor)
                         r_hard_x, r_hard_y = int(min_dist_units * draw_scale_factor), int((min_dist_units * oval_vertical_stretch) * draw_scale_factor)
                         r_smooth_x, r_smooth_y = int(trigger_dist * draw_scale_factor), int((trigger_dist * oval_vertical_stretch) * draw_scale_factor)
                         
-                        # Dicke Outlines
                         cv2.ellipse(img_bgr, (cx, cy), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), 2)
                         cv2.ellipse(img_bgr, (cx, cy), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), 2)
                         
-                    # 3. Das blaue Skelett zeichnen (Bones)
                     for (i, j) in smpl_bones:
                         if i < len(joints) and j < len(joints):
                             x1, y1 = int(joints[i][0] * draw_scale_factor), int(joints[i][1] * draw_scale_factor)
                             x2, y2 = int(joints[j][0] * draw_scale_factor), int(joints[j][1] * draw_scale_factor)
-                            # OpenCV nutzt BGR, also ist (255, 0, 0) pures Blau
                             cv2.line(img_bgr, (x1, y1), (x2, y2), (255, 0, 0), bone_thickness)
 
 
-                # --- DIE PHYSIKALISCHE KOLLISIONSLOGIK (Unverändert) ---
+                # --- DIE PHYSIKALISCHE KOLLISIONSLOGIK ---
                 def process_arm(arm_name, idx_shoulder, idx_elbow, idx_wrist, idx_hand):
                     wrist_pos = joints[idx_wrist]
                     
@@ -16734,7 +16723,6 @@ class NLFDataHandDebugV6:
 
         final_log_string = "\n".join(log_lines) if generate_log_output else "Log output is disabled."
 
-        # Bild wieder in ComfyUI Tensor umwandeln [1, H, W, RGB]
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         out_image_tensor = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).unsqueeze(0)
 
