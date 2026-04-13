@@ -18052,8 +18052,10 @@ class RenderNLFPosesDirectPoseDataMimic16:
                 "draw_feet": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet Füße von PoseData und mappt sie an die NLF-Knöchel"}),
                 "draw_nlf_feet": ("BOOLEAN", {"default": False, "tooltip": "Zeichnet Füße direkt aus originalen NLF-Daten (überschreibt PoseData-Füße)"}),
                 
-                # NEU: Toggles für die Offsets
+                # NEU: Hände Tweaks (Skalierung, Alpha, Offsets)
                 "apply_fingertip_offsets": ("BOOLEAN", {"default": True, "tooltip": "Wendet die Rotations-Offsets auf die Finger an (falls Input vorhanden)"}),
+                "hand_scale_factor": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05, "tooltip": "Skaliert die Hände (1.0 = normal)"}),
+                "hand_face_alpha": ("FLOAT", {"default": 0.6, "min": 0.1, "max": 1.0, "step": 0.05, "tooltip": "Deckkraft für 2D Hände und Gesicht (0.6 passt gut zum Körper)"}),
             },
             "optional": {
                 "dw_poses_fallback": ("DWPOSES", {"tooltip": "Für Hände/Gesicht als Fallback"}),
@@ -18067,9 +18069,9 @@ class RenderNLFPosesDirectPoseDataMimic16:
     RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings", "nlf_data_for_mask")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/SCAIL"
-    DESCRIPTION = "Mimic 15 mit NLF_MASK_DATA Output, Hand-Rotation (Pixel-Offsets) und NLF Feet Support."
+    DESCRIPTION = "Mimic 15 mit Offsets, Logging, NLF Feet (Rot/Gelb) und Hand-Skalierung."
 
-    def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Offset Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, use_pose_data=True, use_dwpose_head_for_posedata=True, draw_feet=True, draw_nlf_feet=False, apply_fingertip_offsets=True, dw_poses_fallback=None, pose_data_fallback=None, nlf_render_config="{}", fingertip_offsets=None):
+    def process(self, nlf_poses, width, height, line_thickness=4, point_radius=4, head_connection_mode="Offset Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, use_pose_data=True, use_dwpose_head_for_posedata=True, draw_feet=True, draw_nlf_feet=False, apply_fingertip_offsets=True, hand_scale_factor=1.0, hand_face_alpha=0.6, dw_poses_fallback=None, pose_data_fallback=None, nlf_render_config="{}", fingertip_offsets=None):
         import copy
         import json
         import math
@@ -18188,20 +18190,21 @@ class RenderNLFPosesDirectPoseDataMimic16:
                     for joints3d in people:
                         j3d_np = joints3d.cpu().numpy() if isinstance(joints3d, torch.Tensor) else joints3d
                         
-                        # NLF Füße projizieren
+                        # --- NEU: NLF Füße projizieren (mit exakten Farben) ---
                         if draw_nlf_feet and j3d_np.shape[0] >= 12:
-                            for s_idx, e_idx, color_idx in [(7, 10, 11), (8, 11, 8)]: 
+                            # 7->10 ist Links (Rot), 8->11 ist Rechts (Gelb)
+                            for s_idx, e_idx, foot_color in [(7, 10, (255, 0, 0)), (8, 11, (255, 255, 0))]: 
                                 if np.sum(np.abs(j3d_np[s_idx])) > 0 and np.sum(np.abs(j3d_np[e_idx])) > 0:
                                     p1 = p3d_single_p2d(j3d_np[s_idx], intrinsic_matrix)
                                     p2 = p3d_single_p2d(j3d_np[e_idx], intrinsic_matrix)
                                     nlf_extra_bones.append({
                                         'pt1': (p1[0], p1[1]), 'pt2': (p2[0], p2[1]), 
                                         'z': (j3d_np[s_idx][2] + j3d_np[e_idx][2]) / 2.0, 
-                                        'color': limb_colors_rgb[color_idx % len(limb_colors_rgb)]
+                                        'color': foot_color
                                     })
                                     nlf_extra_joints.append({
                                         'pt': (p2[0], p2[1]), 'z': j3d_np[e_idx][2], 
-                                        'color': joint_colors_rgb[color_idx % len(joint_colors_rgb)]
+                                        'color': foot_color
                                     })
 
                         if np.sum(np.abs(j3d_np)) > 0.01:
@@ -18254,7 +18257,15 @@ class RenderNLFPosesDirectPoseDataMimic16:
                                 
                                 if isinstance(r_hand, np.ndarray):
                                     valid_mask = r_hand[:, 0] > 0
-                                    r_hand[valid_mask, 0] += ox; r_hand[valid_mask, 1] += oy
+                                    r_hand[valid_mask, 0] += ox
+                                    r_hand[valid_mask, 1] += oy
+                                    
+                                    # --- NEU: Skalierung anwenden ---
+                                    if hand_scale_factor != 1.0:
+                                        wrist_pos = r_hand[0].copy()
+                                        for f_idx in range(1, 21):
+                                            if valid_mask[f_idx]:
+                                                r_hand[f_idx] = wrist_pos + (r_hand[f_idx] - wrist_pos) * hand_scale_factor
                                     
                                     # Rotations-Offset auf FINGER anwenden
                                     if apply_fingertip_offsets and (abs(r_offset[0]) > 0.001 or abs(r_offset[1]) > 0.001):
@@ -18263,6 +18274,9 @@ class RenderNLFPosesDirectPoseDataMimic16:
                                         finger_mask[0] = False 
                                         r_hand[finger_mask, 0] += r_off_x
                                         r_hand[finger_mask, 1] += r_off_y
+                                        # Logging
+                                        if i % 10 == 0: # Nicht das Log sprengen, alle 10 Frames reicht als Beweis
+                                            log_messages.append(f"  -> Frame {i}, Person {p}: Rechte Hand Finger verschoben (X: {r_offset[0]:.2f}px, Y: {r_offset[1]:.2f}px)")
 
                             if len(pts) > 4 and pts[4] is not None and np.sum(l_hand) > 0.01:
                                 wrist_norm = np.array([pts[4][0] / float(width), pts[4][1] / float(height)])
@@ -18276,7 +18290,15 @@ class RenderNLFPosesDirectPoseDataMimic16:
                                 
                                 if isinstance(l_hand, np.ndarray):
                                     valid_mask = l_hand[:, 0] > 0
-                                    l_hand[valid_mask, 0] += ox; l_hand[valid_mask, 1] += oy
+                                    l_hand[valid_mask, 0] += ox
+                                    l_hand[valid_mask, 1] += oy
+                                    
+                                    # --- NEU: Skalierung anwenden ---
+                                    if hand_scale_factor != 1.0:
+                                        wrist_pos = l_hand[0].copy()
+                                        for f_idx in range(1, 21):
+                                            if valid_mask[f_idx]:
+                                                l_hand[f_idx] = wrist_pos + (l_hand[f_idx] - wrist_pos) * hand_scale_factor
                                     
                                     # Rotations-Offset auf FINGER anwenden
                                     if apply_fingertip_offsets and (abs(l_offset[0]) > 0.001 or abs(l_offset[1]) > 0.001):
@@ -18285,6 +18307,9 @@ class RenderNLFPosesDirectPoseDataMimic16:
                                         finger_mask[0] = False 
                                         l_hand[finger_mask, 0] += l_off_x
                                         l_hand[finger_mask, 1] += l_off_y
+                                        # Logging
+                                        if i % 10 == 0:
+                                            log_messages.append(f"  -> Frame {i}, Person {p}: Linke Hand Finger verschoben (X: {l_offset[0]:.2f}px, Y: {l_offset[1]:.2f}px)")
 
                             if draw_feet and "_posedata_feet" in dw_pose_input[i]:
                                 feet_array = dw_pose_input[i]["_posedata_feet"]
@@ -18393,9 +18418,14 @@ class RenderNLFPosesDirectPoseDataMimic16:
                 canvas_2d = draw_pose_to_canvas_np(dw_pose_input, pool=None, H=height, W=width, reshape_scale=0, show_feet_flag=False, show_body_flag=False, show_cheek_flag=True, dw_hand=True, show_face_flag=draw_face, show_hand_flag=draw_hands)
                 for i in range(len(frames_np_rgba)):
                     frame_rgba, canvas_img = frames_np_rgba[i], canvas_2d[i]
-                    mask = canvas_img != 0
-                    frame_rgba[:, :, :3][mask] = canvas_img[mask]
-                    frame_rgba[:, :, 3][np.any(canvas_img > 0, axis=-1)] = 255
+                    
+                    # --- NEU: Alpha-Blending für Hände und Gesicht ---
+                    mask_bool = np.any(canvas_img > 0, axis=-1)
+                    dimmed_canvas = (canvas_img * hand_face_alpha).astype(np.uint8)
+                    
+                    # Mischen!
+                    frame_rgba[:, :, :3][mask_bool] = dimmed_canvas[mask_bool]
+                    frame_rgba[:, :, 3][mask_bool] = 255
                     frames_np_rgba[i] = frame_rgba
 
             frames_tensor = torch.from_numpy(np.stack(frames_np_rgba, axis=0)).contiguous() / 255.0
