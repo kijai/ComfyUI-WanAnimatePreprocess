@@ -16497,8 +16497,7 @@ class NLFDataHandDebugV6:
                 "generate_log_output": ("BOOLEAN", {"default": True}),
                 "viz_frame_idx": ("INT", {"default": 0, "min": 0, "max": 100000}),
                 "bone_thickness": ("INT", {"default": 2, "min": 1, "max": 10}),
-                "draw_scale_factor": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01}),
-                # --- NEUE INPUTS FÜR DIE KAMERA-AUFLÖSUNG ---
+                # --- Automatische Kamera-Parameter ---
                 "width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
                 "height": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
             },
@@ -16541,23 +16540,35 @@ class NLFDataHandDebugV6:
     def apply_collision(self, nlf_data, min_radius_body_pct, oval_vertical_stretch, smooth_entry, 
                         smooth_zone_body_pct, smooth_strength, move_elbows, 
                         elbow_move_percent, keep_arm_length, generate_log_output,
-                        viz_frame_idx, bone_thickness, draw_scale_factor, width, height, optional_image=None):
+                        viz_frame_idx, bone_thickness, width, height, optional_image=None):
         
         import copy
         import numpy as np
+        import math
         import torch
         import cv2
         
         new_data = copy.deepcopy(nlf_data)
         log_lines = []
         
+        # --- 3D Kamera-Perspektive berechnen (Exakt wie NLF_Render) ---
+        fov_degrees = 55.0
+        fov_radians = fov_degrees * (math.pi / 180.0)
+        larger_side = max(width, height)
+        focal_length = larger_side / (math.tan(fov_radians / 2) * 2)
+        cx, cy = width / 2.0, height / 2.0
+        
+        def project_3d_to_2d(pts_3d):
+            X, Y, Z = pts_3d[:, 0], pts_3d[:, 1], np.maximum(pts_3d[:, 2], 1e-5)
+            u = (focal_length * X / Z) + cx
+            v = (focal_length * Y / Z) + cy
+            return u, v
+
         # 1. BILD VORBEREITEN
         if optional_image is not None:
-            # ComfyUI Tensor [B, H, W, C] zu Numpy OpenCV [H, W, BGR]
             img_np = (optional_image[0].cpu().numpy() * 255).astype(np.uint8)
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         else:
-            # Schwarze Leinwand als Fallback mit den eingestellten Dimensionen!
             img_bgr = np.zeros((height, width, 3), dtype=np.uint8)
             
         overlay = img_bgr.copy()
@@ -16577,11 +16588,6 @@ class NLFDataHandDebugV6:
         R_SHOULDER, R_ELBOW, R_WRIST, R_HAND = 17, 19, 21, 23
         
         smpl_bones = [(0,1), (0,2), (0,3), (1,4), (2,5), (3,6), (4,7), (5,8), (6,9), (7,10), (8,11), (9,12), (9,13), (9,14), (12,15), (13,16), (14,17), (16,18), (17,19), (18,20), (19,21), (20,22), (21,23)]
-        
-        if generate_log_output:
-            log_lines.append("="*50)
-            log_lines.append("🟢 NLF HAND COLLISION DEBUG LOG")
-            log_lines.append("="*50)
         
         for frame_idx in range(len(frames)):
             if frames[frame_idx] is None or len(frames[frame_idx]) == 0:
@@ -16612,42 +16618,10 @@ class NLFDataHandDebugV6:
                 smooth_zone_units = (smooth_zone_body_pct / 100.0) * torso_length if smooth_entry else 0.0
                 trigger_dist = min_dist_units + smooth_zone_units
                 
-                # BILD ZEICHNEN
-                if frame_idx == viz_frame_idx and person_idx == 0:
-                    for hip_idx in [L_HIP, R_HIP]:
-                        cx = int(joints[hip_idx][0] * draw_scale_factor)
-                        cy = int(joints[hip_idx][1] * draw_scale_factor)
-                        
-                        r_hard_x = int(min_dist_units * draw_scale_factor)
-                        r_hard_y = int((min_dist_units * oval_vertical_stretch) * draw_scale_factor)
-                        
-                        r_smooth_x = int(trigger_dist * draw_scale_factor)
-                        r_smooth_y = int((trigger_dist * oval_vertical_stretch) * draw_scale_factor)
-                        
-                        cv2.ellipse(overlay, (cx, cy), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), -1)
-                        cv2.ellipse(overlay, (cx, cy), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), -1)
-
-                    alpha = 0.3
-                    cv2.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0, img_bgr)
-                    
-                    for hip_idx in [L_HIP, R_HIP]:
-                        cx = int(joints[hip_idx][0] * draw_scale_factor)
-                        cy = int(joints[hip_idx][1] * draw_scale_factor)
-                        r_hard_x, r_hard_y = int(min_dist_units * draw_scale_factor), int((min_dist_units * oval_vertical_stretch) * draw_scale_factor)
-                        r_smooth_x, r_smooth_y = int(trigger_dist * draw_scale_factor), int((trigger_dist * oval_vertical_stretch) * draw_scale_factor)
-                        
-                        cv2.ellipse(img_bgr, (cx, cy), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), 2)
-                        cv2.ellipse(img_bgr, (cx, cy), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), 2)
-                        
-                    for (i, j) in smpl_bones:
-                        if i < len(joints) and j < len(joints):
-                            x1, y1 = int(joints[i][0] * draw_scale_factor), int(joints[i][1] * draw_scale_factor)
-                            x2, y2 = int(joints[j][0] * draw_scale_factor), int(joints[j][1] * draw_scale_factor)
-                            cv2.line(img_bgr, (x1, y1), (x2, y2), (255, 0, 0), bone_thickness)
-
+                orig_joints = joints.copy()
 
                 # --- DIE PHYSIKALISCHE KOLLISIONSLOGIK ---
-                def process_arm(arm_name, idx_shoulder, idx_elbow, idx_wrist, idx_hand):
+                def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand):
                     wrist_pos = joints[idx_wrist]
                     
                     vec_L = wrist_pos - joints[L_HIP]
@@ -16702,9 +16676,78 @@ class NLFDataHandDebugV6:
                                 joints[idx_hand] = target_hand
                                 joints[idx_elbow] = target_elbow
 
-                process_arm("Linker Arm", L_SHOULDER, L_ELBOW, L_WRIST, L_HAND)
-                process_arm("Rechter Arm", R_SHOULDER, R_ELBOW, R_WRIST, R_HAND)
+                process_arm(L_SHOULDER, L_ELBOW, L_WRIST, L_HAND)
+                process_arm(R_SHOULDER, R_ELBOW, R_WRIST, R_HAND)
                 
+                # --- VISUALISIERUNG ZEICHNEN ---
+                if frame_idx == viz_frame_idx and person_idx == 0:
+                    # 3D zu 2D Projektion!
+                    orig_u, orig_v = project_3d_to_2d(orig_joints)
+                    new_u, new_v = project_3d_to_2d(joints)
+                    
+                    # 1. LAYER: Gelbe Smooth-Zonen füllen
+                    for hip_idx in [L_HIP, R_HIP]:
+                        hz = max(orig_joints[hip_idx][2], 1e-5) # Tiefe (Z-Achse) der Hüfte
+                        center_x, center_y = int(orig_u[hip_idx]), int(orig_v[hip_idx])
+                        
+                        # Perspektivischer Radius: R_2D = (Focal_Length * R_3D) / Z
+                        r_smooth_x = int((focal_length * trigger_dist) / hz)
+                        r_smooth_y = int((focal_length * trigger_dist * oval_vertical_stretch) / hz)
+                        cv2.ellipse(overlay, (center_x, center_y), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), -1)
+                        
+                    # 2. LAYER: Rote Hard-Limit-Zonen füllen (Überschreibt Gelb)
+                    for hip_idx in [L_HIP, R_HIP]:
+                        hz = max(orig_joints[hip_idx][2], 1e-5)
+                        center_x, center_y = int(orig_u[hip_idx]), int(orig_v[hip_idx])
+                        r_hard_x = int((focal_length * min_dist_units) / hz)
+                        r_hard_y = int((focal_length * min_dist_units * oval_vertical_stretch) / hz)
+                        cv2.ellipse(overlay, (center_x, center_y), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), -1)
+
+                    # Transparenz mischen
+                    alpha = 0.3
+                    cv2.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0, img_bgr)
+                    
+                    # 3. LAYER: Outlines zeichnen
+                    for hip_idx in [L_HIP, R_HIP]:
+                        hz = max(orig_joints[hip_idx][2], 1e-5)
+                        center_x, center_y = int(orig_u[hip_idx]), int(orig_v[hip_idx])
+                        
+                        r_hard_x = int((focal_length * min_dist_units) / hz)
+                        r_hard_y = int((focal_length * min_dist_units * oval_vertical_stretch) / hz)
+                        r_smooth_x = int((focal_length * trigger_dist) / hz)
+                        r_smooth_y = int((focal_length * trigger_dist * oval_vertical_stretch) / hz)
+                        
+                        cv2.ellipse(img_bgr, (center_x, center_y), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), 2)
+                        cv2.ellipse(img_bgr, (center_x, center_y), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), 2)
+                        
+                    # 4. LAYER: Originales blaues Skelett
+                    for (i, j) in smpl_bones:
+                        if i < len(orig_joints) and j < len(orig_joints):
+                            x1, y1 = int(orig_u[i]), int(orig_v[i])
+                            x2, y2 = int(orig_u[j]), int(orig_v[j])
+                            cv2.line(img_bgr, (x1, y1), (x2, y2), (255, 0, 0), bone_thickness)
+
+                    # 5. LAYER: Lila verschobene Arme & Pfeile
+                    arm_bones = [(L_SHOULDER, L_ELBOW), (L_ELBOW, L_WRIST), (L_WRIST, L_HAND),
+                                 (R_SHOULDER, R_ELBOW), (R_ELBOW, R_WRIST), (R_WRIST, R_HAND)]
+                    
+                    for (i, j) in arm_bones:
+                        dist_moved = np.linalg.norm(orig_joints[j] - joints[j])
+                        if dist_moved > 0.001:
+                            x1, y1 = int(new_u[i]), int(new_v[i])
+                            x2, y2 = int(new_u[j]), int(new_v[j])
+                            # Lila Arm-Linie
+                            cv2.line(img_bgr, (x1, y1), (x2, y2), (255, 0, 255), bone_thickness + 1)
+                            
+                    # Pfeile, die die Verschiebung anzeigen (von alt zu neu)
+                    for point_idx in [L_ELBOW, L_WRIST, R_ELBOW, R_WRIST]:
+                        ox, oy = int(orig_u[point_idx]), int(orig_v[point_idx])
+                        nx, ny = int(new_u[point_idx]), int(new_v[point_idx])
+                        
+                        if abs(ox - nx) > 2 or abs(oy - ny) > 2:
+                            cv2.arrowedLine(img_bgr, (ox, oy), (nx, ny), (255, 0, 255), 2, tipLength=0.3)
+
+                # --- DATEN ZURÜCKSCHREIBEN ---
                 if is_tensor:
                     if has_extra_dim:
                         frames[frame_idx][person_idx][0] = torch.from_numpy(joints).to(person_data.device)
@@ -16716,12 +16759,7 @@ class NLFDataHandDebugV6:
                     else:
                         frames[frame_idx][person_idx] = joints.tolist()
 
-        if generate_log_output:
-            log_lines.append("="*50)
-            log_lines.append("🔴 LOG END")
-            log_lines.append("="*50)
-
-        final_log_string = "\n".join(log_lines) if generate_log_output else "Log output is disabled."
+        final_log_string = "Log output disabled (Render focus)."
 
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         out_image_tensor = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).unsqueeze(0)
