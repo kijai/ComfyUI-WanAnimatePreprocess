@@ -16767,6 +16767,333 @@ class NLFDataHandDebugV6:
         return (new_data, final_log_string, out_image_tensor,)
 
 
+class NLFDataHandDebugV7:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "nlf_data": ("NLFPRED",),
+                "min_radius_body_pct": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 200.0, "step": 1.0}),
+                "oval_vertical_stretch": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.1}),
+                "smooth_entry": ("BOOLEAN", {"default": True}),
+                "smooth_zone_body_pct": ("FLOAT", {"default": 30.0, "min": 0.0, "max": 100.0, "step": 1.0}),
+                "smooth_strength": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
+                
+                # --- NEU: Hand-spezifische Skalierungen ---
+                "hand_effect_radius_pct": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 200.0, "step": 1.0}),
+                "hand_smooth_zone_pct": ("FLOAT", {"default": 100.0, "min": 0.0, "max": 200.0, "step": 1.0}),
+                
+                # --- NEU: 3D-Illusion aufheben ---
+                "ignore_z_axis": ("BOOLEAN", {"default": False}),
+                
+                "move_elbows": ("BOOLEAN", {"default": True}),
+                "elbow_move_percent": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 100.0, "step": 1.0}),
+                "keep_arm_length": ("BOOLEAN", {"default": True}),
+                "generate_log_output": ("BOOLEAN", {"default": True}),
+                "viz_frame_idx": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                "bone_thickness": ("INT", {"default": 2, "min": 1, "max": 10}),
+                "width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
+            },
+            "optional": {
+                "optional_image": ("IMAGE",), 
+            }
+        }
+
+    RETURN_TYPES = ("NLFPRED", "STRING", "IMAGE",)
+    RETURN_NAMES = ("nlf_data", "debug_log", "debug_image",)
+    FUNCTION = "apply_collision"
+    CATEGORY = "WanAnimate/NLF"
+
+    def solve_fabrik(self, p_shoulder, p_elbow, p_wrist, target_wrist):
+        import numpy as np
+        L1 = np.linalg.norm(p_elbow - p_shoulder)
+        L2 = np.linalg.norm(p_wrist - p_elbow)
+        max_reach = L1 + L2
+        
+        reach_vec = target_wrist - p_shoulder
+        reach_dist = np.linalg.norm(reach_vec)
+        
+        if reach_dist >= max_reach:
+            dir_w = reach_vec / (reach_dist + 1e-8)
+            new_e = p_shoulder + dir_w * L1
+            new_w = new_e + dir_w * L2
+            return new_e, new_w
+            
+        w_prime = target_wrist
+        dir_e = p_elbow - w_prime
+        e_prime = w_prime + (dir_e / (np.linalg.norm(dir_e) + 1e-8)) * L2
+        
+        dir_e2 = e_prime - p_shoulder
+        new_e = p_shoulder + (dir_e2 / (np.linalg.norm(dir_e2) + 1e-8)) * L1
+        dir_w2 = w_prime - new_e
+        new_w = new_e + (dir_w2 / (np.linalg.norm(dir_w2) + 1e-8)) * L2
+        
+        return new_e, new_w
+
+    def apply_collision(self, nlf_data, min_radius_body_pct, oval_vertical_stretch, smooth_entry, 
+                        smooth_zone_body_pct, smooth_strength, hand_effect_radius_pct, hand_smooth_zone_pct,
+                        ignore_z_axis, move_elbows, elbow_move_percent, keep_arm_length, generate_log_output,
+                        viz_frame_idx, bone_thickness, width, height, optional_image=None):
+        
+        import copy
+        import numpy as np
+        import math
+        import torch
+        import cv2
+        
+        new_data = copy.deepcopy(nlf_data)
+        log_lines = []
+        
+        fov_degrees = 55.0
+        fov_radians = fov_degrees * (math.pi / 180.0)
+        larger_side = max(width, height)
+        focal_length = larger_side / (math.tan(fov_radians / 2) * 2)
+        cx, cy = width / 2.0, height / 2.0
+        
+        def project_3d_to_2d(pts_3d):
+            X, Y, Z = pts_3d[:, 0], pts_3d[:, 1], np.maximum(pts_3d[:, 2], 1e-5)
+            u = (focal_length * X / Z) + cx
+            v = (focal_length * Y / Z) + cy
+            return u, v
+
+        if optional_image is not None:
+            img_np = (optional_image[0].cpu().numpy() * 255).astype(np.uint8)
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        else:
+            img_bgr = np.zeros((height, width, 3), dtype=np.uint8)
+            
+        overlay = img_bgr.copy()
+        
+        is_dict = isinstance(new_data, dict)
+        if is_dict:
+            if 'joints3d_nonparam' in new_data:
+                frames = new_data['joints3d_nonparam'][0]
+            else:
+                out_tensor = torch.from_numpy(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0).unsqueeze(0)
+                return (new_data, "No joints3d_nonparam found.", out_tensor,)
+        else:
+            frames = new_data
+            
+        PELVIS, L_HIP, R_HIP = 0, 1, 2
+        L_SHOULDER, L_ELBOW, L_WRIST, L_HAND = 16, 18, 20, 22
+        R_SHOULDER, R_ELBOW, R_WRIST, R_HAND = 17, 19, 21, 23
+        
+        smpl_bones = [(0,1), (0,2), (0,3), (1,4), (2,5), (3,6), (4,7), (5,8), (6,9), (7,10), (8,11), (9,12), (9,13), (9,14), (12,15), (13,16), (14,17), (16,18), (17,19), (18,20), (19,21), (20,22), (21,23)]
+        
+        for frame_idx in range(len(frames)):
+            if frames[frame_idx] is None or len(frames[frame_idx]) == 0:
+                continue
+                
+            for person_idx in range(len(frames[frame_idx])):
+                person_data = frames[frame_idx][person_idx]
+                
+                is_tensor = isinstance(person_data, torch.Tensor)
+                if is_tensor:
+                    joints = person_data.cpu().numpy().copy()
+                else:
+                    joints = np.array(person_data, dtype=np.float32).copy()
+                    
+                has_extra_dim = joints.ndim == 3
+                if has_extra_dim:
+                    joints = joints[0]
+                    
+                if joints.shape[0] < 24:
+                    continue
+                
+                mid_shoulder = (joints[L_SHOULDER] + joints[R_SHOULDER]) / 2.0
+                torso_length = np.linalg.norm(mid_shoulder - joints[PELVIS])
+                if torso_length < 0.001:
+                    continue
+                
+                # Handgelenk Zonen
+                min_dist_units = (min_radius_body_pct / 100.0) * torso_length
+                smooth_zone_units = (smooth_zone_body_pct / 100.0) * torso_length if smooth_entry else 0.0
+                trigger_dist = min_dist_units + smooth_zone_units
+                
+                # Hand Zonen
+                hand_min_dist = min_dist_units * (hand_effect_radius_pct / 100.0)
+                hand_smooth_zone = smooth_zone_units * (hand_smooth_zone_pct / 100.0) if smooth_entry else 0.0
+                hand_trigger = hand_min_dist + hand_smooth_zone
+                
+                orig_joints = joints.copy()
+
+                def get_dist_and_dir(pos):
+                    vec_L = pos - joints[L_HIP]
+                    vec_R = pos - joints[R_HIP]
+                    
+                    if ignore_z_axis:
+                        vec_L[2] = 0.0
+                        vec_R[2] = 0.0
+                        
+                    vec_L_scaled = vec_L.copy()
+                    vec_L_scaled[1] /= max(0.1, oval_vertical_stretch) 
+                    vec_R_scaled = vec_R.copy()
+                    vec_R_scaled[1] /= max(0.1, oval_vertical_stretch)
+                    
+                    dist_L = np.linalg.norm(vec_L_scaled)
+                    dist_R = np.linalg.norm(vec_R_scaled)
+                    
+                    if dist_L < dist_R:
+                        return dist_L, vec_L
+                    else:
+                        return dist_R, vec_R
+
+                def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand):
+                    # --- 1. Handgelenk berechnen ---
+                    dist_W, vec_real_W = get_dist_and_dir(joints[idx_wrist])
+                    push_amount_W = 0
+                    
+                    if dist_W < trigger_dist and dist_W > 0.001:
+                        dir_vec_W = vec_real_W / (np.linalg.norm(vec_real_W) + 1e-8)
+                        if dist_W < min_dist_units:
+                            target_dist_W = min_dist_units
+                        else:
+                            t = (dist_W - min_dist_units) / smooth_zone_units
+                            t_curved = t ** (1.0 / smooth_strength)
+                            target_dist_W = min_dist_units + smooth_zone_units * t_curved
+                        push_amount_W = target_dist_W - dist_W 
+                        
+                    # Handgelenk und Ellbogen verschieben
+                    if push_amount_W > 0:
+                        actual_push_W = push_amount_W * oval_vertical_stretch 
+                        target_wrist = joints[idx_wrist] + dir_vec_W * actual_push_W
+                        target_elbow = joints[idx_elbow] + dir_vec_W * actual_push_W * (elbow_move_percent / 100.0)
+                        
+                        if keep_arm_length:
+                            new_e, new_w = self.solve_fabrik(joints[idx_shoulder], target_elbow, target_wrist, target_wrist)
+                            joints[idx_elbow] = new_e
+                            joints[idx_wrist] = new_w
+                        else:
+                            joints[idx_wrist] = target_wrist
+                            joints[idx_elbow] = target_elbow
+
+                    # --- 2. Echte Hand berechnen ---
+                    # Wo wäre die Hand jetzt (abhängig vom neuen Handgelenk)?
+                    if push_amount_W > 0 and keep_arm_length:
+                        tentative_hand = joints[idx_wrist] + (orig_joints[idx_hand] - orig_joints[idx_wrist])
+                    elif push_amount_W > 0:
+                        tentative_hand = orig_joints[idx_hand] + dir_vec_W * actual_push_W
+                    else:
+                        tentative_hand = orig_joints[idx_hand].copy()
+                        
+                    dist_H, vec_real_H = get_dist_and_dir(tentative_hand)
+                    push_amount_H = 0
+                    
+                    if dist_H < hand_trigger and dist_H > 0.001:
+                        dir_vec_H = vec_real_H / (np.linalg.norm(vec_real_H) + 1e-8)
+                        if dist_H < hand_min_dist:
+                            target_dist_H = hand_min_dist
+                        else:
+                            t = (dist_H - hand_min_dist) / (hand_smooth_zone + 1e-8)
+                            t_curved = t ** (1.0 / smooth_strength)
+                            target_dist_H = hand_min_dist + hand_smooth_zone * t_curved
+                        push_amount_H = target_dist_H - dist_H
+                        
+                    # Hand ggf. nochmal extra wegschieben
+                    if push_amount_H > 0:
+                        actual_push_H = push_amount_H * oval_vertical_stretch
+                        joints[idx_hand] = tentative_hand + dir_vec_H * actual_push_H
+                    else:
+                        joints[idx_hand] = tentative_hand
+
+                process_arm(L_SHOULDER, L_ELBOW, L_WRIST, L_HAND)
+                process_arm(R_SHOULDER, R_ELBOW, R_WRIST, R_HAND)
+                
+                # --- VISUALISIERUNG ZEICHNEN ---
+                if frame_idx == viz_frame_idx and person_idx == 0:
+                    orig_u, orig_v = project_3d_to_2d(orig_joints)
+                    new_u, new_v = project_3d_to_2d(joints)
+                    
+                    # 1. LAYER: Gelbe Smooth-Zonen (Handgelenk)
+                    for hip_idx in [L_HIP, R_HIP]:
+                        hz = max(orig_joints[hip_idx][2], 1e-5) 
+                        cx, cy = int(orig_u[hip_idx]), int(orig_v[hip_idx])
+                        r_smooth_x = int((focal_length * trigger_dist) / hz)
+                        r_smooth_y = int((focal_length * trigger_dist * oval_vertical_stretch) / hz)
+                        cv2.ellipse(overlay, (cx, cy), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), -1)
+                        
+                    # 2. LAYER: Rote Hard-Limit-Zonen (Handgelenk)
+                    for hip_idx in [L_HIP, R_HIP]:
+                        hz = max(orig_joints[hip_idx][2], 1e-5)
+                        cx, cy = int(orig_u[hip_idx]), int(orig_v[hip_idx])
+                        r_hard_x = int((focal_length * min_dist_units) / hz)
+                        r_hard_y = int((focal_length * min_dist_units * oval_vertical_stretch) / hz)
+                        cv2.ellipse(overlay, (cx, cy), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), -1)
+
+                    alpha = 0.3
+                    cv2.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0, img_bgr)
+                    
+                    # 3. LAYER: Outlines Handgelenk
+                    for hip_idx in [L_HIP, R_HIP]:
+                        hz = max(orig_joints[hip_idx][2], 1e-5)
+                        cx, cy = int(orig_u[hip_idx]), int(orig_v[hip_idx])
+                        
+                        r_hard_x = int((focal_length * min_dist_units) / hz)
+                        r_hard_y = int((focal_length * min_dist_units * oval_vertical_stretch) / hz)
+                        r_smooth_x = int((focal_length * trigger_dist) / hz)
+                        r_smooth_y = int((focal_length * trigger_dist * oval_vertical_stretch) / hz)
+                        
+                        cv2.ellipse(img_bgr, (cx, cy), (r_smooth_x, r_smooth_y), 0, 0, 360, (0, 255, 255), 2)
+                        cv2.ellipse(img_bgr, (cx, cy), (r_hard_x, r_hard_y), 0, 0, 360, (0, 0, 255), 2)
+                        
+                    # 4. LAYER: Dünne Outlines für die HAND-Zonen (Grün = Hard, Hellblau = Smooth)
+                    for hip_idx in [L_HIP, R_HIP]:
+                        hz = max(orig_joints[hip_idx][2], 1e-5)
+                        cx, cy = int(orig_u[hip_idx]), int(orig_v[hip_idx])
+                        
+                        rh_hard_x = int((focal_length * hand_min_dist) / hz)
+                        rh_hard_y = int((focal_length * hand_min_dist * oval_vertical_stretch) / hz)
+                        rh_smooth_x = int((focal_length * hand_trigger) / hz)
+                        rh_smooth_y = int((focal_length * hand_trigger * oval_vertical_stretch) / hz)
+                        
+                        cv2.ellipse(img_bgr, (cx, cy), (rh_smooth_x, rh_smooth_y), 0, 0, 360, (255, 255, 0), 1)
+                        cv2.ellipse(img_bgr, (cx, cy), (rh_hard_x, rh_hard_y), 0, 0, 360, (0, 255, 0), 1)
+
+                    # 5. LAYER: Originales blaues Skelett
+                    for (i, j) in smpl_bones:
+                        if i < len(orig_joints) and j < len(orig_joints):
+                            x1, y1 = int(orig_u[i]), int(orig_v[i])
+                            x2, y2 = int(orig_u[j]), int(orig_v[j])
+                            cv2.line(img_bgr, (x1, y1), (x2, y2), (255, 0, 0), bone_thickness)
+
+                    # 6. LAYER: Lila verschobene Arme & Pfeile
+                    arm_bones = [(L_SHOULDER, L_ELBOW), (L_ELBOW, L_WRIST), (L_WRIST, L_HAND),
+                                 (R_SHOULDER, R_ELBOW), (R_ELBOW, R_WRIST), (R_WRIST, R_HAND)]
+                    
+                    for (i, j) in arm_bones:
+                        dist_moved = np.linalg.norm(orig_joints[j] - joints[j])
+                        if dist_moved > 0.001:
+                            x1, y1 = int(new_u[i]), int(new_v[i])
+                            x2, y2 = int(new_u[j]), int(new_v[j])
+                            cv2.line(img_bgr, (x1, y1), (x2, y2), (255, 0, 255), bone_thickness + 1)
+                            
+                    for point_idx in [L_ELBOW, L_WRIST, R_ELBOW, R_WRIST, L_HAND, R_HAND]:
+                        ox, oy = int(orig_u[point_idx]), int(orig_v[point_idx])
+                        nx, ny = int(new_u[point_idx]), int(new_v[point_idx])
+                        
+                        if abs(ox - nx) > 2 or abs(oy - ny) > 2:
+                            cv2.arrowedLine(img_bgr, (ox, oy), (nx, ny), (255, 0, 255), 2, tipLength=0.3)
+
+                if is_tensor:
+                    if has_extra_dim:
+                        frames[frame_idx][person_idx][0] = torch.from_numpy(joints).to(person_data.device)
+                    else:
+                        frames[frame_idx][person_idx] = torch.from_numpy(joints).to(person_data.device)
+                else:
+                    if has_extra_dim:
+                        frames[frame_idx][person_idx][0] = joints.tolist()
+                    else:
+                        frames[frame_idx][person_idx] = joints.tolist()
+
+        final_log_string = "Log output disabled (Render focus)."
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        out_image_tensor = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).unsqueeze(0)
+
+        return (new_data, final_log_string, out_image_tensor,)
+
+
 class NLFProportionalRetargeterV13:
     @classmethod
     def INPUT_TYPES(cls):
@@ -17105,6 +17432,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFDataHandDebugV4": NLFDataHandDebugV4,
     "NLFDataHandDebugV5": NLFDataHandDebugV5,
     "NLFDataHandDebugV6": NLFDataHandDebugV6,
+    "NLFDataHandDebugV7": NLFDataHandDebugV7,
     "NLFProportionalRetargeterV13": NLFProportionalRetargeterV13,
     
 }
@@ -17196,6 +17524,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFDataHandDebugV4": "NLF Data Hand Debug V4 (Collision / IK)",
     "NLFDataHandDebugV5": "NLF Data Hand Debug V5 (Collision / IK)",
     "NLFDataHandDebugV6": "NLF Data Hand Debug V6 (Collision / IK)",
+    "NLFDataHandDebugV7": "NLF Data Hand Debug V7 (Collision / IK)",
     "NLFProportionalRetargeterV13": "NLF Proportional Retargeter V13",
     
 }
