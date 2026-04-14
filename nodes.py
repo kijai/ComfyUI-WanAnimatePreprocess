@@ -18413,7 +18413,6 @@ class NLFDataHandDebugV11:
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         return (new_data, "\n".join(log_lines), torch.from_numpy(img_rgb.astype(np.float32) / 255.0).unsqueeze(0), json.dumps(fingertip_offsets_dict),)
 
-
 class NLFDataHandDebugV12:
     @classmethod
     def INPUT_TYPES(s):
@@ -18426,8 +18425,6 @@ class NLFDataHandDebugV12:
                 "oval_depth_stretch": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.1}),
                 
                 "oval_center_offset_outward": ("FLOAT", {"default": 0.0, "min": -100.0, "max": 100.0, "step": 0.5}),
-                
-                # --- NEU: Verschiebt den inneren Kraft-Kern, während die Hülle bleibt (Das Skew-Feld) ---
                 "asymmetry_core_shift_pct": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 1.0}),
                 
                 "smooth_entry": ("BOOLEAN", {"default": True}),
@@ -18547,15 +18544,23 @@ class NLFDataHandDebugV12:
                 hist = temporal_history[p_key]
                 fingertip_offsets_dict[str(frame_idx)][p_key] = {"left_hand": [0.0, 0.0], "right_hand": [0.0, 0.0]}
                 
-                joints = person_data.cpu().numpy().copy() if isinstance(person_data, torch.Tensor) else np.array(person_data, dtype=np.float32).copy()
-                if joints.ndim == 3: joints = joints[0]
+                # --- BUGFIX: Sicheres Entpacken von Tensor/Numpy ---
+                is_tensor = isinstance(person_data, torch.Tensor)
+                if is_tensor:
+                    joints = person_data.cpu().numpy().copy()
+                else:
+                    joints = np.array(person_data, dtype=np.float32).copy()
+                    
+                has_extra_dim = joints.ndim == 3
+                if has_extra_dim:
+                    joints = joints[0]
+                    
                 if joints.shape[0] < 24: continue
                 
                 mid_shoulder = (joints[L_SHOULDER] + joints[R_SHOULDER]) / 2.0
                 torso_length = np.linalg.norm(mid_shoulder - joints[PELVIS])
                 if torso_length < 0.001: continue
                 
-                # 1. Äußeres Zentrum verschieben (Die Hülle wandert)
                 hip_dist_vec = joints[L_HIP] - joints[R_HIP]
                 outward_dir = hip_dist_vec / (np.linalg.norm(hip_dist_vec) + 1e-8)
                 
@@ -18572,60 +18577,53 @@ class NLFDataHandDebugV12:
                 hand_smooth_zone = smooth_zone_units * (hand_smooth_zone_pct / 100.0) if smooth_entry else 0.0
                 hand_trigger = hand_min_dist + hand_smooth_zone
                 
-                # 2. Inneren Kraft-Kern verschieben (Das asymmetrische Feld)
-                core_offset_val = (asymmetry_core_shift_pct / 100.0) * min_dist_units * 0.98 # Max 98% an den Rand
+                core_offset_val = (asymmetry_core_shift_pct / 100.0) * min_dist_units * 0.98
                 core_L = v_center_L + outward_dirs[L_HIP] * core_offset_val
                 core_R = v_center_R + outward_dirs[R_HIP] * core_offset_val
                 cores = {L_HIP: core_L, R_HIP: core_R}
                 
                 orig_joints = joints.copy()
 
-                # --- DIE NEUE SKEWED DISTANCE MATHEMATIK ---
                 def get_skewed_dist_and_push(pos, hip_idx, R_base):
                     v_center = v_centers[hip_idx]
                     core = cores[hip_idx]
                     
                     stretches = np.array([max(0.1, oval_horizontal_stretch), max(0.1, oval_vertical_stretch), 1e8 if ignore_z_axis else max(0.1, oval_depth_stretch)])
                     
-                    # In den perfekten Kugel-Raum transformieren
                     v_center_scaled = v_center / stretches
                     core_scaled = core / stretches
                     pos_scaled = pos.copy()
                     if ignore_z_axis: pos_scaled[2] = 0.0
                     pos_scaled = pos_scaled / stretches
                     
-                    # Strahl vom Kraft-Kern zur Hand
                     v_from_core = pos_scaled - core_scaled
                     dist_raw = np.linalg.norm(v_from_core)
-                    if dist_raw < 1e-6: return 0.0, np.zeros(3)
+                    if dist_raw < 1e-6: return 0.0, np.zeros(3), 1.0, stretches
                     
                     u_hat = v_from_core / dist_raw
                     d_vec = core_scaled - v_center_scaled
                     
-                    # Schnittpunkt mit der gedachten Hülle (Quadratische Gleichung)
                     d_dot_u = np.dot(d_vec, u_hat)
                     d_sq = np.dot(d_vec, d_vec)
                     discriminant = max(0.0, d_dot_u**2 - (d_sq - R_base**2))
                     t_boundary = -d_dot_u + np.sqrt(discriminant)
                     if t_boundary < 1e-5: t_boundary = 1e-5
                     
-                    # Normierte Distanz berechnen (effektive Distanz zur Hülle)
                     t_ratio = t_boundary / R_base
                     dist_eff = dist_raw / t_ratio
                     
                     return dist_eff, u_hat, t_ratio, stretches
 
                 def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand, target_hip_idx, wrist_key, hand_key):
-                    # --- 1. Handgelenk ---
                     dist_eff_W, u_hat_W, t_ratio_W, stretches = get_skewed_dist_and_push(joints[idx_wrist], target_hip_idx, min_dist_units)
                     raw_push_W = np.zeros(3)
                     
                     if dist_eff_W < trigger_dist and dist_eff_W > 0.001:
                         target_dist_W = min_dist_units if dist_eff_W < min_dist_units else min_dist_units + smooth_zone_units * ((dist_eff_W - min_dist_units) / smooth_zone_units)**(1.0/smooth_strength)
                         delta_eff = target_dist_W - dist_eff_W
-                        delta_raw = delta_eff * t_ratio_W # Zurück in den Kern-Raum
+                        delta_raw = delta_eff * t_ratio_W 
                         push_scaled = u_hat_W * delta_raw
-                        raw_push_W = push_scaled * stretches # Zurück in den 3D-Raum
+                        raw_push_W = push_scaled * stretches 
                     
                     smoothed_push_W = raw_push_W * (1.0 - temporal_smooth_factor) + hist[wrist_key] * temporal_smooth_factor
                     hist[wrist_key] = smoothed_push_W
@@ -18639,11 +18637,9 @@ class NLFDataHandDebugV12:
                         else:
                             joints[idx_wrist], joints[idx_elbow] = target_wrist, target_elbow
 
-                    # --- 2. Hand ---
                     tentative_hand = joints[idx_wrist] + (orig_joints[idx_hand] - orig_joints[idx_wrist]) if keep_arm_length else orig_joints[idx_hand] + smoothed_push_W
-                    dist_eff_H, u_hat_H, t_ratio_H, _ = get_skewed_dist_and_push(tentative_hand, target_hip_idx, min_dist_units) # Hülle bleibt min_dist_units als Basis
+                    dist_eff_H, u_hat_H, t_ratio_H, _ = get_skewed_dist_and_push(tentative_hand, target_hip_idx, min_dist_units) 
                     
-                    # Trigger-Zonen für die Hand anpassen (relativ zur Basis)
                     h_scale = hand_min_dist / min_dist_units if min_dist_units > 0 else 1.0
                     dist_eff_H_norm = dist_eff_H * h_scale 
                     
@@ -18659,7 +18655,6 @@ class NLFDataHandDebugV12:
                     hist[hand_key] = smoothed_push_H
                     joints[idx_hand] = tentative_hand + smoothed_push_H
 
-                    # --- 3. Winkel ---
                     if keep_hand_angle:
                         v1 = (orig_joints[idx_wrist] - orig_joints[idx_elbow]) / (np.linalg.norm(orig_joints[idx_wrist] - orig_joints[idx_elbow]) + 1e-8)
                         v2 = (joints[idx_wrist] - joints[idx_elbow]) / (np.linalg.norm(joints[idx_wrist] - joints[idx_elbow]) + 1e-8)
@@ -18674,7 +18669,6 @@ class NLFDataHandDebugV12:
                 process_arm(L_SHOULDER, L_ELBOW, L_WRIST, L_HAND, L_HIP, 'wrist_L', 'hand_L')
                 process_arm(R_SHOULDER, R_ELBOW, R_WRIST, R_HAND, R_HIP, 'wrist_R', 'hand_R')
                 
-                # --- OFFSETS SPEICHERN ---
                 orig_u, orig_v = project_3d_to_2d(orig_joints)
                 new_u, new_v = project_3d_to_2d(joints)
                 
@@ -18688,7 +18682,6 @@ class NLFDataHandDebugV12:
                 fingertip_offsets_dict[str(frame_idx)][str(person_idx)]["left_hand"] = [float(offset_px_L[0]), float(offset_px_L[1])]
                 fingertip_offsets_dict[str(frame_idx)][str(person_idx)]["right_hand"] = [float(offset_px_R[0]), float(offset_px_R[1])]
                 
-                # --- VISUALISIERUNG ---
                 if frame_idx == viz_frame_idx and person_idx == 0:
                     v_u, v_v = project_3d_to_2d(np.array([v_center_L, v_center_R]))
                     c_u, c_v = project_3d_to_2d(np.array([core_L, core_R]))
@@ -18703,14 +18696,12 @@ class NLFDataHandDebugV12:
                         cv2.ellipse(overlay, (vc_u, vc_v), (rx_s, ry_s), 0, 0, 360, (0, 255, 255), -1)
                         cv2.ellipse(overlay, (vc_u, vc_v), (rx_h, ry_h), 0, 0, 360, (0, 0, 255), -1)
                         
-                        # Weißer Punkt: Geometrische Mitte
                         cv2.circle(img_bgr, (vc_u, vc_v), 3, (255, 255, 255), -1)
-                        # Türkiser Punkt: Der verschobene Kraft-Ursprung
                         cv2.circle(img_bgr, (int(c_u[i]), int(c_v[i])), 7, (255, 255, 0), -1)
 
                     cv2.addWeighted(overlay, 0.3, img_bgr, 0.7, 0, img_bgr)
                     
-                    for i, hip_idx in enumerate([L_HIP, R_HIP]):
+                    for i, hip_idx in enumerate([L_HIP, R_HIP]:
                         hz = max(orig_joints[hip_idx][2], 1e-5)
                         vc_u, vc_v = int(v_u[i]), int(v_v[i])
                         rx_smooth = int((focal_length * trigger_dist * oval_horizontal_stretch) / hz)
@@ -18725,8 +18716,17 @@ class NLFDataHandDebugV12:
                         if np.linalg.norm(orig_joints[point_idx] - joints[point_idx]) > 0.001:
                             cv2.arrowedLine(img_bgr, (int(orig_u[point_idx]), int(orig_v[point_idx])), (int(new_u[point_idx]), int(new_v[point_idx])), (255, 0, 255), 2, tipLength=0.3)
 
-                if is_tensor: frames[frame_idx][person_idx] = torch.from_numpy(joints).to(person_data.device)
-                else: frames[frame_idx][person_idx] = joints.tolist()
+                # --- BUGFIX: Sicheres Speichern (Berücksichtigt Extra-Dimension) ---
+                if is_tensor:
+                    if has_extra_dim:
+                        frames[frame_idx][person_idx][0] = torch.from_numpy(joints).to(person_data.device)
+                    else:
+                        frames[frame_idx][person_idx] = torch.from_numpy(joints).to(person_data.device)
+                else:
+                    if has_extra_dim:
+                        frames[frame_idx][person_idx][0] = joints.tolist()
+                    else:
+                        frames[frame_idx][person_idx] = joints.tolist()
 
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         return (new_data, "\n".join(log_lines), torch.from_numpy(img_rgb.astype(np.float32) / 255.0).unsqueeze(0), json.dumps(fingertip_offsets_dict),)
