@@ -18532,6 +18532,11 @@ class NLFDataHandDebugV12:
         R_SHOULDER, R_ELBOW, R_WRIST, R_HAND = 17, 19, 21, 23
         smpl_bones = [(0,1), (0,2), (0,3), (1,4), (2,5), (3,6), (4,7), (5,8), (6,9), (7,10), (8,11), (9,12), (9,13), (9,14), (12,15), (13,16), (14,17), (16,18), (17,19), (18,20), (19,21), (20,22), (21,23)]
         
+        if generate_log_output:
+            log_lines.append("="*50)
+            log_lines.append("🟢 NLF HAND COLLISION DEBUG LOG")
+            log_lines.append("="*50)
+
         for frame_idx in range(len(frames)):
             if frames[frame_idx] is None or len(frames[frame_idx]) == 0: continue
             fingertip_offsets_dict[str(frame_idx)] = {}
@@ -18581,12 +18586,15 @@ class NLFDataHandDebugV12:
                 core_R = v_center_R + outward_dirs[R_HIP] * core_offset_val
                 cores = {L_HIP: core_L, R_HIP: core_R}
                 
+                if generate_log_output and frame_idx % 10 == 0:
+                    log_lines.append(f"\n[Frame {frame_idx} | Person {person_idx}]")
+                    log_lines.append(f"  Torso: {torso_length:.3f} | Trigger-Zone: {trigger_dist:.3f}")
+                
                 orig_joints = joints.copy()
 
                 def get_skewed_dist_and_push(pos, hip_idx, R_base):
                     v_center = v_centers[hip_idx]
                     core = cores[hip_idx]
-                    
                     stretches = np.array([max(0.1, oval_horizontal_stretch), max(0.1, oval_vertical_stretch), 1e8 if ignore_z_axis else max(0.1, oval_depth_stretch)])
                     
                     v_center_scaled = v_center / stretches
@@ -18610,15 +18618,23 @@ class NLFDataHandDebugV12:
                     
                     t_ratio = t_boundary / R_base
                     dist_eff = dist_raw / t_ratio
-                    
                     return dist_eff, u_hat, t_ratio, stretches
 
-                def process_arm(idx_shoulder, idx_elbow, idx_wrist, idx_hand, target_hip_idx, wrist_key, hand_key):
+                def process_arm(arm_name, idx_shoulder, idx_elbow, idx_wrist, idx_hand, target_hip_idx, wrist_key, hand_key):
+                    # --- 1. Handgelenk ---
                     dist_eff_W, u_hat_W, t_ratio_W, stretches = get_skewed_dist_and_push(joints[idx_wrist], target_hip_idx, min_dist_units)
                     raw_push_W = np.zeros(3)
                     
                     if dist_eff_W < trigger_dist and dist_eff_W > 0.001:
-                        target_dist_W = min_dist_units if dist_eff_W < min_dist_units else min_dist_units + smooth_zone_units * ((dist_eff_W - min_dist_units) / smooth_zone_units)**(1.0/smooth_strength)
+                        if dist_eff_W < min_dist_units:
+                            target_dist_W = min_dist_units
+                            if generate_log_output and frame_idx % 10 == 0:
+                                log_lines.append(f"  ⚠️ {arm_name} Handgelenk HARTER PUSH (Eff. Dist: {dist_eff_W:.3f})")
+                        else:
+                            target_dist_W = min_dist_units + smooth_zone_units * ((dist_eff_W - min_dist_units) / smooth_zone_units)**(1.0/smooth_strength)
+                            if generate_log_output and frame_idx % 10 == 0:
+                                log_lines.append(f"  ⚠️ {arm_name} Handgelenk SMOOTH PUSH (Eff. Dist: {dist_eff_W:.3f})")
+                                
                         delta_eff = target_dist_W - dist_eff_W
                         delta_raw = delta_eff * t_ratio_W 
                         push_scaled = u_hat_W * delta_raw
@@ -18636,6 +18652,7 @@ class NLFDataHandDebugV12:
                         else:
                             joints[idx_wrist], joints[idx_elbow] = target_wrist, target_elbow
 
+                    # --- 2. Hand ---
                     tentative_hand = joints[idx_wrist] + (orig_joints[idx_hand] - orig_joints[idx_wrist]) if keep_arm_length else orig_joints[idx_hand] + smoothed_push_W
                     dist_eff_H, u_hat_H, t_ratio_H, _ = get_skewed_dist_and_push(tentative_hand, target_hip_idx, min_dist_units) 
                     
@@ -18644,7 +18661,15 @@ class NLFDataHandDebugV12:
                     
                     raw_push_H = np.zeros(3)
                     if dist_eff_H_norm < hand_trigger and dist_eff_H_norm > 0.001:
-                        target_dist_H = hand_min_dist if dist_eff_H_norm < hand_min_dist else hand_min_dist + hand_smooth_zone * ((dist_eff_H_norm - hand_min_dist) / (hand_smooth_zone + 1e-8))**(1.0/smooth_strength)
+                        if dist_eff_H_norm < hand_min_dist:
+                            target_dist_H = hand_min_dist
+                            if generate_log_output and frame_idx % 10 == 0:
+                                log_lines.append(f"  ⚠️ {arm_name} Finger HARTER PUSH (Eff. Dist: {dist_eff_H_norm:.3f})")
+                        else:
+                            target_dist_H = hand_min_dist + hand_smooth_zone * ((dist_eff_H_norm - hand_min_dist) / (hand_smooth_zone + 1e-8))**(1.0/smooth_strength)
+                            if generate_log_output and frame_idx % 10 == 0:
+                                log_lines.append(f"  ⚠️ {arm_name} Finger SMOOTH PUSH (Eff. Dist: {dist_eff_H_norm:.3f})")
+                                
                         delta_eff_H = target_dist_H - dist_eff_H_norm
                         delta_raw_H = (delta_eff_H / h_scale) * t_ratio_H
                         push_scaled_H = u_hat_H * delta_raw_H
@@ -18654,6 +18679,7 @@ class NLFDataHandDebugV12:
                     hist[hand_key] = smoothed_push_H
                     joints[idx_hand] = tentative_hand + smoothed_push_H
 
+                    # --- 3. Winkel ---
                     if keep_hand_angle:
                         v1 = (orig_joints[idx_wrist] - orig_joints[idx_elbow]) / (np.linalg.norm(orig_joints[idx_wrist] - orig_joints[idx_elbow]) + 1e-8)
                         v2 = (joints[idx_wrist] - joints[idx_elbow]) / (np.linalg.norm(joints[idx_wrist] - joints[idx_elbow]) + 1e-8)
@@ -18665,9 +18691,10 @@ class NLFDataHandDebugV12:
                             joints[idx_hand] = joints[idx_wrist] + v * np.cos(angle) + np.cross(axis, v) * np.sin(angle) + axis * np.dot(axis, v) * (1.0 - np.cos(angle))
                         else: joints[idx_hand] = joints[idx_wrist] + (orig_joints[idx_hand] - orig_joints[idx_wrist])
 
-                process_arm(L_SHOULDER, L_ELBOW, L_WRIST, L_HAND, L_HIP, 'wrist_L', 'hand_L')
-                process_arm(R_SHOULDER, R_ELBOW, R_WRIST, R_HAND, R_HIP, 'wrist_R', 'hand_R')
+                process_arm("Linker Arm", L_SHOULDER, L_ELBOW, L_WRIST, L_HAND, L_HIP, 'wrist_L', 'hand_L')
+                process_arm("Rechter Arm", R_SHOULDER, R_ELBOW, R_WRIST, R_HAND, R_HIP, 'wrist_R', 'hand_R')
                 
+                # --- OFFSETS SPEICHERN ---
                 orig_u, orig_v = project_3d_to_2d(orig_joints)
                 new_u, new_v = project_3d_to_2d(joints)
                 
@@ -18681,25 +18708,30 @@ class NLFDataHandDebugV12:
                 fingertip_offsets_dict[str(frame_idx)][str(person_idx)]["left_hand"] = [float(offset_px_L[0]), float(offset_px_L[1])]
                 fingertip_offsets_dict[str(frame_idx)][str(person_idx)]["right_hand"] = [float(offset_px_R[0]), float(offset_px_R[1])]
                 
+                # --- VISUALISIERUNG ---
                 if frame_idx == viz_frame_idx and person_idx == 0:
                     v_u, v_v = project_3d_to_2d(np.array([v_center_L, v_center_R]))
                     c_u, c_v = project_3d_to_2d(np.array([core_L, core_R]))
                     
+                    # LAYER 1: Alle GELBEN Kreise (Smooth Zone) füllen
                     for i, hip_idx in enumerate([L_HIP, R_HIP]):
                         hz = max(orig_joints[hip_idx][2], 1e-5)
                         vc_u, vc_v = int(v_u[i]), int(v_v[i])
                         rx_s = int((focal_length * trigger_dist * oval_horizontal_stretch) / hz)
                         ry_s = int((focal_length * trigger_dist * oval_vertical_stretch) / hz)
+                        cv2.ellipse(overlay, (vc_u, vc_v), (rx_s, ry_s), 0, 0, 360, (0, 255, 255), -1)
+
+                    # LAYER 2: Alle ROTEN Kreise (Hard Limit) füllen -> Überlappen Gelb
+                    for i, hip_idx in enumerate([L_HIP, R_HIP]):
+                        hz = max(orig_joints[hip_idx][2], 1e-5)
+                        vc_u, vc_v = int(v_u[i]), int(v_v[i])
                         rx_h = int((focal_length * min_dist_units * oval_horizontal_stretch) / hz)
                         ry_h = int((focal_length * min_dist_units * oval_vertical_stretch) / hz)
-                        cv2.ellipse(overlay, (vc_u, vc_v), (rx_s, ry_s), 0, 0, 360, (0, 255, 255), -1)
                         cv2.ellipse(overlay, (vc_u, vc_v), (rx_h, ry_h), 0, 0, 360, (0, 0, 255), -1)
-                        
-                        cv2.circle(img_bgr, (vc_u, vc_v), 3, (255, 255, 255), -1)
-                        cv2.circle(img_bgr, (int(c_u[i]), int(c_v[i])), 7, (255, 255, 0), -1)
 
                     cv2.addWeighted(overlay, 0.3, img_bgr, 0.7, 0, img_bgr)
                     
+                    # LAYER 3: Outlines für Handgelenke (Gelb & Rot) und Zentren zeichnen
                     for i, hip_idx in enumerate([L_HIP, R_HIP]):
                         hz = max(orig_joints[hip_idx][2], 1e-5)
                         vc_u, vc_v = int(v_u[i]), int(v_v[i])
@@ -18707,10 +18739,39 @@ class NLFDataHandDebugV12:
                         ry_smooth = int((focal_length * trigger_dist * oval_vertical_stretch) / hz)
                         rx_hard = int((focal_length * min_dist_units * oval_horizontal_stretch) / hz)
                         ry_hard = int((focal_length * min_dist_units * oval_vertical_stretch) / hz)
+                        
                         cv2.ellipse(img_bgr, (vc_u, vc_v), (rx_smooth, ry_smooth), 0, 0, 360, (0, 255, 255), 2)
                         cv2.ellipse(img_bgr, (vc_u, vc_v), (rx_hard, ry_hard), 0, 0, 360, (0, 0, 255), 2)
+                        
+                        # Zentren
+                        cv2.circle(img_bgr, (vc_u, vc_v), 3, (255, 255, 255), -1)
+                        cv2.circle(img_bgr, (int(c_u[i]), int(c_v[i])), 7, (255, 255, 0), -1)
 
-                    for (i, j) in smpl_bones: cv2.line(img_bgr, (int(orig_u[i]), int(orig_v[i])), (int(orig_u[j]), int(orig_v[j])), (255, 0, 0), bone_thickness)
+                    # LAYER 4: Outlines für Hand-Zonen (Cyan & Grün dünn)
+                    for i, hip_idx in enumerate([L_HIP, R_HIP]):
+                        hz = max(orig_joints[hip_idx][2], 1e-5)
+                        vc_u, vc_v = int(v_u[i]), int(v_v[i])
+                        rh_smooth_x = int((focal_length * hand_trigger * oval_horizontal_stretch) / hz)
+                        rh_smooth_y = int((focal_length * hand_trigger * oval_vertical_stretch) / hz)
+                        rh_hard_x = int((focal_length * hand_min_dist * oval_horizontal_stretch) / hz)
+                        rh_hard_y = int((focal_length * hand_min_dist * oval_vertical_stretch) / hz)
+                        
+                        cv2.ellipse(img_bgr, (vc_u, vc_v), (rh_smooth_x, rh_smooth_y), 0, 0, 360, (255, 255, 0), 1)
+                        cv2.ellipse(img_bgr, (vc_u, vc_v), (rh_hard_x, rh_hard_y), 0, 0, 360, (0, 255, 0), 1)
+
+                    # LAYER 5: Blaues Skelett (Original)
+                    for (i, j) in smpl_bones: 
+                        if i < len(orig_joints) and j < len(orig_joints):
+                            cv2.line(img_bgr, (int(orig_u[i]), int(orig_v[i])), (int(orig_u[j]), int(orig_v[j])), (255, 0, 0), bone_thickness)
+
+                    # LAYER 6: Lila Arme und Pfeile (Nach der Kollision)
+                    arm_bones = [(L_SHOULDER, L_ELBOW), (L_ELBOW, L_WRIST), (L_WRIST, L_HAND),
+                                 (R_SHOULDER, R_ELBOW), (R_ELBOW, R_WRIST), (R_WRIST, R_HAND)]
+                    
+                    for (i, j) in arm_bones:
+                        if np.linalg.norm(orig_joints[j] - joints[j]) > 0.001:
+                            cv2.line(img_bgr, (int(new_u[i]), int(new_v[i])), (int(new_u[j]), int(new_v[j])), (255, 0, 255), bone_thickness + 1)
+                            
                     for point_idx in [L_ELBOW, L_WRIST, R_ELBOW, R_WRIST, L_HAND, R_HAND]:
                         if np.linalg.norm(orig_joints[point_idx] - joints[point_idx]) > 0.001:
                             cv2.arrowedLine(img_bgr, (int(orig_u[point_idx]), int(orig_v[point_idx])), (int(new_u[point_idx]), int(new_v[point_idx])), (255, 0, 255), 2, tipLength=0.3)
@@ -18726,8 +18787,17 @@ class NLFDataHandDebugV12:
                     else:
                         frames[frame_idx][person_idx] = joints.tolist()
 
+        if generate_log_output:
+            log_lines.append("="*50)
+            log_lines.append("🔴 LOG END")
+            log_lines.append("="*50)
+
+        final_log_string = "\n".join(log_lines) if generate_log_output else "Log output disabled."
+        offsets_json_string = json.dumps(fingertip_offsets_dict)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        return (new_data, "\n".join(log_lines), torch.from_numpy(img_rgb.astype(np.float32) / 255.0).unsqueeze(0), json.dumps(fingertip_offsets_dict),)
+        out_image_tensor = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).unsqueeze(0)
+
+        return (new_data, final_log_string, out_image_tensor, offsets_json_string,)
 
 class NLFProportionalRetargeterV13:
     @classmethod
