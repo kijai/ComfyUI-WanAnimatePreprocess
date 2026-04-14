@@ -19469,6 +19469,73 @@ class RenderNLFPosesDirectPoseDataMimic16:
             log_messages.append(traceback.format_exc())
             return (torch.zeros((1, height, width, 3)), torch.zeros((1, height, width)), "\n".join(log_messages), nlf_poses, "{}", None)
 
+class PoseCalibrationManipulator2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "calibration_data": ("POSE_CALIBRATION",),
+                "echte_groesse_override": ("FLOAT", {"default": 2.10, "min": 0.1, "max": 5.0, "step": 0.01, "tooltip": "Erzwingt eine neue echte Größe in Metern."}),
+                "enable_override": ("BOOLEAN", {"default": False, "tooltip": "Wenn False, werden die Originaldaten durchgeleitet."})
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION", "STRING")
+    RETURN_NAMES = ("modified_calibration", "log_output")
+    FUNCTION = "manipulate"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "Manipuliert die echte_groesse nachträglich und passt alle abhängigen Meter- und Scaler-Werte proportional an."
+
+    def manipulate(self, calibration_data, echte_groesse_override, enable_override):
+        import copy
+        import json
+        
+        # Tiefkopie, um das Original nicht zu zerstören
+        calib = copy.deepcopy(calibration_data)
+        log_messages = ["=== CALIBRATION MANIPULATOR LOG ==="]
+
+        if not enable_override:
+            log_messages.append("Bypass aktiv: Originaldaten werden unverändert weitergeleitet.")
+            return (calib, "\n".join(log_messages))
+
+        alte_groesse = calib.get("echte_groesse", 1.0)
+        
+        if alte_groesse <= 0:
+            log_messages.append("Fehler: Originale echte_groesse ist <= 0. Manipulation abgebrochen.")
+            return (calib, "\n".join(log_messages))
+
+        # Skalierungsfaktor berechnen
+        faktor = echte_groesse_override / alte_groesse
+        
+        log_messages.append(f"Originale Größe: {alte_groesse:.3f}m")
+        log_messages.append(f"Neue Ziel-Größe: {echte_groesse_override:.3f}m")
+        log_messages.append(f"Manipulations-Faktor: {faktor:.4f}x")
+
+        # 1. Hauptgröße überschreiben
+        calib["echte_groesse"] = echte_groesse_override
+
+        # 2. Metrische Knochen proportional anpassen
+        bone_m = calib.get("bone_lengths_in_meters", {})
+        if bone_m:
+            log_messages.append("\n--- NEUE METRISCHE KNOCHEN (bone_lengths_in_meters) ---")
+            for key, val in bone_m.items():
+                neuer_wert = val * faktor
+                calib["bone_lengths_in_meters"][key] = neuer_wert
+                log_messages.append(f"{key.capitalize()}: {val:.3f}m -> {neuer_wert:.3f}m")
+        
+        # 3. Scaler-Knochen proportional anpassen (Wie gewünscht)
+        bone_s = calib.get("bone_length_for_scaler", {})
+        if bone_s:
+            log_messages.append("\n--- NEUE SCALER KNOCHEN (bone_length_for_scaler) ---")
+            for key, val in bone_s.items():
+                neuer_wert = val * faktor
+                calib["bone_length_for_scaler"][key] = neuer_wert
+                log_messages.append(f"{key.capitalize()}: {val:.3f} -> {neuer_wert:.3f}")
+
+        log_messages.append("\nProportionen (true_3d_bones) bleiben unangetastet (Das erledigt der Bones2-Scaler).")
+
+        return (calib, "\n".join(log_messages))
+
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -19565,6 +19632,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFDataHandDebugV12": NLFDataHandDebugV12,
     "NLFProportionalRetargeterV13": NLFProportionalRetargeterV13,
     "RenderNLFPosesDirectPoseDataMimic16": RenderNLFPosesDirectPoseDataMimic16,
+    "PoseCalibrationManipulator2": PoseCalibrationManipulator2,
     
 }
 
@@ -19663,6 +19731,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFDataHandDebugV12": "NLF Data Hand Debug V12 (Collision / IK)",
     "NLFProportionalRetargeterV13": "NLF Proportional Retargeter V13",
     "RenderNLFPosesDirectPoseDataMimic16": "Render NLF Poses Mimic 16 (Flat 3D PoseData)",
+    "PoseCalibrationManipulator2": "Pose Calibration Manipulator2",
     
 }
 
