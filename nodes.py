@@ -20258,7 +20258,7 @@ class NLFProportionalRetargeterV14:
     RETURN_NAMES = ("nlf_data_retargeted", "log_output")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Retargeting"
-    DESCRIPTION = "V14: Globale Höhen-Stabilisierung am Anchor-Frame. Inkl. Toggle für Breiten/Kopf-Skalierung."
+    DESCRIPTION = "V14: Perfekter NLF-Loop zur Höhenstabilisierung am Anchor-Frame. Inkl. Toggle für Breiten/Kopf."
 
     def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance, scale_stance_and_head):
         import copy
@@ -20266,7 +20266,7 @@ class NLFProportionalRetargeterV14:
         import math
         import torch
 
-        log_messages = ["=== NLF PROPORTIONAL RETARGETER V14 (STABILE HÖHE & STANCE TOGGLE) ==="]
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V14 (EXAKTER 3D-LOOP & STANCE TOGGLE) ==="]
         
         true_3d_bones = calibration_data.get("true_3d_bones", {})
         if not true_3d_bones:
@@ -20324,7 +20324,7 @@ class NLFProportionalRetargeterV14:
             if score > best_score:
                 best_score, best_idx = score, idx
 
-        log_messages.append(f"-> Referenz-Frame (Anchor) für globale Messung: {best_idx}")
+        log_messages.append(f"-> Referenz-Frame (Anchor) für globalen Scale-Loop: {best_idx}")
 
         ref_frame_data = raw_poses[best_idx]
         is_t = isinstance(ref_frame_data, torch.Tensor)
@@ -20336,7 +20336,6 @@ class NLFProportionalRetargeterV14:
         missing_neck = orig_torso_ref * (head_val / 100.0) / 2.0 if is_normalized else head_val / 2.0
         reference_torso_length = orig_torso_ref + missing_neck
 
-        # Die Targets basieren alle auf der Referenzlänge und sind global für alle Frames gültig
         targets = {k: (v / 100.0 * reference_torso_length if is_normalized else v) for k, v in true_3d_bones.items()}
 
         # --- HILFSFUNKTIONEN ---
@@ -20356,7 +20355,6 @@ class NLFProportionalRetargeterV14:
             feet_y = [p_array[idx][1] for idx in [7,8,10,11,4,5] if idx < len(p_array) and np.linalg.norm(p_array[idx]) > 1e-5]
             return (max(feet_y) - top_y) if feet_y else 0.0
 
-        # Die Kernfunktion umgeschrieben, sodass do_log von außen gesteuert wird
         def build_and_log(pts_source, factor, final_mode=False, do_log=False):
             pts_b = pts_source.copy()
             
@@ -20364,7 +20362,7 @@ class NLFProportionalRetargeterV14:
             cv = pts_b[12] - pts_b[0]; cl = np.linalg.norm(cv)
             if cl > 1e-5:
                 t_len = targets.get("torso", cl)
-                if final_mode: t_len *= factor
+                if final_mode: t_len *= factor # Torso wird IMMER runterskaliert
                 if do_log: log_messages.append(f"Knochen: Torso          | Ist: {cl:.4f} -> Soll: {t_len:.4f}")
                 
                 f_node = t_len / cl
@@ -20379,11 +20377,10 @@ class NLFProportionalRetargeterV14:
                 cv = pts_b[15] - pts_b[12]; cl = np.linalg.norm(cv)
                 if cl > 1e-5:
                     t_len = targets.get("head", cl * 2.0) / 2.0
-                    # NEU: Kopfskalierung an den Toggle geknüpft
                     if final_mode and scale_stance_and_head: 
-                        t_len *= factor
+                        t_len *= factor # Kopfskalierung an den Toggle geknüpft
                     
-                    if do_log: log_messages.append(f"Knochen: Kopf (NLF-Map)  | Ist: {cl:.4f} -> Soll: {t_len:.4f}")
+                    if do_log: log_messages.append(f"Knochen: Kopf (NLF)      | Ist: {cl:.4f} -> Soll: {t_len:.4f}")
                     f_node = t_len / cl
                     delta = (pts_b[12] + (cv / cl * t_len)) - pts_b[15]
                     pts_b[15] += delta
@@ -20398,19 +20395,14 @@ class NLFProportionalRetargeterV14:
                 if cl < 1e-5: continue
 
                 if key in ['shoulder_width', 'hip_width']:
-                    # 1. Stance Target (Ganzes Bein wandert) -> Nimmt den Standard Config Wert
                     stance_target = targets.get(key, cl * 2.0) / 2.0
-                    
-                    # 2. Bone Target (Nur Gelenk wandert) -> Nimmt den Calibration Wert
                     calib_key = f"calibration_{key}"
                     bone_target = targets.get(calib_key, stance_target * 2.0) / 2.0
 
-                    # NEU: Breiten-Skalierung an den Toggle geknüpft
                     if final_mode and scale_stance_and_head:
-                        stance_target *= factor
+                        stance_target *= factor # Breiten-Skalierung an den Toggle geknüpft
                         bone_target *= factor
 
-                    # SCHRITT A: STANCE SCALE ANWENDEN
                     scale_xz_stance = stance_target / cl
                     pos_stance = pts_b[p_idx].copy()
                     pos_stance[0] += cv[0] * scale_xz_stance
@@ -20418,12 +20410,11 @@ class NLFProportionalRetargeterV14:
                     pos_stance[2] += cv[2] * scale_xz_stance
                     
                     delta_stance = pos_stance - pts_b[c_idx]
-                    pts_b[c_idx] += delta_stance # Gelenk verschieben
+                    pts_b[c_idx] += delta_stance
                     for d in get_all_descendants(c_idx, tree):
                         if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
-                            pts_b[d] += delta_stance # Beine mitverschieben
+                            pts_b[d] += delta_stance
 
-                    # SCHRITT B: BONE CONFIG ANWENDEN
                     scale_xz_config = bone_target / cl
                     pos_config = pts_b[p_idx].copy()
                     pos_config[0] += cv[0] * scale_xz_config
@@ -20431,20 +20422,18 @@ class NLFProportionalRetargeterV14:
                     pos_config[2] += cv[2] * scale_xz_config
                     
                     delta_config = pos_config - pts_b[c_idx]
-                    pts_b[c_idx] += delta_config # NUR das Gelenk verschieben
+                    pts_b[c_idx] += delta_config
                             
                     if do_log and (c_idx == 2 or c_idx == 17): 
-                        log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Scale (ganzes Bein): {stance_target:.4f} -> Config (nur Gelenk): {bone_target:.4f}")
+                        log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Scale: {stance_target:.4f} -> Config: {bone_target:.4f}")
 
                 else:
-                    # Normale Arme / Beine
                     if key not in targets: continue
                     t_len_normal = targets[key]
                     cal_k = "calibration_" + key
                     t_len_final = targets.get(cal_k, t_len_normal)
                     
-                    # Bei Armen und Beinen wird der Factor IMMER angewandt, um die Gesamthöhe zu stabilisieren
-                    if final_mode: t_len_final *= factor
+                    if final_mode: t_len_final *= factor # Arme und Beine IMMER runterskaliert
                     
                     dir_vec = cv / cl
                     new_c_pos = pts_b[p_idx] + (dir_vec * t_len_final)
@@ -20462,18 +20451,31 @@ class NLFProportionalRetargeterV14:
             return pts_b
 
 
-        # --- PHASE 1: GLOBALE MESSUNG AM ANCHOR-FRAME ---
-        # Wir messen genau 1x am perfekten Frame, wie stark das Retargeting die Y-Höhe verzerrt
+        # --- PHASE 1: ITERATIVER LOOP AM ANCHOR-FRAME (Für NLF-Raum Perfektion) ---
         orig_h_global = get_height_stable(ref_pts)
-        pts_dry_global = build_and_log(ref_pts, 1.0, final_mode=False, do_log=False)
-        dry_h_global = get_height_stable(pts_dry_global)
+        global_f_scale = 1.0
         
-        global_f_scale = orig_h_global / dry_h_global if (orig_h_global > 1e-5 and dry_h_global > 1e-5) else 1.0
+        log_messages.append(f"\n--- NLF-LOOP SKALIERUNG (Anchor Frame {best_idx}) ---")
+        log_messages.append(f"Ziel-Originalhöhe (NLF-Raum): {orig_h_global:.4f}")
+        
+        if orig_h_global > 1e-5:
+            # Maximal 10 Iterationen, um den perfekten Faktor zu finden
+            for iteration in range(10):
+                pts_test = build_and_log(ref_pts, global_f_scale, final_mode=True, do_log=False)
+                test_h = get_height_stable(pts_test)
+                
+                if test_h < 1e-5: break
+                
+                diff = abs(orig_h_global - test_h)
+                if diff < 0.1: # Toleranz: 0.1 NLF-Einheiten Differenz
+                    log_messages.append(f"Loop beendet in Iteration {iteration+1}. Differenz < 0.1")
+                    break
+                    
+                ratio = orig_h_global / test_h
+                global_f_scale *= ratio
 
-        log_messages.append(f"\n--- GLOBALE SKALIERUNG (Stabil für alle Frames) ---")
-        log_messages.append(f"Gemessene Original-Höhe: {orig_h_global:.4f}")
-        log_messages.append(f"Höhe nach Retargeting (ohne Korrektur): {dry_h_global:.4f}")
-        log_messages.append(f"-> Angewandter Globaler Faktor: {global_f_scale:.4f}x")
+        log_messages.append(f"Erreichte Test-Höhe im NLF-Raum: {test_h:.4f}")
+        log_messages.append(f"-> Angewandter Globaler Faktor für alle Frames: {global_f_scale:.6f}x")
         if scale_stance_and_head:
             log_messages.append("-> Toggle: Faktor WIRD auf Schultern/Hüfte und Kopf angewandt.")
         else:
@@ -20481,6 +20483,7 @@ class NLFProportionalRetargeterV14:
 
 
         # --- PHASE 2: VERARBEITUNG ALLER FRAMES ---
+        log_messages.append("\n--- LOG FINALE KNochenlängen (Anchor Frame) ---")
         for frame_idx in range(len(raw_poses)):
             frame_data = raw_poses[frame_idx]
             if frame_data is None or len(frame_data) == 0: continue
@@ -20489,10 +20492,9 @@ class NLFProportionalRetargeterV14:
             pts = frame_data[0].cpu().numpy().copy() if is_tensor and frame_data.dim() == 3 else (frame_data.cpu().numpy().copy() if is_tensor else np.array(frame_data).copy())
             if pts.ndim == 3: pts = pts[0]
 
-            # Wir loggen die Details nur einmalig am Anchor-Frame, damit die Console sauber bleibt
             is_anchor = (frame_idx == best_idx)
 
-            # Wende den Build mit dem CONSTANTEN f_scale an
+            # Wende den finalen Scale auf alle Frames an
             pts_final = build_and_log(pts, global_f_scale, final_mode=True, do_log=is_anchor)
 
             # GROUND ANCHOR (Person wieder auf den Boden stellen)
