@@ -21281,6 +21281,257 @@ class NLFProportionalRetargeterV17:
 
         return (nlf_data_retargeted, "\n".join(log_messages), clean_config_str)
 
+class NLFProportionalRetargeterV17ex:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_nlf_data": ("NLFPRED", {"tooltip": "Die originalen 3D NLF Daten"}),
+                "calibration_data": ("POSE_CALIBRATION", {"tooltip": "Die Referenz-Daten aus V20/V22"}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 90.0, "step": 1.0, "tooltip": "Toleranz für die Frontal-Suche"}),
+                "scale_stance_and_head": ("BOOLEAN", {"default": False, "tooltip": "Wendet den Höhen-Korrekturfaktor auch auf Schulter-/Hüftbreite und den Kopf an."}),
+            }
+        }
+
+    RETURN_TYPES = ("NLFPRED", "STRING")
+    RETURN_NAMES = ("nlf_data_retargeted", "log_output")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Retargeting"
+    DESCRIPTION = "V17: PELVIS-ANKER (Dein Fix!). Keine Boden-Verschiebung mehr. Kopf behält Originalgröße."
+
+    def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance, scale_stance_and_head):
+        import copy
+        import numpy as np
+        import math
+        import torch
+
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V17 (PELVIS ANCHOR & FIXED PROPORTIONS) ==="]
+        
+        true_3d_bones = calibration_data.get("true_3d_bones", {})
+        if not true_3d_bones:
+            log_messages.append("FEHLER: Keine true_3d_bones in calibration_data gefunden.")
+            return (video_nlf_data, "\n".join(log_messages))
+
+        is_dict = isinstance(video_nlf_data, dict)
+        nlf_data_retargeted = copy.deepcopy(video_nlf_data)
+        
+        if is_dict:
+            raw_poses = nlf_data_retargeted.get('joints3d_nonparam', [nlf_data_retargeted])[0]
+        else:
+            raw_poses = nlf_data_retargeted
+
+        is_normalized = math.isclose(true_3d_bones.get("torso", 0.0), 100.0, abs_tol=1e-3)
+        head_val = true_3d_bones.get("head", 0.0)
+
+        # --- STUFE 1 & 2: Anchor-Frame finden (wie vorher) ---
+        all_frames_data = []
+        frontal_indices = []
+
+        for i, frame_data in enumerate(raw_poses):
+            if frame_data is None or len(frame_data) == 0:
+                all_frames_data.append({'length': 0.0, 'is_frontal': False, 'has_feet': False})
+                continue
+            is_tensor = isinstance(frame_data, torch.Tensor)
+            pts = frame_data[0].cpu().numpy() if is_tensor and frame_data.dim() == 3 else (frame_data.cpu().numpy() if is_tensor else np.array(frame_data))
+            if pts.ndim == 3: pts = pts[0]
+            def is_val(idx): return idx < len(pts) and np.linalg.norm(pts[idx]) > 1e-5
+            valid_y = [pts[idx][1] for idx in range(len(pts)) if is_val(idx)]
+            length = (max(valid_y) - min(valid_y)) if valid_y else 0.0
+            is_frontal = False
+            if len(pts) >= 18:
+                dx_h, dz_h = pts[2][0] - pts[1][0], pts[2][2] - pts[1][2]
+                angle_h = math.degrees(math.atan2(abs(dz_h), abs(dx_h)))
+                dx_s, dz_s = pts[17][0] - pts[16][0], pts[17][2] - pts[16][2]
+                angle_s = math.degrees(math.atan2(abs(dz_s), abs(dx_s)))
+                if max(angle_h, angle_s) <= frontal_3d_angle_tolerance: is_frontal = True
+            all_frames_data.append({'length': length, 'is_frontal': is_frontal, 'has_feet': is_val(7) or is_val(8)})
+            if is_frontal: frontal_indices.append(i)
+
+        candidates = frontal_indices if frontal_indices else list(range(len(raw_poses)))
+        max_len = max([d['length'] for d in all_frames_data]) if all_frames_data else 1.0
+        best_idx, best_score = candidates[0], -1.0
+        for idx in candidates:
+            d = all_frames_data[idx]
+            score = (1000.0 if d['has_feet'] else 0.0) + (500.0 if d['is_frontal'] else 0.0) + ((d['length'] / max_len) * 100.0)
+            if score > best_score: best_score, best_idx = score, idx
+
+        ref_frame_data = raw_poses[best_idx]
+        is_t = isinstance(ref_frame_data, torch.Tensor)
+        ref_pts = ref_frame_data[0].cpu().numpy() if is_t and ref_frame_data.dim() == 3 else (ref_frame_data.cpu().numpy() if is_t else np.array(ref_frame_data))
+        if ref_pts.ndim == 3: ref_pts = ref_pts[0]
+
+        # --- HILFSFUNKTIONEN ---
+        tree = {0:[1,2,3], 1:[4], 4:[7], 7:[10], 2:[5], 5:[8], 8:[11], 3:[6], 6:[9], 9:[12,13,14], 12:[15], 13:[16], 16:[18], 18:[20], 20:[22], 14:[17], 17:[19], 19:[21], 21:[23]}
+        def get_all_descendants(node, tree_map):
+            desc = []
+            if node in tree_map:
+                for child in tree_map[node]:
+                    desc.append(child); desc.extend(get_all_descendants(child, tree_map))
+            return desc
+
+        def get_height_stable(p_array):
+            if 12 < len(p_array) and np.linalg.norm(p_array[12]) > 1e-5: top_y = p_array[12][1]
+            else: return 0.0
+            feet_y = [p_array[idx][1] for idx in [7,8,10,11,4,5] if idx < len(p_array) and np.linalg.norm(p_array[idx]) > 1e-5]
+            return (max(feet_y) - top_y) if feet_y else 0.0
+
+        def get_bone_lengths(pts_array):
+            def dist(p1, p2):
+                if p1 < len(pts_array) and p2 < len(pts_array) and np.linalg.norm(pts_array[p1]) > 1e-5 and np.linalg.norm(pts_array[p2]) > 1e-5:
+                    return float(np.linalg.norm(pts_array[p2] - pts_array[p1]))
+                return 0.0
+            return {
+                "Torso": dist(0, 12), "Kopf": dist(12, 15),
+                "R_Oberschenkel": dist(2, 5), "R_Wade": dist(5, 8),
+                "L_Oberschenkel": dist(1, 4), "L_Wade": dist(4, 7),
+                "R_Arm": dist(17, 19), "R_Unterarm": dist(19, 21),
+                "L_Arm": dist(16, 18), "L_Unterarm": dist(18, 20),
+                "Schulterbreite": dist(16, 17), "Hueftbreite": dist(1, 2)
+            }
+
+        def build_and_log(pts_source, factor, final_mode=False):
+            pts_b = pts_source.copy()
+            
+            orig_torso_curr = np.linalg.norm(pts_b[12] - pts_b[0]) if np.linalg.norm(pts_b[12]) > 1e-5 else 0.0
+            missing_neck_curr = orig_torso_curr * (head_val / 100.0) / 2.0 if is_normalized else head_val / 2.0
+            frame_ref_torso = orig_torso_curr + missing_neck_curr
+            targets = {k: (v / 100.0 * frame_ref_torso if is_normalized else v) for k, v in true_3d_bones.items()}
+            
+            # 1. Torso Skalierung
+            cv = pts_b[12] - pts_b[0]; cl = np.linalg.norm(cv)
+            if cl > 1e-5:
+                t_len = targets.get("torso", cl)
+                if final_mode: t_len *= factor
+                f_node = t_len / cl
+                for p, c in [(0,3), (3,6), (6,9), (9,12)]:
+                    vec = pts_b[c] - pts_b[p]; new_c = pts_b[p] + vec * f_node
+                    delta = new_c - pts_b[c]; pts_b[c] += delta
+                    for d in get_all_descendants(c, tree):
+                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5: pts_b[d] += delta
+
+            # 2. Kopf (USER-FIX: Behält Originalgröße, außer Toggle ist aktiv!)
+            if 15 < len(pts_b):
+                cv = pts_b[15] - pts_b[12]; cl = np.linalg.norm(cv)
+                if cl > 1e-5:
+                    t_len = cl # <--- HIER IST DER FIX! Originalgröße statt Config-Überschreibung
+                    if final_mode and scale_stance_and_head: t_len *= factor
+                    f_node = t_len / cl
+                    delta = (pts_b[12] + (cv / cl * t_len)) - pts_b[15]
+                    pts_b[15] += delta
+
+            # 3. Operations
+            ops = [('shoulder_width',12,17), ('shoulder_width',12,16), ('hip_width',0,2), ('hip_width',0,1),
+                   ('r_arm',17,19), ('r_forearm',19,21), ('l_arm',16,18), ('l_forearm',18,20),
+                   ('r_thigh',2,5), ('r_calf',5,8), ('l_thigh',1,4), ('l_calf',4,7)]
+
+            for key, p_idx, c_idx in ops:
+                cv = pts_b[c_idx] - pts_b[p_idx]; cl = np.linalg.norm(cv)
+                if cl < 1e-5: continue
+
+                if key in ['shoulder_width', 'hip_width']:
+                    stance_target = targets.get(key, cl * 2.0) / 2.0
+                    calib_key = f"calibration_{key}"
+                    bone_target = targets.get(calib_key, stance_target * 2.0) / 2.0
+
+                    if final_mode and scale_stance_and_head:
+                        stance_target *= factor
+                        bone_target *= factor
+
+                    scale_xz_stance = stance_target / cl
+                    pos_stance = pts_b[p_idx].copy()
+                    pos_stance[0] += cv[0] * scale_xz_stance
+                    pos_stance[1] += cv[1]
+                    pos_stance[2] += cv[2] * scale_xz_stance
+                    delta_stance = pos_stance - pts_b[c_idx]
+                    pts_b[c_idx] += delta_stance
+                    for d in get_all_descendants(c_idx, tree):
+                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5: pts_b[d] += delta_stance
+
+                    scale_xz_config = bone_target / cl
+                    pos_config = pts_b[p_idx].copy()
+                    pos_config[0] += cv[0] * scale_xz_config
+                    pos_config[1] += cv[1]
+                    pos_config[2] += cv[2] * scale_xz_config
+                    delta_config = pos_config - pts_b[c_idx]
+                    pts_b[c_idx] += delta_config
+
+                else:
+                    # Arme behalten Originalgröße (werden nur geschrumpft), Beine nehmen Target!
+                    t_len_normal = targets.get(key, cl) 
+                    if 'arm' in key: t_len_normal = cl # Arm-Fix: Keine Verzerrung durch Config!
+                    
+                    cal_k = "calibration_" + key
+                    t_len_final = targets.get(cal_k, t_len_normal)
+                    
+                    if final_mode: t_len_final *= factor 
+                    
+                    dir_vec = cv / cl
+                    new_c_pos = pts_b[p_idx] + (dir_vec * t_len_final)
+                    delta_shift = new_c_pos - pts_b[c_idx]
+                    pts_b[c_idx] = new_c_pos
+
+                    for d in get_all_descendants(c_idx, tree):
+                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5: pts_b[d] += delta_shift
+                        
+            return pts_b
+
+
+        # --- PHASE 1: RATIO-LOOP AM ANCHOR-FRAME ---
+        orig_h_global = get_height_stable(ref_pts)
+        global_f_scale = 1.0
+        
+        log_messages.append(f"\n--- TOTAL-HEIGHT-ENFORCER ---")
+        if orig_h_global > 1e-5:
+            for iteration in range(10):
+                pts_test = build_and_log(ref_pts, global_f_scale, final_mode=True)
+                test_h = get_height_stable(pts_test)
+                if test_h < 1e-5: break
+                diff = abs(orig_h_global - test_h)
+                if diff < 0.1: break
+                ratio = orig_h_global / test_h
+                global_f_scale *= ratio
+
+        log_messages.append(f"Berechneter universeller Kompressions-Faktor: {global_f_scale:.6f}x")
+
+        # --- PHASE 2: VERARBEITUNG ALLER FRAMES ---
+        for frame_idx in range(len(raw_poses)):
+            frame_data = raw_poses[frame_idx]
+            if frame_data is None or len(frame_data) == 0: continue
+            
+            is_tensor = isinstance(frame_data, torch.Tensor)
+            pts = frame_data[0].cpu().numpy().copy() if is_tensor and frame_data.dim() == 3 else (frame_data.cpu().numpy().copy() if is_tensor else np.array(frame_data).copy())
+            if pts.ndim == 3: pts = pts[0]
+
+            log_this_frame = (frame_idx % 10 == 0)
+            if log_this_frame:
+                bones_before = get_bone_lengths(pts)
+                h_before = get_height_stable(pts)
+
+            pts_final = build_and_log(pts, global_f_scale, final_mode=True)
+
+            if log_this_frame:
+                bones_after = get_bone_lengths(pts_final)
+                h_after = get_height_stable(pts_final)
+                log_messages.append(f"\n--- FRAME {frame_idx} VERGLEICH ---")
+                log_messages.append(f"Gesamthöhe (3D) | Vorher: {h_before:.2f} -> Nachher: {h_after:.2f}")
+                log_messages.append("-" * 50)
+                for k in bones_before.keys():
+                    log_messages.append(f"Knochen: {k.ljust(18)} | Vorher: {bones_before[k]:.2f} -> Nachher: {bones_after[k]:.2f}")
+
+            # PELVIS ANCHOR: DAS IST DER MAGIC FIX!
+            # Wir entfernen den gesamten Ground-Anchor-Block. 
+            # Das Becken (Joint 0) bleibt exakt an seiner Originalkoordinate im Raum.
+            # Die Beine wachsen nach unten, der Torso schrumpft nach oben. 
+            # Die Kameraperspektive bleibt absolut fehlerfrei erhalten!
+
+            # Output-Formatierung
+            if is_tensor:
+                if frame_data.dim() == 3: raw_poses[frame_idx][0] = torch.from_numpy(pts_final).to(frame_data.device)
+                else: raw_poses[frame_idx] = torch.from_numpy(pts_final).to(frame_data.device)
+            else:
+                raw_poses[frame_idx] = pts_final.tolist()
+
+        return (nlf_data_retargeted, "\n".join(log_messages))
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -21385,6 +21636,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFPhysicalScalerV1": NLFPhysicalScalerV1,
     "NLFProportionalRetargeterV16": NLFProportionalRetargeterV16,
     "NLFProportionalRetargeterV17": NLFProportionalRetargeterV17,
+    "NLFProportionalRetargeterV17ex": NLFProportionalRetargeterV17ex,
     
 }
 
@@ -21490,6 +21742,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFProportionalRetargeterV14": "NLF Proportional Retargeter V14",
     "NLFPhysicalScalerV1": "NLF Physical Scaler V1",
     "NLFProportionalRetargeterV17": "NLF Proportional Retargeter V17",
+    "NLFProportionalRetargeterV17ex": "NLF Proportional Retargeter V17ex",
     
     
 }
