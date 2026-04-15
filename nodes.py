@@ -20242,6 +20242,277 @@ class PoseGlobalPerspectiveScalerV51:
         return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
 
 
+class NLFProportionalRetargeterV14:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_nlf_data": ("NLFPRED", {"tooltip": "Die originalen 3D NLF Daten"}),
+                "calibration_data": ("POSE_CALIBRATION", {"tooltip": "Die Referenz-Daten aus V20/V22"}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 90.0, "step": 1.0, "tooltip": "Toleranz für die Frontal-Suche"}),
+                "scale_stance_and_head": ("BOOLEAN", {"default": False, "tooltip": "Wendet den Höhen-Korrekturfaktor auch auf Schulter-/Hüftbreite und den Kopf an."}),
+            }
+        }
+
+    RETURN_TYPES = ("NLFPRED", "STRING")
+    RETURN_NAMES = ("nlf_data_retargeted", "log_output")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Retargeting"
+    DESCRIPTION = "V14: Globale Höhen-Stabilisierung am Anchor-Frame. Inkl. Toggle für Breiten/Kopf-Skalierung."
+
+    def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance, scale_stance_and_head):
+        import copy
+        import numpy as np
+        import math
+        import torch
+
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V14 (STABILE HÖHE & STANCE TOGGLE) ==="]
+        
+        true_3d_bones = calibration_data.get("true_3d_bones", {})
+        if not true_3d_bones:
+            log_messages.append("FEHLER: Keine true_3d_bones in calibration_data gefunden.")
+            return (video_nlf_data, "\n".join(log_messages))
+
+        is_dict = isinstance(video_nlf_data, dict)
+        nlf_data_retargeted = copy.deepcopy(video_nlf_data)
+        
+        if is_dict:
+            raw_poses = nlf_data_retargeted.get('joints3d_nonparam', [nlf_data_retargeted])[0]
+        else:
+            raw_poses = nlf_data_retargeted
+
+        is_normalized = math.isclose(true_3d_bones.get("torso", 0.0), 100.0, abs_tol=1e-3)
+
+        # --- STUFE 1: TÜRSTEHER (WINKEL-RADAR) ---
+        all_frames_data = []
+        frontal_indices = []
+
+        for i, frame_data in enumerate(raw_poses):
+            if frame_data is None or len(frame_data) == 0:
+                all_frames_data.append({'length': 0.0, 'is_frontal': False, 'has_feet': False})
+                continue
+
+            is_tensor = isinstance(frame_data, torch.Tensor)
+            pts = frame_data[0].cpu().numpy() if is_tensor and frame_data.dim() == 3 else (frame_data.cpu().numpy() if is_tensor else np.array(frame_data))
+            if pts.ndim == 3: pts = pts[0]
+
+            def is_val(idx): return idx < len(pts) and np.linalg.norm(pts[idx]) > 1e-5
+
+            valid_y = [pts[idx][1] for idx in range(len(pts)) if is_val(idx)]
+            length = (max(valid_y) - min(valid_y)) if valid_y else 0.0
+
+            is_frontal = False
+            if len(pts) >= 18:
+                dx_h, dz_h = pts[2][0] - pts[1][0], pts[2][2] - pts[1][2]
+                angle_h = math.degrees(math.atan2(abs(dz_h), abs(dx_h)))
+                dx_s, dz_s = pts[17][0] - pts[16][0], pts[17][2] - pts[16][2]
+                angle_s = math.degrees(math.atan2(abs(dz_s), abs(dx_s)))
+                if max(angle_h, angle_s) <= frontal_3d_angle_tolerance:
+                    is_frontal = True
+
+            all_frames_data.append({'length': length, 'is_frontal': is_frontal, 'has_feet': is_val(7) or is_val(8)})
+            if is_frontal: frontal_indices.append(i)
+
+        # --- STUFE 2: ANCHOR-FRAME BESTIMMEN ---
+        candidates = frontal_indices if frontal_indices else list(range(len(raw_poses)))
+        max_len = max([d['length'] for d in all_frames_data]) if all_frames_data else 1.0
+        
+        best_idx, best_score = candidates[0], -1.0
+        for idx in candidates:
+            d = all_frames_data[idx]
+            score = (1000.0 if d['has_feet'] else 0.0) + (500.0 if d['is_frontal'] else 0.0) + ((d['length'] / max_len) * 100.0)
+            if score > best_score:
+                best_score, best_idx = score, idx
+
+        log_messages.append(f"-> Referenz-Frame (Anchor) für globale Messung: {best_idx}")
+
+        ref_frame_data = raw_poses[best_idx]
+        is_t = isinstance(ref_frame_data, torch.Tensor)
+        ref_pts = ref_frame_data[0].cpu().numpy() if is_t and ref_frame_data.dim() == 3 else (ref_frame_data.cpu().numpy() if is_t else np.array(ref_frame_data))
+        if ref_pts.ndim == 3: ref_pts = ref_pts[0]
+
+        orig_torso_ref = np.linalg.norm(ref_pts[12] - ref_pts[0]) if np.linalg.norm(ref_pts[12]) > 1e-5 else 0.0
+        head_val = true_3d_bones.get("head", 0.0)
+        missing_neck = orig_torso_ref * (head_val / 100.0) / 2.0 if is_normalized else head_val / 2.0
+        reference_torso_length = orig_torso_ref + missing_neck
+
+        # Die Targets basieren alle auf der Referenzlänge und sind global für alle Frames gültig
+        targets = {k: (v / 100.0 * reference_torso_length if is_normalized else v) for k, v in true_3d_bones.items()}
+
+        # --- HILFSFUNKTIONEN ---
+        tree = {0:[1,2,3], 1:[4], 4:[7], 7:[10], 2:[5], 5:[8], 8:[11], 3:[6], 6:[9], 9:[12,13,14], 12:[15], 13:[16], 16:[18], 18:[20], 20:[22], 14:[17], 17:[19], 19:[21], 21:[23]}
+        
+        def get_all_descendants(node, tree_map):
+            desc = []
+            if node in tree_map:
+                for child in tree_map[node]:
+                    desc.append(child); desc.extend(get_all_descendants(child, tree_map))
+            return desc
+
+        def get_height_stable(p_array):
+            if 12 < len(p_array) and np.linalg.norm(p_array[12]) > 1e-5:
+                top_y = p_array[12][1]
+            else: return 0.0
+            feet_y = [p_array[idx][1] for idx in [7,8,10,11,4,5] if idx < len(p_array) and np.linalg.norm(p_array[idx]) > 1e-5]
+            return (max(feet_y) - top_y) if feet_y else 0.0
+
+        # Die Kernfunktion umgeschrieben, sodass do_log von außen gesteuert wird
+        def build_and_log(pts_source, factor, final_mode=False, do_log=False):
+            pts_b = pts_source.copy()
+            
+            # 1. Torso Skalierung
+            cv = pts_b[12] - pts_b[0]; cl = np.linalg.norm(cv)
+            if cl > 1e-5:
+                t_len = targets.get("torso", cl)
+                if final_mode: t_len *= factor
+                if do_log: log_messages.append(f"Knochen: Torso          | Ist: {cl:.4f} -> Soll: {t_len:.4f}")
+                
+                f_node = t_len / cl
+                for p, c in [(0,3), (3,6), (6,9), (9,12)]:
+                    vec = pts_b[c] - pts_b[p]; new_c = pts_b[p] + vec * f_node
+                    delta = new_c - pts_b[c]; pts_b[c] += delta
+                    for d in get_all_descendants(c, tree):
+                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5: pts_b[d] += delta
+
+            # 2. Kopf
+            if 15 < len(pts_b):
+                cv = pts_b[15] - pts_b[12]; cl = np.linalg.norm(cv)
+                if cl > 1e-5:
+                    t_len = targets.get("head", cl * 2.0) / 2.0
+                    # NEU: Kopfskalierung an den Toggle geknüpft
+                    if final_mode and scale_stance_and_head: 
+                        t_len *= factor
+                    
+                    if do_log: log_messages.append(f"Knochen: Kopf (NLF-Map)  | Ist: {cl:.4f} -> Soll: {t_len:.4f}")
+                    f_node = t_len / cl
+                    delta = (pts_b[12] + (cv / cl * t_len)) - pts_b[15]
+                    pts_b[15] += delta
+
+            # 3. Operations (Gliedmaßen & Breiten)
+            ops = [('shoulder_width',12,17), ('shoulder_width',12,16), ('hip_width',0,2), ('hip_width',0,1),
+                   ('r_arm',17,19), ('r_forearm',19,21), ('l_arm',16,18), ('l_forearm',18,20),
+                   ('r_thigh',2,5), ('r_calf',5,8), ('l_thigh',1,4), ('l_calf',4,7)]
+
+            for key, p_idx, c_idx in ops:
+                cv = pts_b[c_idx] - pts_b[p_idx]; cl = np.linalg.norm(cv)
+                if cl < 1e-5: continue
+
+                if key in ['shoulder_width', 'hip_width']:
+                    # 1. Stance Target (Ganzes Bein wandert) -> Nimmt den Standard Config Wert
+                    stance_target = targets.get(key, cl * 2.0) / 2.0
+                    
+                    # 2. Bone Target (Nur Gelenk wandert) -> Nimmt den Calibration Wert
+                    calib_key = f"calibration_{key}"
+                    bone_target = targets.get(calib_key, stance_target * 2.0) / 2.0
+
+                    # NEU: Breiten-Skalierung an den Toggle geknüpft
+                    if final_mode and scale_stance_and_head:
+                        stance_target *= factor
+                        bone_target *= factor
+
+                    # SCHRITT A: STANCE SCALE ANWENDEN
+                    scale_xz_stance = stance_target / cl
+                    pos_stance = pts_b[p_idx].copy()
+                    pos_stance[0] += cv[0] * scale_xz_stance
+                    pos_stance[1] += cv[1] # Y-Lock
+                    pos_stance[2] += cv[2] * scale_xz_stance
+                    
+                    delta_stance = pos_stance - pts_b[c_idx]
+                    pts_b[c_idx] += delta_stance # Gelenk verschieben
+                    for d in get_all_descendants(c_idx, tree):
+                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
+                            pts_b[d] += delta_stance # Beine mitverschieben
+
+                    # SCHRITT B: BONE CONFIG ANWENDEN
+                    scale_xz_config = bone_target / cl
+                    pos_config = pts_b[p_idx].copy()
+                    pos_config[0] += cv[0] * scale_xz_config
+                    pos_config[1] += cv[1] # Y-Lock
+                    pos_config[2] += cv[2] * scale_xz_config
+                    
+                    delta_config = pos_config - pts_b[c_idx]
+                    pts_b[c_idx] += delta_config # NUR das Gelenk verschieben
+                            
+                    if do_log and (c_idx == 2 or c_idx == 17): 
+                        log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Scale (ganzes Bein): {stance_target:.4f} -> Config (nur Gelenk): {bone_target:.4f}")
+
+                else:
+                    # Normale Arme / Beine
+                    if key not in targets: continue
+                    t_len_normal = targets[key]
+                    cal_k = "calibration_" + key
+                    t_len_final = targets.get(cal_k, t_len_normal)
+                    
+                    # Bei Armen und Beinen wird der Factor IMMER angewandt, um die Gesamthöhe zu stabilisieren
+                    if final_mode: t_len_final *= factor
+                    
+                    dir_vec = cv / cl
+                    new_c_pos = pts_b[p_idx] + (dir_vec * t_len_final)
+
+                    if do_log and key.startswith('r_'):
+                        log_messages.append(f"Knochen: {key.ljust(15)} | Ist: {cl:.4f} -> Soll: {t_len_final:.4f}")
+
+                    delta_shift = new_c_pos - pts_b[c_idx]
+                    pts_b[c_idx] = new_c_pos
+
+                    for d in get_all_descendants(c_idx, tree):
+                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
+                            pts_b[d] += delta_shift
+                        
+            return pts_b
+
+
+        # --- PHASE 1: GLOBALE MESSUNG AM ANCHOR-FRAME ---
+        # Wir messen genau 1x am perfekten Frame, wie stark das Retargeting die Y-Höhe verzerrt
+        orig_h_global = get_height_stable(ref_pts)
+        pts_dry_global = build_and_log(ref_pts, 1.0, final_mode=False, do_log=False)
+        dry_h_global = get_height_stable(pts_dry_global)
+        
+        global_f_scale = orig_h_global / dry_h_global if (orig_h_global > 1e-5 and dry_h_global > 1e-5) else 1.0
+
+        log_messages.append(f"\n--- GLOBALE SKALIERUNG (Stabil für alle Frames) ---")
+        log_messages.append(f"Gemessene Original-Höhe: {orig_h_global:.4f}")
+        log_messages.append(f"Höhe nach Retargeting (ohne Korrektur): {dry_h_global:.4f}")
+        log_messages.append(f"-> Angewandter Globaler Faktor: {global_f_scale:.4f}x")
+        if scale_stance_and_head:
+            log_messages.append("-> Toggle: Faktor WIRD auf Schultern/Hüfte und Kopf angewandt.")
+        else:
+            log_messages.append("-> Toggle: Faktor WIRD NICHT auf Schultern/Hüfte und Kopf angewandt.")
+
+
+        # --- PHASE 2: VERARBEITUNG ALLER FRAMES ---
+        for frame_idx in range(len(raw_poses)):
+            frame_data = raw_poses[frame_idx]
+            if frame_data is None or len(frame_data) == 0: continue
+            
+            is_tensor = isinstance(frame_data, torch.Tensor)
+            pts = frame_data[0].cpu().numpy().copy() if is_tensor and frame_data.dim() == 3 else (frame_data.cpu().numpy().copy() if is_tensor else np.array(frame_data).copy())
+            if pts.ndim == 3: pts = pts[0]
+
+            # Wir loggen die Details nur einmalig am Anchor-Frame, damit die Console sauber bleibt
+            is_anchor = (frame_idx == best_idx)
+
+            # Wende den Build mit dem CONSTANTEN f_scale an
+            pts_final = build_and_log(pts, global_f_scale, final_mode=True, do_log=is_anchor)
+
+            # GROUND ANCHOR (Person wieder auf den Boden stellen)
+            v_orig_feet = [pts[idx][1] for idx in [7,8,10,11,4,5] if idx < len(pts) and np.linalg.norm(pts[idx]) > 1e-5]
+            v_new_feet = [pts_final[idx][1] for idx in [7,8,10,11,4,5] if idx < len(pts_final) and np.linalg.norm(pts_final[idx]) > 1e-5]
+            if v_orig_feet and v_new_feet:
+                shift = max(v_orig_feet) - max(v_new_feet)
+                for j in range(len(pts_final)):
+                    if np.linalg.norm(pts_final[j]) > 1e-5: pts_final[j][1] += shift
+
+            # Output-Formatierung
+            if is_tensor:
+                if frame_data.dim() == 3: raw_poses[frame_idx][0] = torch.from_numpy(pts_final).to(frame_data.device)
+                else: raw_poses[frame_idx] = torch.from_numpy(pts_final).to(frame_data.device)
+            else:
+                raw_poses[frame_idx] = pts_final.tolist()
+
+        return (nlf_data_retargeted, "\n".join(log_messages))
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -20341,6 +20612,7 @@ NODE_CLASS_MAPPINGS = {
     "FrameSubsamplerForDepth": FrameSubsamplerForDepth,
     "PoseGlobalPerspectiveScalerV50": PoseGlobalPerspectiveScalerV50,
     "PoseGlobalPerspectiveScalerV51": PoseGlobalPerspectiveScalerV51,
+    "NLFProportionalRetargeterV14": NLFProportionalRetargeterV14,
     
 }
 
@@ -20443,6 +20715,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FrameSubsamplerForDepth": "Frame Subsampler For Depth (VRAM Saver)",
     "PoseGlobalPerspectiveScalerV50": "Pose Global Perspective Scaler (V50)",
     "PoseGlobalPerspectiveScalerV51": "Pose Global Perspective Scaler (V51)",
+    "NLFProportionalRetargeterV14": "NLF Proportional Retargeter V14",
     
 }
 
