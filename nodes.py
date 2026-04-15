@@ -20251,27 +20251,32 @@ class NLFProportionalRetargeterV14:
                 "calibration_data": ("POSE_CALIBRATION", {"tooltip": "Die Referenz-Daten aus V20/V22"}),
                 "frontal_3d_angle_tolerance": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 90.0, "step": 1.0, "tooltip": "Toleranz für die Frontal-Suche"}),
                 "scale_stance_and_head": ("BOOLEAN", {"default": False, "tooltip": "Wendet den Höhen-Korrekturfaktor auch auf Schulter-/Hüftbreite und den Kopf an."}),
+            },
+            "optional": {
+                "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus dem Scaler (wird bereinigt)"}),
             }
         }
 
-    RETURN_TYPES = ("NLFPRED", "STRING")
-    RETURN_NAMES = ("nlf_data_retargeted", "log_output")
+    RETURN_TYPES = ("NLFPRED", "STRING", "STRING")
+    RETURN_NAMES = ("nlf_data_retargeted", "log_output", "nlf_render_config_clean")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess/Retargeting"
-    DESCRIPTION = "V14: Perfekter NLF-Loop zur Höhenstabilisierung am Anchor-Frame. Inkl. Toggle für Breiten/Kopf."
+    DESCRIPTION = "V14: Perfekter NLF-Loop zur Höhenstabilisierung. Bereinigt zusätzlich die Kamera-Config für Mimic."
 
-    def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance, scale_stance_and_head):
+    def process(self, video_nlf_data, calibration_data, frontal_3d_angle_tolerance, scale_stance_and_head, nlf_render_config="{}"):
         import copy
         import numpy as np
         import math
         import torch
+        import json
 
-        log_messages = ["=== NLF PROPORTIONAL RETARGETER V14 (EXAKTER 3D-LOOP & STANCE TOGGLE) ==="]
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V14 (EXAKTER 3D-LOOP & CAMERA FIX) ==="]
         
         true_3d_bones = calibration_data.get("true_3d_bones", {})
         if not true_3d_bones:
             log_messages.append("FEHLER: Keine true_3d_bones in calibration_data gefunden.")
-            return (video_nlf_data, "\n".join(log_messages))
+            # Gebe bei Fehler eine leere Config zurück
+            return (video_nlf_data, "\n".join(log_messages), "{}")
 
         is_dict = isinstance(video_nlf_data, dict)
         nlf_data_retargeted = copy.deepcopy(video_nlf_data)
@@ -20362,7 +20367,7 @@ class NLFProportionalRetargeterV14:
             cv = pts_b[12] - pts_b[0]; cl = np.linalg.norm(cv)
             if cl > 1e-5:
                 t_len = targets.get("torso", cl)
-                if final_mode: t_len *= factor # Torso wird IMMER runterskaliert
+                if final_mode: t_len *= factor
                 if do_log: log_messages.append(f"Knochen: Torso          | Ist: {cl:.4f} -> Soll: {t_len:.4f}")
                 
                 f_node = t_len / cl
@@ -20378,7 +20383,7 @@ class NLFProportionalRetargeterV14:
                 if cl > 1e-5:
                     t_len = targets.get("head", cl * 2.0) / 2.0
                     if final_mode and scale_stance_and_head: 
-                        t_len *= factor # Kopfskalierung an den Toggle geknüpft
+                        t_len *= factor
                     
                     if do_log: log_messages.append(f"Knochen: Kopf (NLF)      | Ist: {cl:.4f} -> Soll: {t_len:.4f}")
                     f_node = t_len / cl
@@ -20400,7 +20405,7 @@ class NLFProportionalRetargeterV14:
                     bone_target = targets.get(calib_key, stance_target * 2.0) / 2.0
 
                     if final_mode and scale_stance_and_head:
-                        stance_target *= factor # Breiten-Skalierung an den Toggle geknüpft
+                        stance_target *= factor
                         bone_target *= factor
 
                     scale_xz_stance = stance_target / cl
@@ -20433,7 +20438,7 @@ class NLFProportionalRetargeterV14:
                     cal_k = "calibration_" + key
                     t_len_final = targets.get(cal_k, t_len_normal)
                     
-                    if final_mode: t_len_final *= factor # Arme und Beine IMMER runterskaliert
+                    if final_mode: t_len_final *= factor
                     
                     dir_vec = cv / cl
                     new_c_pos = pts_b[p_idx] + (dir_vec * t_len_final)
@@ -20476,10 +20481,6 @@ class NLFProportionalRetargeterV14:
 
         log_messages.append(f"Erreichte Test-Höhe im NLF-Raum: {test_h:.4f}")
         log_messages.append(f"-> Angewandter Globaler Faktor für alle Frames: {global_f_scale:.6f}x")
-        if scale_stance_and_head:
-            log_messages.append("-> Toggle: Faktor WIRD auf Schultern/Hüfte und Kopf angewandt.")
-        else:
-            log_messages.append("-> Toggle: Faktor WIRD NICHT auf Schultern/Hüfte und Kopf angewandt.")
 
 
         # --- PHASE 2: VERARBEITUNG ALLER FRAMES ---
@@ -20512,7 +20513,26 @@ class NLFProportionalRetargeterV14:
             else:
                 raw_poses[frame_idx] = pts_final.tolist()
 
-        return (nlf_data_retargeted, "\n".join(log_messages))
+
+        # --- PHASE 3: KAMERA-CONFIG BEREINIGEN ---
+        # Da wir die Höhe jetzt physikalisch in 3D korrigiert haben, darf Mimic16 die Kamera NICHT mehr verzerren!
+        try:
+            config_dict = json.loads(nlf_render_config) if isinstance(nlf_render_config, str) and nlf_render_config.strip() else {}
+        except Exception as e:
+            config_dict = {}
+            log_messages.append(f"Konnte nlf_render_config nicht parsen: {e}")
+            
+        # Wir zwingen die störenden Scale-Faktoren hart auf 1.0
+        config_dict["anchor_scale"] = 1.0
+        config_dict["scale_x_factor"] = 1.0
+        
+        # Den Rest (wie pivot_x, pivot_y) lassen wir in Ruhe, das braucht Mimic16 vielleicht noch.
+        clean_config_str = json.dumps(config_dict)
+        log_messages.append("\n-> Kamera-Config wurde erfolgreich für Mimic16 bereinigt (Scale = 1.0)")
+
+
+        return (nlf_data_retargeted, "\n".join(log_messages), clean_config_str)
+
 
 
 NODE_CLASS_MAPPINGS = {
