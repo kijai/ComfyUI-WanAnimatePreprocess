@@ -23049,6 +23049,62 @@ class PoseGlobalPerspectiveScalerV53:
         return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
 
 
+class NLFPoseDataSelectFrame:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "nlf_poses": ("NLFPRED", {"tooltip": "Die 3D NLF Pose Daten (Sequenz)"}),
+                "frame_index": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Der Index des gewünschten Frames"}),
+            }
+        }
+
+    RETURN_TYPES = ("NLFPRED",)
+    RETURN_NAMES = ("nlf_poses_single",)
+    FUNCTION = "select_frame"
+    CATEGORY = "WanAnimatePreprocess/NLF"
+    DESCRIPTION = "Extrahiert einen exakten, einzelnen Frame aus einer NLF 3D Pose Sequenz."
+
+    def select_frame(self, nlf_poses, frame_index):
+        # Tiefe Kopie, um die Originaldaten im Speicher nicht aus Versehen zu kappen
+        selected_nlf = copy.deepcopy(nlf_poses)
+        
+        # NLF-Daten kommen meist als Dictionary mit verschiedenen Keys (joints3d_nonparam, cam_poses etc.)
+        if isinstance(selected_nlf, dict):
+            for key, value in selected_nlf.items():
+                if isinstance(value, list) and len(value) > 0:
+                    # Wenn es eine Liste von Arrays/Tensoren ist (z.B. Person 0, Person 1)
+                    for i in range(len(value)):
+                        try:
+                            # Wir sichern ab, dass der Index nicht out-of-bounds geht (Clamp)
+                            max_idx = max(0, len(value[i]) - 1)
+                            idx = min(frame_index, max_idx)
+                            idx = max(0, idx)
+                            
+                            # WICHTIG: Slice [idx : idx+1] erhält die Frame-Dimension! 
+                            value[i] = value[i][idx:idx+1]
+                        except Exception:
+                            pass 
+                elif hasattr(value, '__getitem__') and hasattr(value, '__len__'):
+                    # Falls es direkt ein Tensor/Array ist
+                    try:
+                        max_idx = max(0, len(value) - 1)
+                        idx = min(frame_index, max_idx)
+                        idx = max(0, idx)
+                        selected_nlf[key] = value[idx:idx+1]
+                    except:
+                        pass
+                        
+        # Fallback, falls nlf_poses direkt eine Liste oder ein Tensor ist (ohne Dict drumherum)
+        elif hasattr(selected_nlf, '__getitem__') and hasattr(selected_nlf, '__len__'):
+             max_idx = max(0, len(selected_nlf) - 1)
+             idx = min(frame_index, max_idx)
+             idx = max(0, idx)
+             selected_nlf = selected_nlf[idx:idx+1]
+
+        return (selected_nlf,)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -23158,6 +23214,7 @@ NODE_CLASS_MAPPINGS = {
     "RenderNLFPosesOrthographicMimic": RenderNLFPosesOrthographicMimic,
     "PoseCalibrationV30": PoseCalibrationV30,
     "PoseGlobalPerspectiveScalerV53": PoseGlobalPerspectiveScalerV53,
+    "NLFPoseDataSelectFrame": NLFPoseDataSelectFrame,
     
     
 }
@@ -23270,6 +23327,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RenderNLFPosesOrthographicMimic": "Render NLF Poses Orthographic Mimic",
     "PoseCalibrationV30": "🎯 Pose Calibration Hub (V30)",
     "PoseGlobalPerspectiveScalerV53": "⚖️ Pose Global Perspective Scaler (V53)",
+    "NLFPoseDataSelectFrame": "NLF Pose Data Select Frame",
     
     
 }
