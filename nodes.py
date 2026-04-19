@@ -24979,6 +24979,95 @@ class PoseGlobalPerspectiveScalerV56:
         return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
 
 
+class PoseCalibrationManipulator3:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "calibration_data": ("POSE_CALIBRATION",),
+                "echte_groesse_override": ("FLOAT", {"default": 2.10, "min": 0.1, "max": 5.0, "step": 0.01, "tooltip": "Erzwingt eine neue echte Größe in Metern (für Depth Map/2D)."}),
+                "nlf_3d_scale_factor": ("FLOAT", {"default": 1.00, "min": 0.01, "max": 10.0, "step": 0.01, "tooltip": "Multiplikator für die echten 3D-Knochenlängen aus NLF (bone_lengths_nlf_3d)."}),
+                "enable_override": ("BOOLEAN", {"default": False, "tooltip": "Wenn False, werden die Originaldaten durchgeleitet."})
+            }
+        }
+
+    RETURN_TYPES = ("POSE_CALIBRATION", "STRING")
+    RETURN_NAMES = ("modified_calibration", "log_output")
+    FUNCTION = "manipulate"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V3: Manipuliert echte_groesse und bietet einen präzisen Multiplikator für NLF 3D-Knochen."
+
+    def manipulate(self, calibration_data, echte_groesse_override, nlf_3d_scale_factor, enable_override):
+        import copy
+        
+        # Tiefkopie, um das Original nicht zu zerstören
+        calib = copy.deepcopy(calibration_data)
+        log_messages = ["=== CALIBRATION MANIPULATOR LOG (V3) ==="]
+
+        if not enable_override:
+            log_messages.append("Bypass aktiv: Originaldaten werden unverändert weitergeleitet.")
+            return (calib, "\n".join(log_messages))
+
+        # --- 1. ECHTE GRÖSSE (DEPTH MAP / 2D) MANIPULATION ---
+        # Fallback auf echte_groesse_depthmap, da wir das in V33 umbenannt haben
+        alte_groesse = calib.get("echte_groesse_depthmap", calib.get("echte_groesse", 1.0))
+        
+        if alte_groesse > 0:
+            faktor = echte_groesse_override / alte_groesse
+            
+            log_messages.append(f"Originale 2D/Depth-Größe: {alte_groesse:.3f}m")
+            log_messages.append(f"Neue 2D/Depth-Größe: {echte_groesse_override:.3f}m")
+            log_messages.append(f"Manipulations-Faktor (2D): {faktor:.4f}x")
+
+            # Hauptgrößen überschreiben
+            calib["echte_groesse"] = echte_groesse_override
+            if "echte_groesse_depthmap" in calib:
+                calib["echte_groesse_depthmap"] = echte_groesse_override
+
+            # Metrische Knochen proportional anpassen
+            bone_m = calib.get("bone_lengths_in_meters", {})
+            if not bone_m:
+                bone_m = calib.get("bone_lengths_in_meters_depthmap", {})
+                
+            if bone_m:
+                log_messages.append("\n--- NEUE METRISCHE KNOCHEN (2D/DepthMap) ---")
+                for key, val in bone_m.items():
+                    neuer_wert = val * faktor
+                    bone_m[key] = neuer_wert
+                    log_messages.append(f"{key.capitalize()}: {val:.3f}m -> {neuer_wert:.3f}m")
+            
+            # Scaler-Knochen proportional anpassen
+            bone_s = calib.get("bone_length_for_scaler", {})
+            if bone_s:
+                log_messages.append("\n--- NEUE SCALER KNOCHEN (2D/DepthMap) ---")
+                for key, val in bone_s.items():
+                    neuer_wert = val * faktor
+                    calib["bone_length_for_scaler"][key] = neuer_wert
+                    log_messages.append(f"{key.capitalize()}: {val:.3f} -> {neuer_wert:.3f}")
+        else:
+            log_messages.append("Warnung: Originale echte_groesse ist <= 0. Überspringe 2D/Depth-Manipulation.")
+
+        # --- 2. NEU: NLF 3D KNOCHEN MANIPULATION ---
+        bone_nlf_3d = calib.get("bone_lengths_nlf_3d", {})
+        if bone_nlf_3d:
+            if nlf_3d_scale_factor != 1.0:
+                log_messages.append("\n--- NEUE NLF 3D KNOCHEN (bone_lengths_nlf_3d) ---")
+                log_messages.append(f"Wende 3D-Skalierungsfaktor an: {nlf_3d_scale_factor:.2f}x")
+                for key, val in bone_nlf_3d.items():
+                    neuer_wert = val * nlf_3d_scale_factor
+                    calib["bone_lengths_nlf_3d"][key] = neuer_wert
+                    log_messages.append(f"{key.capitalize()}: {val:.3f} -> {neuer_wert:.3f}")
+            else:
+                log_messages.append("\n--- NLF 3D KNOCHEN (bone_lengths_nlf_3d) ---")
+                log_messages.append("Faktor ist 1.00x, 3D-Werte bleiben unverändert.")
+        else:
+            log_messages.append("\nKeine 'bone_lengths_nlf_3d' im Hub gefunden. Bitte V33 nutzen!")
+
+        log_messages.append("\nProportionen (true_3d_bones) bleiben unangetastet.")
+
+        return (calib, "\n".join(log_messages))
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -25095,6 +25184,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV55": PoseGlobalPerspectiveScalerV55,
     "PoseCalibrationV33": PoseCalibrationV33,
     "PoseGlobalPerspectiveScalerV56": PoseGlobalPerspectiveScalerV56,
+    "PoseCalibrationManipulator3": PoseCalibrationManipulator3,
     
 }
 
@@ -25213,6 +25303,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseGlobalPerspectiveScalerV55": "⚖️ Pose Global Perspective Scaler (V55)",
     "PoseCalibrationV33": "🎯 Pose Calibration Hub (V33)",
     "PoseGlobalPerspectiveScalerV56": "⚖️ Pose Global Perspective Scaler (V56)",
+    "PoseCalibrationManipulator3": "🔧 Pose Calibration Manipulator (V3)",
 
     
     
