@@ -25067,6 +25067,396 @@ class PoseCalibrationManipulator3:
 
         return (calib, "\n".join(log_messages))
 
+# ==============================================================================
+# Node: Pose And Face Detection V8 NoWarp
+# ==============================================================================
+
+class PoseAndFaceDetectionV8_NoWarp:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("POSEMODEL",),
+                "images": ("IMAGE",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Breite der Pose-Generierung"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Höhe der Pose-Generierung"}),
+                "face_resolution": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64, "tooltip": "Zielauflösung (quadratisch)."}),
+                "face_pad_factor": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 5.0, "step": 0.05, "tooltip": "Padding um das Gesicht."}),
+                "camera_smooth_window": ("INT", {"default": 10, "min": 0, "max": 100, "step": 1, "tooltip": "Gimbal Window (0 = Aus)."}),
+                "smoothing_passes": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1, "tooltip": "Multi-Pass für butterweiche Kamera."}),
+                "max_face_ratio": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 10.0, "step": 0.05, "tooltip": "Ab welchem Screen-Anteil (z.B. 0.4 = 40%) wird das Gesicht ausgeblendet? Hoher Wert = Aus."}),
+                "fade_frames": ("INT", {"default": 15, "min": 0, "max": 100, "step": 1, "tooltip": "Wie viele Frames dauert die weiche Überblendung?"}),
+            },
+            "optional": {
+                "retarget_image": ("IMAGE", {"default": None, "tooltip": "Optionales Referenzbild"}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "FACE_INFO", "STRING", "BBOX", "BBOX")
+    RETURN_NAMES = ("pose_data", "face_images", "face_info", "key_frame_body_points", "bboxes", "face_bboxes")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "V8 (No Warp): V7 mit Temporal Smoothing und dynamischem Proximity Fade-Out."
+
+    def process(self, model, images, width, height, face_resolution, face_pad_factor, camera_smooth_window, smoothing_passes, max_face_ratio, fade_frames, retarget_image=None):
+        import cv2
+        import numpy as np
+        import torch
+        import math
+        import json
+        from tqdm import tqdm
+        from comfy.utils import ProgressBar
+        from .utils import resize_by_area, bbox_from_detector, crop
+        from .retarget_pose import load_pose_metas_from_kp2ds_seq, get_face_bboxes, get_retarget_pose, AAPoseMeta
+
+        detector = model["yolo"]
+        pose_model = model["vitpose"]
+        B, H, W, C = images.shape
+
+        shape = np.array([H, W])[None]
+        images_np = images.numpy()
+
+        IMG_NORM_MEAN = np.array([0.485, 0.456, 0.406])
+        IMG_NORM_STD = np.array([0.229, 0.224, 0.225])
+        input_resolution=(256, 192)
+        rescale = 1.25
+
+        detector.reinit()
+        pose_model.reinit()
+        
+        # --- 1. Original V2/V4 Retarget Logic ---
+        refer_pose_meta = None
+        refer_img = None
+        
+        if retarget_image is not None:
+            refer_img = resize_by_area(retarget_image[0].numpy() * 255, width * height, divisor=16) / 255.0
+            ref_bbox = (detector(
+                cv2.resize(refer_img.astype(np.float32), (640, 640)).transpose(2, 0, 1)[None],
+                shape
+                )[0][0]["bbox"])
+
+            if ref_bbox is None or ref_bbox[-1] <= 0 or (ref_bbox[2] - ref_bbox[0]) < 10 or (ref_bbox[3] - ref_bbox[1]) < 10:
+                ref_bbox = np.array([0, 0, refer_img.shape[1], refer_img.shape[0]])
+
+            center, scale = bbox_from_detector(ref_bbox, input_resolution, rescale=rescale)
+            refer_img_crop = crop(refer_img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+
+            img_norm = (refer_img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+
+            ref_keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            refer_pose_meta = load_pose_metas_from_kp2ds_seq(ref_keypoints, width=retarget_image.shape[2], height=retarget_image.shape[1])[0]
+
+        # --- 2. Original V2/V4 Detection Loop ---
+        comfy_pbar = ProgressBar(B*2)
+        progress = 0
+        bboxes = []
+        for img in tqdm(images_np, total=len(images_np), desc="V8 Detecting"):
+            det_result = detector(
+                cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None],
+                shape
+            )
+            bbox_res = det_result[0][0]["bbox"]
+            bboxes.append(bbox_res)
+            
+            progress += 1
+            if progress % 10 == 0:
+                comfy_pbar.update_absolute(progress)
+
+        detector.cleanup()
+
+        # --- 3. Original V2/V4 Pose Loop ---
+        kp2ds = []
+        for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="V8 Keypoints"):
+            if bbox is None or bbox[-1] <= 0 or (bbox[2] - bbox[0]) < 10 or (bbox[3] - bbox[1]) < 10:
+                bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+
+            bbox_xywh = bbox
+            center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
+            img_crop = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+
+            img_norm = (img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+
+            keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            kp2ds.append(keypoints)
+            
+            progress += 1
+            if progress % 10 == 0:
+                comfy_pbar.update_absolute(progress)
+
+        pose_model.cleanup()
+
+        kp2ds = np.concatenate(kp2ds, 0)
+        pose_metas = load_pose_metas_from_kp2ds_seq(kp2ds, width=W, height=H)
+
+        # --- 4. TEMPORAL SMOOTHING & ALPHA FADE LOGIC ---
+        raw_face_data = []
+        last_valid_data = (W/2.0, H/2.0, float(face_resolution))
+        
+        for idx, meta in enumerate(pose_metas):
+            current_scale = 1.0 + face_pad_factor
+            face_bbox_for_image = get_face_bboxes(meta['keypoints_face'][:, :2], scale=current_scale, image_shape=(H, W))
+            raw_x1, raw_x2, raw_y1, raw_y2 = face_bbox_for_image
+            raw_w = raw_x2 - raw_x1
+            raw_h = raw_y2 - raw_y1
+            max_side = max(raw_w, raw_h)
+            cx = raw_x1 + raw_w / 2.0
+            cy = raw_y1 + raw_h / 2.0
+            
+            if max_side > 0:
+                last_valid_data = (cx, cy, max_side)
+                raw_face_data.append((cx, cy, max_side))
+            else:
+                raw_face_data.append(last_valid_data)
+
+        def smooth_series(series, passes, window):
+            if window <= 0: return series
+            res = series.copy()
+            for _ in range(passes):
+                temp = []
+                for i in range(len(res)):
+                    s = max(0, i - window)
+                    e = min(len(res), i + window + 1)
+                    w_slice = res[s:e]
+                    avg = tuple(sum(val[k] for val in w_slice) / len(w_slice) for k in range(len(res[0])))
+                    temp.append(avg)
+                res = temp
+            return res
+
+        smoothed_data = smooth_series(raw_face_data, smoothing_passes, camera_smooth_window)
+
+        # Fade Alpha Calculation based on face size
+        alphas = [1.0] * len(smoothed_data)
+        if max_face_ratio < 10.0:
+            is_too_close = []
+            for cx, cy, max_side in smoothed_data:
+                ratio = max_side / float(min(H, W))
+                is_too_close.append(ratio > max_face_ratio)
+            
+            for i in range(len(alphas)):
+                min_dist = 999999
+                for j, close in enumerate(is_too_close):
+                    if close:
+                        dist = abs(i - j)
+                        if dist < min_dist: min_dist = dist
+                
+                if fade_frames <= 0:
+                    alphas[i] = 0.0 if min_dist == 0 else 1.0
+                else:
+                    if min_dist == 0:
+                        alphas[i] = 0.0
+                    elif min_dist >= fade_frames:
+                        alphas[i] = 1.0
+                    else:
+                        alphas[i] = float(min_dist) / float(fade_frames)
+
+        # --- 5. FACE EXTRACTION (Using Smoothed Data) ---
+        face_images = []
+        face_bboxes = []
+        face_info = []
+
+        for idx, (data, alpha) in enumerate(zip(smoothed_data, alphas)):
+            cx, cy, max_side = data
+            
+            sq_x1 = int(cx - max_side / 2)
+            sq_y1 = int(cy - max_side / 2)
+            sq_x2 = sq_x1 + int(max_side)
+            sq_y2 = sq_y1 + int(max_side)
+            
+            # Clamping
+            safe_x1 = max(0, sq_x1)
+            safe_y1 = max(0, sq_y1)
+            safe_x2 = min(W, sq_x2)
+            safe_y2 = min(H, sq_y2)
+            
+            valid = True
+            
+            # Crop mit Padding
+            if safe_x2 > safe_x1 and safe_y2 > safe_y1:
+                crop_img = images_np[idx][safe_y1:safe_y2, safe_x1:safe_x2]
+                
+                pad_l = safe_x1 - sq_x1
+                pad_t = safe_y1 - sq_y1
+                pad_r = sq_x2 - safe_x2
+                pad_b = sq_y2 - safe_y2
+                
+                if any([pad_l > 0, pad_t > 0, pad_r > 0, pad_b > 0]):
+                    crop_img = cv2.copyMakeBorder(
+                        crop_img, 
+                        max(0, pad_t), max(0, pad_b), max(0, pad_l), max(0, pad_r), 
+                        cv2.BORDER_CONSTANT, 
+                        value=(0,0,0)
+                    )
+            else:
+                crop_img = np.zeros((face_resolution, face_resolution, C), dtype=images_np.dtype)
+                valid = False
+
+            # Resize (verzerrungsfrei, da quadratisch)
+            if crop_img.shape[0] != face_resolution or crop_img.shape[1] != face_resolution:
+                face_image_resized = cv2.resize(crop_img, (face_resolution, face_resolution), interpolation=cv2.INTER_CUBIC)
+            else:
+                face_image_resized = crop_img
+
+            face_images.append(face_image_resized)
+            face_bboxes.append((sq_x1, sq_y1, sq_x2, sq_y2))
+            
+            info_entry = {
+                "frame_index": idx,
+                "original_img_shape": (W, H),
+                "target_tensor_size": (face_resolution, face_resolution),
+                "valid": valid,
+                "crop_coords": (float(sq_x1), float(sq_y1), float(sq_x2), float(sq_y2)),
+                "padding": (0, 0, 0, 0),
+                "blend_alpha": float(alpha) # <-- Hier geht der Fade-Wert in den Stitcher
+            }
+            face_info.append(info_entry)
+
+        face_images_tensor = torch.from_numpy(np.stack(face_images, 0))
+
+        # --- 6. Restliche Outputs ---
+        if retarget_image is not None and refer_pose_meta is not None:
+            retarget_pose_metas = get_retarget_pose(pose_metas[0], refer_pose_meta, pose_metas, None, None)
+        else:
+            retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+
+        final_bboxes_list = []
+        for bb in bboxes:
+            bb_flat = np.array(bb).flatten()
+            if bb_flat.shape[0] >= 4:
+                bbox_ints = tuple(int(v) for v in bb_flat[:4])
+            else:
+                bbox_ints = (0, 0, 0, 0)
+            final_bboxes_list.append(bbox_ints)
+
+        key_frame_num = 4 if B >= 4 else 1
+        key_frame_step = len(pose_metas) // key_frame_num
+        key_frame_index_list = list(range(0, len(pose_metas), key_frame_step))
+        key_points_index = [0, 1, 2, 5, 8, 11, 10, 13]
+        
+        points_dict_list = [] 
+        for key_frame_index in key_frame_index_list:
+            if key_frame_index < len(pose_metas):
+                keypoints_body_list = []
+                body_key_points = pose_metas[key_frame_index]['keypoints_body']
+                for each_index in key_points_index:
+                    each_keypoint = body_key_points[each_index]
+                    if None is each_keypoint:
+                        continue
+                    keypoints_body_list.append(each_keypoint)
+
+                if keypoints_body_list:
+                    keypoints_body = np.array(keypoints_body_list)[:, :2]
+                    wh = np.array([[pose_metas[0]['width'], pose_metas[0]['height']]])
+                    points = (keypoints_body * wh).astype(np.int32)
+                    for point in points:
+                        points_dict_list.append({"x": int(point[0]), "y": int(point[1])})
+
+        pose_data = {
+            "retarget_image": refer_img if retarget_image is not None else None,
+            "pose_metas": retarget_pose_metas,
+            "refer_pose_meta": refer_pose_meta if retarget_image is not None else None,
+            "pose_metas_original": pose_metas,
+        }
+
+        return (pose_data, face_images_tensor, face_info, json.dumps(points_dict_list), final_bboxes_list, face_bboxes)
+
+
+# ==============================================================================
+# Node: Wan Face Stitcher V4
+# ==============================================================================
+
+class WanFaceStitcherV4:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "destination_images": ("IMAGE",),
+                "face_images_v2": ("IMAGE",),
+                "face_info_v2": ("FACE_INFO",),
+                "mode": (["Resize Face to Dest", "Resize Dest to Fit Face"], {"default": "Resize Dest to Fit Face"}),
+                "blend_feather": ("INT", {"default": 32, "min": 0, "max": 512, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("stitched_images",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "V4 Stitcher: Beachtet den blend_alpha Fade-Out aus V8 NoWarp."
+
+    def process(self, destination_images, face_images_v2, face_info_v2, mode, blend_feather):
+        import cv2
+        import numpy as np
+        import torch
+        from tqdm import tqdm
+
+        dest_np = destination_images.cpu().numpy()
+        faces_np = face_images_v2.cpu().numpy()
+        B, H_dest, W_dest, _ = dest_np.shape
+        
+        if len(face_info_v2) == 0: return (destination_images,)
+
+        # Smart Scale Calc
+        target_w, target_h = W_dest, H_dest
+        if mode == "Resize Dest to Fit Face":
+            valid_info = next((f for f in face_info_v2 if f.get("valid")), None)
+            if valid_info:
+                orig_crop_w = valid_info["crop_coords"][2] - valid_info["crop_coords"][0]
+                if orig_crop_w > 0:
+                    zoom = faces_np.shape[2] / orig_crop_w
+                    target_w, target_h = int(valid_info["original_img_shape"][0] * zoom), int(valid_info["original_img_shape"][1] * zoom)
+
+        out = np.zeros((B, target_h, target_w, 3), dtype=np.float32)
+
+        for i in tqdm(range(B), desc="V4 Stitching"):
+            bg = dest_np[i]
+            if bg.shape[1] != target_w or bg.shape[0] != target_h: bg = cv2.resize(bg, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+            out[i] = bg
+            
+            if i >= len(face_info_v2) or not face_info_v2[i]["valid"]: continue
+            
+            info = face_info_v2[i]
+            blend_alpha = info.get("blend_alpha", 1.0)
+            
+            # Optimization: Wenn wir komplett im Fade-Out sind, sparen wir uns das Stitching für diesen Frame
+            if blend_alpha <= 0.001: continue
+            
+            # Coords projizieren
+            sx, sy = target_w / info["original_img_shape"][0], target_h / info["original_img_shape"][1]
+            c = info["crop_coords"]
+            tx1, ty1, tx2, ty2 = int(c[0]*sx), int(c[1]*sy), int(c[2]*sx), int(c[3]*sy)
+            tw, th = tx2 - tx1, ty2 - ty1
+            
+            if tw <= 0 or th <= 0: continue
+            
+            # Face resize fit
+            face = faces_np[i]
+            if face.shape[1] != tw or face.shape[0] != th: face = cv2.resize(face, (tw, th), interpolation=cv2.INTER_AREA)
+            
+            # Mask & Blend
+            mask = np.ones((th, tw, 1), dtype=np.float32)
+            if blend_feather > 0:
+                f = min(blend_feather, tw//2, th//2)
+                if f > 0:
+                    g = np.linspace(0, 1, f)
+                    mask[:f, :] *= g[:, None, None]; mask[-f:, :] *= g[::-1, None, None]
+                    mask[:, :f] *= g[None, :, None]; mask[:, -f:] *= g[None, ::-1, None]
+
+            # Multipliziere die Alpha-Maske mit unserem Fade-Wert aus V8
+            mask *= blend_alpha
+
+            # Clipping
+            dx1, dy1 = max(0, tx1), max(0, ty1)
+            dx2, dy2 = min(target_w, tx2), min(target_h, ty2)
+            sx1, sy1 = dx1 - tx1, dy1 - ty1
+            sx2, sy2 = sx1 + (dx2-dx1), sy1 + (dy2-dy1)
+            
+            if dx2 > dx1 and dy2 > dy1:
+                out[i, dy1:dy2, dx1:dx2] = face[sy1:sy2, sx1:sx2] * mask[sy1:sy2, sx1:sx2] + out[i, dy1:dy2, dx1:dx2] * (1.0 - mask[sy1:sy2, sx1:sx2])
+
+        return (torch.from_numpy(out),)
+
 
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
@@ -25185,6 +25575,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseCalibrationV33": PoseCalibrationV33,
     "PoseGlobalPerspectiveScalerV56": PoseGlobalPerspectiveScalerV56,
     "PoseCalibrationManipulator3": PoseCalibrationManipulator3,
+    "PoseAndFaceDetectionV8_NoWarp": PoseAndFaceDetectionV8_NoWarp,
+    "WanFaceStitcherV4": WanFaceStitcherV4,
     
 }
 
@@ -25304,6 +25696,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseCalibrationV33": "🎯 Pose Calibration Hub (V33)",
     "PoseGlobalPerspectiveScalerV56": "⚖️ Pose Global Perspective Scaler (V56)",
     "PoseCalibrationManipulator3": "🔧 Pose Calibration Manipulator (V3)",
+    "PoseAndFaceDetectionV8_NoWarp": "Pose And Face Detection V8 (No Warp)",
+    "WanFaceStitcherV4": "Wan Face Stitcher V4",
 
     
     
