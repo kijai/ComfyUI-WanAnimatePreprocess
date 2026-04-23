@@ -25458,6 +25458,391 @@ class WanFaceStitcherV4:
         return (torch.from_numpy(out),)
 
 
+class RenderNLFPosesDirectHybrid8:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "nlf_poses": ("NLFPRED", {"tooltip": "Die originalen NLF Daten"}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "render_backend": (["taichi", "torch"], {"default": "taichi"}),
+                "head_connection_mode": (["Offset Head to Neck", "Keep Head & Stretch Neck"], {"default": "Offset Head to Neck", "tooltip": "Wie der Kopf an den Hals angebunden wird"}),
+                "draw_2d": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet 2D Overlay (falls DW Poses vorhanden)"}),
+                "draw_face": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet das Gesicht"}),
+                "draw_hands": ("BOOLEAN", {"default": True, "tooltip": "Zeichnet die Hände"}),
+                
+                # POSEDATA TOGGLES
+                "use_pose_data": ("BOOLEAN", {"default": True, "tooltip": "Nutzt PoseData statt DW Poses für Hände/Füße"}),
+                "use_dwpose_head_for_posedata": ("BOOLEAN", {"default": True, "tooltip": "Nimmt KOMPLETTEN Kopf & Gesicht von DW Pose, auch wenn PoseData an ist"}),
+                "draw_feet": ("BOOLEAN", {"default": True, "tooltip": "Gibt Füße von PoseData an Mask_Data weiter"}),
+                
+                # Hände Tweaks (Skalierung, Alpha, Offsets)
+                "apply_fingertip_offsets": ("BOOLEAN", {"default": True, "tooltip": "Wendet die Rotations-Offsets auf die Finger an"}),
+                "hand_scale_factor": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05, "tooltip": "Skaliert die Hände (1.0 = normal)"}),
+            },
+            "optional": {
+                "dw_poses_fallback": ("DWPOSES", {"tooltip": "Referenz-Posen für Hände/Gesicht"}),
+                "pose_data_fallback": ("POSEDATA", {"tooltip": "Pose Data (z.B. ViTPose) für Hände/Füße"}),
+                "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus der Scaler-Node"}),
+                "fingertip_offsets": ("STRING", {"forceInput": True, "tooltip": "Die JSON-Offsets aus der HandDebug-Node"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "NLFPRED", "STRING", "NLF_MASK_DATA")
+    RETURN_NAMES = ("image", "mask", "log_output", "scaled_nlf_poses", "node_mappings", "nlf_data_for_mask")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/SCAIL"
+    DESCRIPTION = "Hybrid 8: Direct 3D Render Optik (Taichi) + PoseData & Offset Präzision (aus Mimic) + NLF Mask Data Output."
+
+    def process(self, nlf_poses, width, height, render_backend="taichi", head_connection_mode="Offset Head to Neck", draw_2d=True, draw_face=True, draw_hands=True, use_pose_data=True, use_dwpose_head_for_posedata=True, draw_feet=True, apply_fingertip_offsets=True, hand_scale_factor=1.0, dw_poses_fallback=None, pose_data_fallback=None, nlf_render_config="{}", fingertip_offsets=None):
+        import copy
+        import json
+        import torch
+        import numpy as np
+        import traceback
+        from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
+        from .NLFPoseExtract.nlf_render_flat import process_data_to_COCO_format, p3d_single_p2d
+
+        log_messages = ["=== RENDER NLF POSES DIRECT HYBRID 8 LOG ==="]
+        
+        if render_backend == "taichi":
+            try:
+                import taichi as ti
+                ti.init(arch=ti.gpu)
+                log_messages.append("Render-Backend: Taichi GPU initialisiert.")
+            except Exception as e:
+                render_backend = "torch"
+                log_messages.append(f"WARNUNG: Taichi GPU fehlgeschlagen. Nutze Torch. Fehler: {e}")
+        else:
+            log_messages.append("Render-Backend: Torch.")
+
+        scaled_nlf_poses = copy.deepcopy(nlf_poses)
+        
+        # Offsets Parsen
+        offsets_dict = {}
+        if apply_fingertip_offsets and fingertip_offsets and fingertip_offsets.strip() != "":
+            try:
+                offsets_dict = json.loads(fingertip_offsets)
+                log_messages.append("Fingertip Offsets erfolgreich geladen und aktiviert.")
+            except Exception as e:
+                log_messages.append(f"Fehler beim Parsen der fingertip_offsets: {e}")
+        elif not apply_fingertip_offsets:
+            log_messages.append("Fingertip Offsets sind per Toggle deaktiviert.")
+
+        try:
+            pose_input = scaled_nlf_poses['joints3d_nonparam'][0] if isinstance(scaled_nlf_poses, dict) else scaled_nlf_poses
+            
+            dw_pose_input = copy.deepcopy(dw_poses_fallback["poses"]) if dw_poses_fallback is not None else None
+            if dw_pose_input is None and use_pose_data:
+                dw_pose_input = [{"bodies": {"candidate": [np.zeros((18, 2))], "subset": [np.full(18, -1)]}, "hands": np.zeros((2, 21, 2)), "faces": [np.zeros((68, 2))]} for _ in range(len(pose_input))]
+            
+            pose_metas = []
+            if use_pose_data and pose_data_fallback is not None:
+                pose_metas = pose_data_fallback.get("pose_metas", [])
+
+            if len(pose_input) > 0 and pose_input[0] is not None:
+                log_messages.append(f"Erfolgreich geladen: {len(pose_input)} Frames.")
+
+            intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
+            
+            # 1. CONFIG MATHEMATISCH AUF DIE 3D PUNKTE ANWENDEN
+            try:
+                config = json.loads(nlf_render_config)
+                if "anchor_scale" in config:
+                    scale_y = float(config["anchor_scale"])
+                    scale_x = float(config.get("scale_x_factor", scale_y))
+                    
+                    p_x = float(config["pivot_x"])
+                    p_y = float(config["pivot_y"])
+
+                    if p_x <= 2.0 and p_y <= 2.0:
+                        p_x = p_x * width
+                        p_y = p_y * height
+                    
+                    fx = intrinsic_matrix[0, 0]
+                    fy = intrinsic_matrix[1, 1]
+                    cx = intrinsic_matrix[0, 2]
+                    cy = intrinsic_matrix[1, 2]
+
+                    M13 = (cx - p_x) * (scale_x - 1.0) / fx
+                    M23 = (cy - p_y) * (scale_y - 1.0) / fy
+
+                    log_messages.append(f"Wende 3D-Transformation an: ScaleX={scale_x:.3f}, ScaleY={scale_y:.3f}")
+
+                    for frame_idx in range(len(pose_input)):
+                        if pose_input[frame_idx] is not None and len(pose_input[frame_idx]) > 0:
+                            pts = pose_input[frame_idx]
+                            X = pts[..., 0].clone()
+                            Y = pts[..., 1].clone()
+                            Z = pts[..., 2].clone()
+                            
+                            pts[..., 0] = X * scale_x + Z * M13
+                            pts[..., 1] = Y * scale_y + Z * M23
+                            
+                    log_messages.append("Erfolg: Die 3D-NLF-Daten wurden physisch im Raum transformiert!")
+            except Exception as e:
+                log_messages.append(f"Fehler bei 3D Transformation: {e}")
+
+            # 2. POSEDATA IN DW-STRUKTUR INJIZIEREN
+            if use_pose_data and pose_metas:
+                for p_idx in range(min(len(dw_pose_input), len(pose_metas))):
+                    meta = pose_metas[p_idx]
+                    dw = dw_pose_input[p_idx]
+                    cand = dw["bodies"]["candidate"][0] if isinstance(dw["bodies"]["candidate"], list) else dw["bodies"]["candidate"][0]
+                    subset = dw["bodies"]["subset"][0] if isinstance(dw["bodies"]["subset"], list) else dw["bodies"]["subset"][0]
+                    
+                    meta_w = getattr(meta, "width", width)
+                    meta_h = getattr(meta, "height", height)
+
+                    if draw_hands:
+                        lh = getattr(meta, "kps_lhand", None)
+                        rh = getattr(meta, "kps_rhand", None)
+                        if lh is not None and len(lh) >= 21: dw["hands"][0] = np.array(lh[:, :2]) / np.array([meta_w, meta_h])
+                        if rh is not None and len(rh) >= 21: dw["hands"][1] = np.array(rh[:, :2]) / np.array([meta_w, meta_h])
+
+                    if not use_dwpose_head_for_posedata:
+                        coco_to_op = {0: 0, 1: 15, 2: 14, 3: 17, 4: 16}
+                        if getattr(meta, "kps_body", None) is not None:
+                            body_pts = meta.kps_body
+                            for coco_idx, op_idx in coco_to_op.items():
+                                if coco_idx < len(body_pts) and body_pts[coco_idx][0] > 0:
+                                    cand[op_idx] = [body_pts[coco_idx][0] / meta_w, body_pts[coco_idx][1] / meta_h]
+                                    subset[op_idx] = op_idx
+                        if draw_face:
+                            face_pts = getattr(meta, "kps_face", None)
+                            if face_pts is not None and len(face_pts) > 1:
+                                dw["faces"][0] = np.array(face_pts[1:, :2]) / np.array([meta_w, meta_h])
+
+                    if draw_feet and getattr(meta, "kps_body", None) is not None:
+                        feet_pts = []
+                        for f_idx in [19, 20, 21, 22, 23, 24]:
+                            if f_idx < len(meta.kps_body) and meta.kps_body[f_idx][0] > 0: feet_pts.append(meta.kps_body[f_idx][:2])
+                        if len(feet_pts) > 0:
+                            dw["_posedata_feet"] = np.array(feet_pts) / np.array([meta_w, meta_h])
+                        else:
+                            dw["_posedata_feet"] = np.array([])
+
+            # 3. 2D BERECHNUNG FÜR OFFSETS UND MASKEN ANPASSUNG
+            all_frames_pts_for_mask = []
+            for i in range(len(pose_input)):
+                if pose_input[i] is not None:
+                    joints3d_batch = pose_input[i]
+                    people = joints3d_batch if joints3d_batch.dim() == 3 else [joints3d_batch] if joints3d_batch.dim() == 2 else []
+
+                    all_pts_2d_with_z = []
+                    for joints3d in people:
+                        j3d_np = joints3d.cpu().numpy() if isinstance(joints3d, torch.Tensor) else joints3d
+                        if np.sum(np.abs(j3d_np)) > 0.01:
+                            j3d_coco = process_data_to_COCO_format(j3d_np)
+                            pts_2d_with_z = []
+                            for pt3d in j3d_coco:
+                                if np.sum(np.abs(pt3d)) > 0:
+                                    pt2d = p3d_single_p2d(pt3d, intrinsic_matrix)
+                                    pts_2d_with_z.append([int(pt2d[0]), int(pt2d[1]), float(pt3d[2])])
+                                else:
+                                    pts_2d_with_z.append(None)
+                                    
+                            if len(pts_2d_with_z) > 5 and pts_2d_with_z[2] is not None and pts_2d_with_z[5] is not None:
+                                p_r, p_l = pts_2d_with_z[2], pts_2d_with_z[5]
+                                if pts_2d_with_z[1] is not None:
+                                    p_neck = pts_2d_with_z[1]
+                                    pts_2d_with_z[1][0] = int((p_r[0] + p_l[0]) / 2)
+                                    pts_2d_with_z[1][1] = int((p_r[1] + p_l[1]) / 2)
+
+                            all_pts_2d_with_z.append(pts_2d_with_z)
+
+                    if dw_pose_input is not None and i < len(dw_pose_input):
+                        dw_faces = dw_pose_input[i].get("faces", [])
+                        dw_hands = dw_pose_input[i].get("hands", [])
+                        dw_bodies = dw_pose_input[i].get("bodies", {})
+                        
+                        for p, pts in enumerate(all_pts_2d_with_z):
+                            if p >= len(dw_hands) // 2: continue
+                            r_hand = dw_hands[p*2]
+                            l_hand = dw_hands[p*2+1]
+                            
+                            l_offset = [0.0, 0.0]
+                            r_offset = [0.0, 0.0]
+                            if apply_fingertip_offsets:
+                                f_idx_str = str(i)
+                                p_idx_str = str(p)
+                                if f_idx_str in offsets_dict and p_idx_str in offsets_dict[f_idx_str]:
+                                    l_offset = offsets_dict[f_idx_str][p_idx_str].get("left_hand", [0.0, 0.0])
+                                    r_offset = offsets_dict[f_idx_str][p_idx_str].get("right_hand", [0.0, 0.0])
+
+                            if len(pts) > 7 and pts[7] is not None and np.sum(r_hand) > 0.01:
+                                wrist_norm = np.array([pts[7][0] / float(width), pts[7][1] / float(height)])
+                                gap_offset = np.array([0.0, 0.0])
+                                if pts[6] is not None:
+                                    dir_vec = np.array([pts[7][0] - pts[6][0], pts[7][1] - pts[6][1]])
+                                    norm_vec = np.linalg.norm(dir_vec)
+                                    if norm_vec > 0: gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
+                                r_flat = np.array(r_hand[0]).flatten()
+                                ox, oy = float((wrist_norm[0] + gap_offset[0]) - r_flat[0]), float((wrist_norm[1] + gap_offset[1]) - r_flat[1])
+                                
+                                if isinstance(r_hand, np.ndarray):
+                                    valid_mask = r_hand[:, 0] > 0
+                                    r_hand[valid_mask, 0] += ox
+                                    r_hand[valid_mask, 1] += oy
+                                    
+                                    if hand_scale_factor != 1.0:
+                                        wrist_pos = r_hand[0].copy()
+                                        for f_idx in range(1, 21):
+                                            if valid_mask[f_idx]:
+                                                r_hand[f_idx] = wrist_pos + (r_hand[f_idx] - wrist_pos) * hand_scale_factor
+                                    
+                                    if apply_fingertip_offsets and (abs(r_offset[0]) > 0.001 or abs(r_offset[1]) > 0.001):
+                                        r_off_x, r_off_y = r_offset[0] / float(width), r_offset[1] / float(height)
+                                        finger_mask = valid_mask.copy()
+                                        finger_mask[0] = False 
+                                        r_hand[finger_mask, 0] += r_off_x
+                                        r_hand[finger_mask, 1] += r_off_y
+
+                            if len(pts) > 4 and pts[4] is not None and np.sum(l_hand) > 0.01:
+                                wrist_norm = np.array([pts[4][0] / float(width), pts[4][1] / float(height)])
+                                gap_offset = np.array([0.0, 0.0])
+                                if pts[3] is not None:
+                                    dir_vec = np.array([pts[4][0] - pts[3][0], pts[4][1] - pts[3][1]])
+                                    norm_vec = np.linalg.norm(dir_vec)
+                                    if norm_vec > 0: gap_offset = (dir_vec / norm_vec) * 4.0 / np.array([width, height])
+                                l_flat = np.array(l_hand[0]).flatten()
+                                ox, oy = float((wrist_norm[0] + gap_offset[0]) - l_flat[0]), float((wrist_norm[1] + gap_offset[1]) - l_flat[1])
+                                
+                                if isinstance(l_hand, np.ndarray):
+                                    valid_mask = l_hand[:, 0] > 0
+                                    l_hand[valid_mask, 0] += ox
+                                    l_hand[valid_mask, 1] += oy
+                                    
+                                    if hand_scale_factor != 1.0:
+                                        wrist_pos = l_hand[0].copy()
+                                        for f_idx in range(1, 21):
+                                            if valid_mask[f_idx]:
+                                                l_hand[f_idx] = wrist_pos + (l_hand[f_idx] - wrist_pos) * hand_scale_factor
+                                    
+                                    if apply_fingertip_offsets and (abs(l_offset[0]) > 0.001 or abs(l_offset[1]) > 0.001):
+                                        l_off_x, l_off_y = l_offset[0] / float(width), l_offset[1] / float(height)
+                                        finger_mask = valid_mask.copy()
+                                        finger_mask[0] = False 
+                                        l_hand[finger_mask, 0] += l_off_x
+                                        l_hand[finger_mask, 1] += l_off_y
+
+                            if draw_feet and "_posedata_feet" in dw_pose_input[i]:
+                                feet_array = dw_pose_input[i]["_posedata_feet"]
+                                if len(feet_array) > 0 and pts[10] is not None:
+                                    ankle_norm = np.array([pts[10][0] / float(width), pts[10][1] / float(height)])
+                                    feet_flat = np.array(feet_array[0]).flatten()
+                                    fox, foy = float(ankle_norm[0] - feet_flat[0]), float(ankle_norm[1] - feet_flat[1])
+
+                            dw_hx, dw_hy, dw_nx, dw_ny = None, None, None, None
+                            person_subset, candidate = None, None
+                            if isinstance(dw_bodies, dict) and "candidate" in dw_bodies and "subset" in dw_bodies:
+                                candidate, subset = dw_bodies["candidate"], dw_bodies["subset"]
+                                if isinstance(subset, np.ndarray) and subset.ndim == 3 and subset.shape[0] == 1: subset = subset[0]
+                                dw_bodies["subset"] = subset
+                                if p < len(subset): person_subset = subset[p]
+                                
+                                nose_idx = int(np.array(person_subset).flatten()[0]) if person_subset is not None else -1
+                                if 0 <= nose_idx < len(candidate):
+                                    cand_val = np.array(candidate[nose_idx]).flatten()
+                                    if len(cand_val) >= 2 and cand_val[0] > 0: dw_hx, dw_hy = float(cand_val[0]), float(cand_val[1])
+                                
+                                if person_subset is not None and len(np.array(person_subset).flatten()) > 1:
+                                    neck_idx = int(np.array(person_subset).flatten()[1])
+                                    if 0 <= neck_idx < len(candidate):
+                                        cand_val = np.array(candidate[neck_idx]).flatten()
+                                        if len(cand_val) >= 2 and cand_val[0] > 0: dw_nx, dw_ny = float(cand_val[0]), float(cand_val[1])
+
+                            if dw_hx is None and p < len(dw_faces):
+                                face = dw_faces[p]
+                                if isinstance(face, np.ndarray) and len(face) > 30 and face[30, 0] > 0:
+                                    dw_hx, dw_hy = float(face[30, 0]), float(face[30, 1])
+
+                            if head_connection_mode == "Offset Head to Neck":
+                                if pts[1] is not None and dw_nx is not None and dw_ny is not None:
+                                    ox, oy = float((float(pts[1][0]) / float(width)) - dw_nx), float((float(pts[1][1]) / float(height)) - dw_ny)
+                                    if person_subset is not None and candidate is not None:
+                                        for h_idx in [0, 14, 15, 16, 17, 18, 19, 20]:
+                                            if h_idx < len(person_subset):
+                                                cand_idx = int(np.array(person_subset).flatten()[h_idx])
+                                                if 0 <= cand_idx < len(candidate):
+                                                    cand = candidate[cand_idx]
+                                                    if isinstance(cand, np.ndarray): cand.flat[0] += ox; cand.flat[1] += oy
+                                                    elif isinstance(cand, list):
+                                                        if isinstance(cand[0], list): cand[0][0] += ox; cand[0][1] += oy
+                                                        else: cand[0] += ox; cand[1] += oy
+
+                                    if p < len(dw_faces):
+                                        face = dw_faces[p]
+                                        if isinstance(face, np.ndarray):
+                                            valid_mask = face[:, 0] > 0
+                                            face[valid_mask, 0] += ox; face[valid_mask, 1] += oy
+                                        elif isinstance(face, list):
+                                            for f_pt in face:
+                                                if f_pt[0] > 0: f_pt[0] += ox; f_pt[1] += oy
+                                                
+                                    pixel_ox, pixel_oy = ox * float(width), oy * float(height)
+                                    for h_idx in [0, 14, 15, 16, 17]:
+                                        if pts[h_idx] is not None: pts[h_idx][0] += pixel_ox; pts[h_idx][1] += pixel_oy
+
+                            elif head_connection_mode == "Keep Head & Stretch Neck":
+                                if pts[0] is not None and dw_hx is not None and dw_hy is not None:
+                                    pixel_ox, pixel_oy = (dw_hx * float(width)) - pts[0][0], (dw_hy * float(height)) - pts[0][1]
+                                    for h_idx in [0, 14, 15, 16, 17]:
+                                        if pts[h_idx] is not None: pts[h_idx][0] += pixel_ox; pts[h_idx][1] += pixel_oy
+
+                    all_frames_pts_for_mask.append(all_pts_2d_with_z)
+
+            # 4. RENDERN MIT TAICHI (Mit den nun modifizierten DW Daten!)
+            log_messages.append(f"Rendere Settings -> 2D: {draw_2d} | Face: {draw_face} | Hands: {draw_hands}")
+            
+            is_multi = False
+            if len(pose_input) > 0:
+                if isinstance(pose_input[0], list):
+                    is_multi = len(pose_input[0]) > 1
+                elif isinstance(pose_input[0], torch.Tensor) and pose_input[0].dim() == 3:
+                    is_multi = pose_input[0].shape[0] > 1
+                    
+            if is_multi:
+                frames_np = render_multi_nlf_as_images(
+                    pose_input, dw_pose_input, height, width, len(pose_input), 
+                    intrinsic_matrix=intrinsic_matrix, 
+                    draw_2d=draw_2d, draw_face=draw_face, draw_hands=draw_hands, 
+                    render_backend=render_backend
+                )
+            else:
+                frames_np = render_nlf_as_images(
+                    pose_input, dw_pose_input, height, width, len(pose_input), 
+                    intrinsic_matrix=intrinsic_matrix, 
+                    draw_2d=draw_2d, draw_face=draw_face, draw_hands=draw_hands, 
+                    render_backend=render_backend
+                )
+
+            frames_tensor = torch.from_numpy(np.stack(frames_np, axis=0)).contiguous() / 255.0
+            frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5
+            
+            if isinstance(scaled_nlf_poses, dict): scaled_nlf_poses['joints3d_nonparam'] = [pose_input]
+            else: scaled_nlf_poses = pose_input
+                
+            node_mappings = json.dumps({"node_name": "RenderNLFPosesDirectHybrid8", "status": "success", "frames": len(pose_input)})
+            
+            nlf_data_for_mask = {
+                "all_frames_pts": all_frames_pts_for_mask,
+                "dw_pose_input": dw_pose_input,
+                "width": width,
+                "height": height,
+                "focal_length": intrinsic_matrix[0, 0]
+            }
+            
+            return (frames_tensor.cpu().float(), mask.cpu().float(), "\n".join(log_messages), scaled_nlf_poses, node_mappings, nlf_data_for_mask)
+
+        except Exception as e:
+            log_messages.append(traceback.format_exc())
+            empty_img = torch.zeros((1, height, width, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((1, height, width), dtype=torch.float32)
+            return (empty_img, empty_mask, "\n".join(log_messages), nlf_poses, "{}", None)
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -25577,6 +25962,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseCalibrationManipulator3": PoseCalibrationManipulator3,
     "PoseAndFaceDetectionV8_NoWarp": PoseAndFaceDetectionV8_NoWarp,
     "WanFaceStitcherV4": WanFaceStitcherV4,
+    "RenderNLFPosesDirectHybrid8": RenderNLFPosesDirectHybrid8,
     
 }
 
@@ -25698,6 +26084,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseCalibrationManipulator3": "🔧 Pose Calibration Manipulator (V3)",
     "PoseAndFaceDetectionV8_NoWarp": "Pose And Face Detection V8 (No Warp)",
     "WanFaceStitcherV4": "Wan Face Stitcher V4",
+    "RenderNLFPosesDirectHybrid8": "Render NLF Poses Direct Hybrid 8",
 
     
     
