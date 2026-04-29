@@ -29316,6 +29316,997 @@ class NLFProportionalRetargeterV20:
 
         return (nlf_data_retargeted, "\n".join(log_messages), clean_config_str)
 
+
+class PoseGlobalPerspectiveScalerV57:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_pose_data": ("POSEDATA",),
+                "calibration_data": ("POSE_CALIBRATION",),
+                "scaling_mode": (
+                    [
+                        "1. Classic 2D + Depth Map",
+                        "2. NLF 2D Overlay + Depth Map",
+                        "3. Pure NLF 3D Compare (Legacy)",
+                        "4. Robust NLF 3D Ratio"
+                    ],
+                    {"default": "4. Robust NLF 3D Ratio"}
+                ),
+                "best_frame_source": (["PoseData (2D)", "NLF (3D SMPL)"], {"default": "NLF (3D SMPL)"}),
+                "nlf_smoothing_window": ("INT", {"default": 3, "min": 1, "max": 20, "step": 1, "tooltip": "Für NLF-Modi: Glättet die 3D-Knochenlängen über X Frames."}),
+                "include_head": ("BOOLEAN", {"default": True}),
+                "anchor_window": ("INT", {"default": 2, "min": 0, "max": 15, "step": 1}),
+                "min_confidence": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "frontal_method": (["3D_NLF", "2D_Ratio"], {"default": "3D_NLF"}),
+                "frontal_2d_threshold": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 90.0, "step": 1.0}),
+                "scale_2d_axes": (["X and Y (Uniform)", "Only Y (Height)"], {"default": "X and Y (Uniform)"}),
+
+                "nlf_top_frame_count": ("INT", {"default": 12, "min": 1, "max": 80, "step": 1, "tooltip": "Nur Modus 4: Anzahl der besten NLF-Frames, aus denen der finale Scale robust berechnet wird."}),
+                "nlf_ratio_aggregation": (["median", "trimmed_mean", "weighted_mean"], {"default": "median", "tooltip": "Nur Modus 4: Wie die Top-Frame-Ratios zu einem einzigen Scale kombiniert werden."}),
+                "nlf_outlier_threshold": ("FLOAT", {"default": 0.18, "min": 0.02, "max": 1.00, "step": 0.01, "tooltip": "Nur Modus 4: Relative Ausreißer-Schwelle. 0.18 = Frames über ca. 18 Prozent vom Median werden verworfen."}),
+                "nlf_min_bone_count": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1, "tooltip": "Nur Modus 4: Mindestanzahl gültiger Bone-Ratios pro Frame."}),
+                "nlf_scale_basis": (
+                    ["visible_parts", "torso_legs_balanced", "full_body", "upper_body_priority", "legs_priority"],
+                    {"default": "torso_legs_balanced", "tooltip": "Nur Modus 4: Welche Bone-Gruppen für den einen finalen NLF-Scale bevorzugt werden."}
+                ),
+            },
+            "optional": {
+                "video_depth_map": ("IMAGE",),
+                "video_nlf_data": ("NLFPRED",),
+                "video_intrinsics_json": ("STRING", {"forceInput": True}),
+                "valid_depth_indices": ("STRING", {"forceInput": True}),
+            }
+        }
+
+    RETURN_TYPES = ("POSEDATA", "STRING", "NLFPRED", "STRING")
+    RETURN_NAMES = ("scaled_pose_data", "log_output", "nlf_data", "nlf_render_config")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Ultimate"
+    DESCRIPTION = "V57: Fügt Robust NLF 3D Ratio als Modus 4 hinzu. Gibt weiterhin nur einen finalen Scale aus."
+
+    def process(
+        self,
+        video_pose_data,
+        calibration_data,
+        scaling_mode,
+        best_frame_source,
+        nlf_smoothing_window,
+        include_head,
+        anchor_window,
+        min_confidence,
+        frontal_method,
+        frontal_2d_threshold,
+        frontal_3d_angle_tolerance,
+        scale_2d_axes,
+        nlf_top_frame_count,
+        nlf_ratio_aggregation,
+        nlf_outlier_threshold,
+        nlf_min_bone_count,
+        nlf_scale_basis,
+        video_depth_map=None,
+        video_nlf_data=None,
+        video_intrinsics_json=None,
+        valid_depth_indices=None
+    ):
+        import copy
+        import numpy as np
+        import math
+        import json
+        import torch
+
+        pose_data_copy = copy.deepcopy(video_pose_data)
+        pose_metas = pose_data_copy.get("pose_metas", [])
+        log_messages = [f"=== V57 GLOBAL SCALER LOG (MODE: {scaling_mode}) ==="]
+
+        if not pose_metas:
+            return (pose_data_copy, "Fehler: Keine Pose-Daten.", video_nlf_data, "{}")
+
+        is_inverted = calibration_data.get("is_depth_inverted", False)
+
+        mode_id = scaling_mode[0]
+        bone_m = {}
+        fx_video = 500.0
+
+        calib_nlf_3d = calibration_data.get("bone_lengths_nlf_3d", {})
+
+        if mode_id in ["1", "2"]:
+            bone_m = calibration_data.get("bone_lengths_in_meters_depthmap", {})
+            if not bone_m:
+                bone_m = calibration_data.get("bone_lengths_in_meters", {})
+
+            fx_video = calibration_data.get("focal_length_fx", 500.0)
+
+            if video_intrinsics_json:
+                try:
+                    int_data = json.loads(video_intrinsics_json)
+                    if "intrinsics" in int_data and len(int_data["intrinsics"]) > 0:
+                        matrix = int_data["intrinsics"][0].get("image_0", None)
+                        if matrix is not None:
+                            fx_video = float(matrix[0][0])
+                except Exception:
+                    pass
+
+            log_messages.append(f">> Lade Pinhole-Metriken (fx={fx_video:.2f}) für Depth Map.")
+
+        elif mode_id in ["3", "4"]:
+            if not calib_nlf_3d:
+                return (
+                    pose_data_copy,
+                    "Fehler: Hub hat keine bone_lengths_nlf_3d! Bitte NLF in die Calibration/Hub Node stecken.",
+                    video_nlf_data,
+                    "{}"
+                )
+
+            if mode_id == "3":
+                log_messages.append(f">> Lade pure 3D-Metrik LEGACY: {calib_nlf_3d} | Pinhole und Z-Tiefe werden ignoriert.")
+            else:
+                log_messages.append(f">> Lade ROBUST NLF 3D Ratio: {calib_nlf_3d} | Pinhole und Z-Tiefe werden ignoriert.")
+
+        valid_depth_frames = None
+        if valid_depth_indices:
+            try:
+                valid_depth_frames = [int(x.strip()) for x in valid_depth_indices.split(",") if x.strip().isdigit()]
+            except Exception:
+                valid_depth_frames = None
+
+        def get_nearest_depth_idx(target_idx, valid_list):
+            if not valid_list:
+                return target_idx, target_idx
+            nearest_val = min(valid_list, key=lambda x: abs(x - target_idx))
+            return valid_list.index(nearest_val), nearest_val
+
+        depth_np = None
+        if video_depth_map is not None:
+            depth_np = video_depth_map.cpu().numpy() if hasattr(video_depth_map, "cpu") else video_depth_map
+
+        H, W = (depth_np.shape[1], depth_np.shape[2]) if depth_np is not None else (1024, 1024)
+
+        def is_val(kps, confs, idx):
+            if kps is None or idx >= len(kps):
+                return False
+            pt = kps[idx]
+            if pt is None or len(pt) < 2:
+                return False
+            c = float(confs[idx]) if (confs is not None and idx < len(confs)) else 1.0
+            return c >= min_confidence
+
+        def dist_2d(kps, i1, i2):
+            return math.sqrt((kps[i1][0] - kps[i2][0]) ** 2 + (kps[i1][1] - kps[i2][1]) ** 2)
+
+        def get_skeleton_depth(kps, confs, depth_img, v_idx, W, H):
+            if depth_img is None:
+                return 0.5
+
+            skeleton_connections = [
+                (0, 1), (1, 2), (2, 3), (3, 4),
+                (1, 5), (5, 6), (6, 7),
+                (1, 8), (8, 9), (9, 10),
+                (1, 11), (11, 12), (12, 13),
+                (8, 11)
+            ]
+
+            depth_vals = []
+
+            for p1, p2 in skeleton_connections:
+                if is_val(kps, confs, p1) and is_val(kps, confs, p2):
+                    x1, y1 = int(kps[p1][0]), int(kps[p1][1])
+                    x2, y2 = int(kps[p2][0]), int(kps[p2][1])
+                    dist = max(abs(x2 - x1), abs(y2 - y1))
+
+                    if dist > 0:
+                        for step in range(dist + 1):
+                            t = step / dist
+                            px = int(x1 + t * (x2 - x1))
+                            py = int(y1 + t * (y2 - y1))
+
+                            if 0 <= px < W and 0 <= py < H:
+                                val = depth_img[v_idx, py, px]
+                                depth_vals.append(float(val[0] if isinstance(val, (np.ndarray, list)) else val))
+
+            if depth_vals:
+                return float(np.mean(depth_vals))
+
+            return 0.5
+
+        def get_nlf_2d_depth(pts, depth_img, v_idx, W, H):
+            if depth_img is None:
+                return 0.5
+
+            depth_vals = []
+
+            for idx in range(len(pts)):
+                if np.linalg.norm(pts[idx]) > 1e-5:
+                    px, py = int(pts[idx][0]), int(pts[idx][1])
+
+                    if 0 <= px < W and 0 <= py < H:
+                        val = depth_img[v_idx, py, px]
+                        depth_vals.append(float(val[0] if isinstance(val, (np.ndarray, list)) else val))
+
+            if depth_vals:
+                return float(np.mean(depth_vals))
+
+            return 0.5
+
+        is_dict = isinstance(video_nlf_data, dict)
+        raw_poses = video_nlf_data.get("joints3d_nonparam", [video_nlf_data])[0] if is_dict and video_nlf_data else video_nlf_data
+
+        def extract_nlf_points(raw_poses_local, f_idx):
+            if raw_poses_local is None:
+                return None
+            if f_idx < 0 or f_idx >= len(raw_poses_local):
+                return None
+            if raw_poses_local[f_idx] is None or len(raw_poses_local[f_idx]) == 0:
+                return None
+
+            frame_data = raw_poses_local[f_idx]
+            is_tensor = hasattr(frame_data, "dim")
+
+            if is_tensor and frame_data.dim() == 3:
+                pts = frame_data[0].cpu().numpy()
+            elif is_tensor:
+                pts = frame_data.cpu().numpy()
+            else:
+                arr = np.array(frame_data)
+                pts = arr[0] if arr.ndim == 3 else arr
+
+            if pts is None or len(pts) == 0:
+                return None
+
+            return pts
+
+        def get_nlf_3d_bones_for_frame(raw_poses_local, f_idx):
+            pts = extract_nlf_points(raw_poses_local, f_idx)
+            if pts is None or len(pts) < 16:
+                return {}
+
+            def valid(idx):
+                return idx < len(pts) and np.linalg.norm(pts[idx]) > 1e-5
+
+            def dist3d(idx1, idx2):
+                if not valid(idx1) or not valid(idx2):
+                    return 0.0
+                return float(np.linalg.norm(pts[idx1] - pts[idx2]))
+
+            head = dist3d(12, 15)
+            torso = dist3d(0, 12)
+
+            l_thigh = dist3d(1, 4)
+            r_thigh = dist3d(2, 5)
+            l_calf = dist3d(4, 7)
+            r_calf = dist3d(5, 8)
+
+            thigh_vals = [v for v in [l_thigh, r_thigh] if v > 1e-5]
+            calf_vals = [v for v in [l_calf, r_calf] if v > 1e-5]
+
+            thigh = float(np.mean(thigh_vals)) if thigh_vals else 0.0
+            calf = float(np.mean(calf_vals)) if calf_vals else 0.0
+
+            shoulder_width = dist3d(16, 17)
+            hip_width = dist3d(1, 2)
+
+            return {
+                "head": head,
+                "torso": torso,
+                "l_thigh": l_thigh,
+                "r_thigh": r_thigh,
+                "thigh": thigh,
+                "l_calf": l_calf,
+                "r_calf": r_calf,
+                "calf": calf,
+                "shoulder_width": shoulder_width,
+                "hip_width": hip_width
+            }
+
+        def get_smoothed_nlf_3d_bones(raw_poses_local, f_idx, window):
+            collected = []
+
+            start = max(0, f_idx - window)
+            end = min(len(raw_poses_local) - 1, f_idx + window) if raw_poses_local is not None else -1
+
+            for w in range(start, end + 1):
+                bones = get_nlf_3d_bones_for_frame(raw_poses_local, w)
+                if bones:
+                    collected.append(bones)
+
+            if not collected:
+                return get_nlf_3d_bones_for_frame(raw_poses_local, f_idx)
+
+            keys = [
+                "head", "torso",
+                "l_thigh", "r_thigh", "thigh",
+                "l_calf", "r_calf", "calf",
+                "shoulder_width", "hip_width"
+            ]
+
+            out = {}
+
+            for key in keys:
+                vals = [float(b.get(key, 0.0)) for b in collected if float(b.get(key, 0.0)) > 1e-5]
+                out[key] = float(np.median(vals)) if vals else 0.0
+
+            return out
+
+        def get_calib_target_value(key):
+            if key in calib_nlf_3d and float(calib_nlf_3d.get(key, 0.0)) > 1e-5:
+                return float(calib_nlf_3d.get(key, 0.0))
+
+            if key == "l_thigh" or key == "r_thigh":
+                if "thigh" in calib_nlf_3d:
+                    return float(calib_nlf_3d.get("thigh", 0.0))
+
+            if key == "l_calf" or key == "r_calf":
+                if "calf" in calib_nlf_3d:
+                    return float(calib_nlf_3d.get("calf", 0.0))
+
+            if key == "thigh":
+                vals = [
+                    float(calib_nlf_3d.get("l_thigh", 0.0)),
+                    float(calib_nlf_3d.get("r_thigh", 0.0))
+                ]
+                vals = [v for v in vals if v > 1e-5]
+                if vals:
+                    return float(np.mean(vals))
+
+            if key == "calf":
+                vals = [
+                    float(calib_nlf_3d.get("l_calf", 0.0)),
+                    float(calib_nlf_3d.get("r_calf", 0.0))
+                ]
+                vals = [v for v in vals if v > 1e-5]
+                if vals:
+                    return float(np.mean(vals))
+
+            return 0.0
+
+        def get_visible_parts_for_frame(frame_idx):
+            if frame_idx < 0 or frame_idx >= len(pose_metas):
+                return [], 0.0
+
+            kps = getattr(pose_metas[frame_idx], "kps_body", [])
+            confs = getattr(pose_metas[frame_idx], "kps_body_p", None)
+
+            visible_parts_keys = []
+            frame_ist_px = 0.0
+
+            if include_head and is_val(kps, confs, 0) and is_val(kps, confs, 1):
+                frame_ist_px += dist_2d(kps, 0, 1)
+                visible_parts_keys.append("head")
+
+            if is_val(kps, confs, 1) and is_val(kps, confs, 8) and is_val(kps, confs, 11):
+                mid_x = (kps[8][0] + kps[11][0]) / 2.0
+                mid_y = (kps[8][1] + kps[11][1]) / 2.0
+                frame_ist_px += math.sqrt((kps[1][0] - mid_x) ** 2 + (kps[1][1] - mid_y) ** 2)
+                visible_parts_keys.append("torso")
+
+            if is_val(kps, confs, 8) and is_val(kps, confs, 9):
+                frame_ist_px += dist_2d(kps, 8, 9)
+                visible_parts_keys.append("thigh")
+
+            if is_val(kps, confs, 9) and is_val(kps, confs, 10):
+                frame_ist_px += dist_2d(kps, 9, 10)
+                visible_parts_keys.append("calf")
+
+            return visible_parts_keys, frame_ist_px
+
+        def get_robust_basis_keys(visible_parts_keys):
+            if nlf_scale_basis == "visible_parts":
+                keys = list(visible_parts_keys)
+                if not keys:
+                    keys = ["torso", "thigh", "calf"]
+                return keys
+
+            if nlf_scale_basis == "full_body":
+                return ["head", "torso", "thigh", "calf"]
+
+            if nlf_scale_basis == "upper_body_priority":
+                return ["head", "torso"]
+
+            if nlf_scale_basis == "legs_priority":
+                return ["thigh", "calf"]
+
+            return ["torso", "thigh", "calf"]
+
+        def get_bone_weight(key):
+            if nlf_scale_basis == "upper_body_priority":
+                weights = {
+                    "head": 0.65,
+                    "torso": 1.50,
+                    "thigh": 0.50,
+                    "calf": 0.50,
+                    "shoulder_width": 0.40,
+                    "hip_width": 0.30
+                }
+            elif nlf_scale_basis == "legs_priority":
+                weights = {
+                    "head": 0.25,
+                    "torso": 0.80,
+                    "thigh": 1.35,
+                    "calf": 1.35,
+                    "shoulder_width": 0.25,
+                    "hip_width": 0.40
+                }
+            elif nlf_scale_basis == "full_body":
+                weights = {
+                    "head": 0.55,
+                    "torso": 1.20,
+                    "thigh": 1.00,
+                    "calf": 1.00,
+                    "shoulder_width": 0.35,
+                    "hip_width": 0.35
+                }
+            else:
+                weights = {
+                    "head": 0.35,
+                    "torso": 1.25,
+                    "thigh": 1.00,
+                    "calf": 1.00,
+                    "shoulder_width": 0.25,
+                    "hip_width": 0.25
+                }
+
+            return float(weights.get(key, 1.0))
+
+        def weighted_median(values, weights):
+            if not values:
+                return 1.0
+
+            pairs = sorted(zip(values, weights), key=lambda x: x[0])
+            total_weight = sum(w for _, w in pairs)
+
+            if total_weight <= 1e-8:
+                return float(np.median(values))
+
+            acc = 0.0
+            half = total_weight * 0.5
+
+            for value, weight in pairs:
+                acc += weight
+                if acc >= half:
+                    return float(value)
+
+            return float(pairs[-1][0])
+
+        def trimmed_mean(values, trim_fraction=0.20):
+            if not values:
+                return 1.0
+
+            vals = sorted([float(v) for v in values])
+            if len(vals) <= 2:
+                return float(np.mean(vals))
+
+            trim_count = int(len(vals) * trim_fraction)
+
+            if trim_count <= 0:
+                return float(np.mean(vals))
+
+            trimmed = vals[trim_count:-trim_count]
+            if not trimmed:
+                trimmed = vals
+
+            return float(np.mean(trimmed))
+
+        def compute_frame_robust_nlf_ratio(frame_idx, max_body_length):
+            visible_parts_keys, frame_ist_px = get_visible_parts_for_frame(frame_idx)
+            source_bones = get_smoothed_nlf_3d_bones(raw_poses, frame_idx, nlf_smoothing_window)
+
+            if not source_bones:
+                return None
+
+            basis_keys = get_robust_basis_keys(visible_parts_keys)
+
+            ratios = {}
+            ratio_values = []
+            ratio_weights = []
+            used_keys = []
+            rejected_keys = []
+
+            for key in basis_keys:
+                source_value = float(source_bones.get(key, 0.0))
+                target_value = get_calib_target_value(key)
+
+                if source_value <= 1e-5 or target_value <= 1e-5:
+                    rejected_keys.append(f"{key}:missing")
+                    continue
+
+                ratio = target_value / source_value
+
+                if ratio <= 0.05 or ratio >= 10.0:
+                    rejected_keys.append(f"{key}:hard_outlier_{ratio:.3f}")
+                    continue
+
+                ratios[key] = float(ratio)
+                ratio_values.append(float(ratio))
+                ratio_weights.append(get_bone_weight(key))
+                used_keys.append(key)
+
+            if len(ratio_values) < nlf_min_bone_count:
+                return None
+
+            frame_ratio = weighted_median(ratio_values, ratio_weights)
+
+            ratio_mean = float(np.mean(ratio_values)) if ratio_values else frame_ratio
+            ratio_std = float(np.std(ratio_values)) if len(ratio_values) > 1 else 0.0
+            ratio_consistency = 1.0 / (1.0 + (ratio_std / max(abs(ratio_mean), 1e-5)))
+
+            radar = all_frames_data[frame_idx] if frame_idx < len(all_frames_data) else {
+                "has_feet": False,
+                "has_ankles": False,
+                "has_knees": False,
+                "is_frontal": False,
+                "length": 0.0,
+                "frontal_pts": 0.0
+            }
+
+            length_score = float(np.clip(radar.get("length", 0.0) / max(max_body_length, 1e-5), 0.0, 1.0))
+            frontal_score = 1.0 if radar.get("is_frontal", False) else 0.0
+            feet_score = 1.0 if (radar.get("has_feet", False) or radar.get("has_ankles", False)) else (0.50 if radar.get("has_knees", False) else 0.0)
+            bone_count_score = float(np.clip(len(ratio_values) / max(len(basis_keys), 1), 0.0, 1.0))
+
+            score = (
+                length_score * 0.25
+                + frontal_score * 0.25
+                + feet_score * 0.20
+                + bone_count_score * 0.15
+                + ratio_consistency * 0.15
+            )
+
+            if "torso" in used_keys:
+                score += 0.05
+
+            if ("thigh" in used_keys or "calf" in used_keys) and (radar.get("has_feet", False) or radar.get("has_ankles", False) or radar.get("has_knees", False)):
+                score += 0.05
+
+            score = float(np.clip(score, 0.0, 1.0))
+
+            return {
+                "frame": int(frame_idx),
+                "ratio": float(frame_ratio),
+                "score": score,
+                "visible_parts": visible_parts_keys,
+                "used_keys": used_keys,
+                "rejected_keys": rejected_keys,
+                "ratios": ratios,
+                "ratio_std": ratio_std,
+                "ratio_consistency": ratio_consistency,
+                "length_score": length_score,
+                "frontal_score": frontal_score,
+                "feet_score": feet_score,
+                "bone_count_score": bone_count_score,
+                "frame_ist_px": frame_ist_px
+            }
+
+        def aggregate_robust_records(records):
+            if not records:
+                return 1.0, [], [], 0.0
+
+            sorted_records = sorted(records, key=lambda r: r["score"], reverse=True)
+
+            pre_count = min(len(sorted_records), max(nlf_top_frame_count * 3, nlf_top_frame_count))
+            preselected = sorted_records[:pre_count]
+
+            base_median = float(np.median([r["ratio"] for r in preselected]))
+
+            accepted = []
+            rejected = []
+
+            for record in preselected:
+                rel_err = abs(record["ratio"] - base_median) / max(abs(base_median), 1e-5)
+
+                if rel_err <= nlf_outlier_threshold:
+                    accepted.append(record)
+                else:
+                    record_copy = dict(record)
+                    record_copy["reject_reason"] = f"ratio_outlier_{rel_err * 100.0:.2f}%"
+                    rejected.append(record_copy)
+
+            if not accepted:
+                accepted = preselected[:max(1, nlf_top_frame_count)]
+                rejected = []
+
+            accepted = sorted(accepted, key=lambda r: r["score"], reverse=True)[:nlf_top_frame_count]
+
+            ratios = [float(r["ratio"]) for r in accepted]
+            weights = [float(r["score"]) for r in accepted]
+
+            if nlf_ratio_aggregation == "weighted_mean":
+                weight_sum = sum(weights)
+                if weight_sum > 1e-8:
+                    final = float(sum(r * w for r, w in zip(ratios, weights)) / weight_sum)
+                else:
+                    final = float(np.mean(ratios))
+            elif nlf_ratio_aggregation == "trimmed_mean":
+                final = trimmed_mean(ratios, trim_fraction=0.20)
+            else:
+                final = float(np.median(ratios))
+
+            avg_score = float(np.mean(weights)) if weights else 0.0
+            ratio_std = float(np.std(ratios)) if len(ratios) > 1 else 0.0
+            ratio_mean = float(np.mean(ratios)) if ratios else final
+            consistency = 1.0 / (1.0 + (ratio_std / max(abs(ratio_mean), 1e-5)))
+            count_factor = float(np.clip(len(accepted) / max(nlf_top_frame_count, 1), 0.0, 1.0))
+            confidence = float(np.clip((avg_score * 0.55) + (consistency * 0.30) + (count_factor * 0.15), 0.0, 1.0))
+
+            return final, accepted, rejected, confidence
+
+        # --- RADAR ---
+        all_frames_data = []
+        frontal_indices = []
+
+        if best_frame_source == "NLF (3D SMPL)":
+            for i in range(len(pose_metas)):
+                pts = extract_nlf_points(raw_poses, i)
+
+                if pts is None:
+                    all_frames_data.append({
+                        "has_feet": False,
+                        "has_ankles": False,
+                        "has_knees": False,
+                        "is_frontal": False,
+                        "length": 0.0,
+                        "frontal_pts": 0.0
+                    })
+                    continue
+
+                def is_val_nlf(idx):
+                    return idx < len(pts) and np.linalg.norm(pts[idx]) > 1e-5
+
+                has_knees = is_val_nlf(4) or is_val_nlf(5)
+                has_ankles = is_val_nlf(7) or is_val_nlf(8)
+                has_feet = has_ankles
+
+                valid_y = [pts[idx][1] for idx in range(len(pts)) if is_val_nlf(idx)]
+                length = (max(valid_y) - min(valid_y)) if valid_y else 0.0
+
+                is_frontal = False
+                frontal_pts = 0.0
+                max_angle = 90.0
+
+                if len(pts) >= 18 and is_val_nlf(1) and is_val_nlf(2) and is_val_nlf(16) and is_val_nlf(17):
+                    dx_h = pts[2][0] - pts[1][0]
+                    dz_h = pts[2][2] - pts[1][2]
+                    dx_s = pts[17][0] - pts[16][0]
+                    dz_s = pts[17][2] - pts[16][2]
+
+                    angle_h = math.degrees(math.atan2(abs(dz_h), abs(dx_h)))
+                    angle_s = math.degrees(math.atan2(abs(dz_s), abs(dx_s)))
+                    max_angle = max(angle_h, angle_s)
+
+                    if max_angle <= frontal_3d_angle_tolerance:
+                        is_frontal = True
+                        frontal_pts = max(0.0, (frontal_3d_angle_tolerance - max_angle) * 10.0)
+
+                all_frames_data.append({
+                    "has_feet": has_feet,
+                    "has_ankles": has_ankles,
+                    "has_knees": has_knees,
+                    "is_frontal": is_frontal,
+                    "length": length,
+                    "frontal_pts": frontal_pts
+                })
+
+                if is_frontal:
+                    frontal_indices.append(i)
+
+        else:
+            pose_input_3d = raw_poses
+
+            for i, meta in enumerate(pose_metas):
+                kps = getattr(meta, "kps_body", [])
+                confs = getattr(meta, "kps_body_p", None)
+
+                valid_y = [kps[idx][1] for idx in range(len(kps)) if is_val(kps, confs, idx)]
+
+                if not valid_y:
+                    all_frames_data.append({
+                        "has_feet": False,
+                        "has_ankles": False,
+                        "has_knees": False,
+                        "is_frontal": False,
+                        "length": 0.0,
+                        "frontal_pts": 0.0
+                    })
+                    continue
+
+                has_ankles = is_val(kps, confs, 10) or is_val(kps, confs, 13)
+                has_knees = is_val(kps, confs, 9) or is_val(kps, confs, 12)
+                has_feet = any(is_val(kps, confs, x) for x in [18, 19, 20, 21, 22, 23, 24])
+
+                top_y = min(valid_y)
+                bottom_y = max(valid_y)
+
+                if not include_head and is_val(kps, confs, 1):
+                    top_y = kps[1][1]
+
+                length = (bottom_y - top_y) if top_y is not None and bottom_y is not None else 0.0
+
+                is_frontal = False
+                frontal_pts = 0.0
+
+                if frontal_method == "3D_NLF" and pose_input_3d is not None and i < len(pose_input_3d):
+                    pts_3d = extract_nlf_points(pose_input_3d, i)
+
+                    if pts_3d is not None and len(pts_3d) > 0:
+                        num_joints = len(pts_3d)
+                        idx_r, idx_l = 2, 5
+
+                        if num_joints == 17:
+                            idx_r, idx_l = 11, 14
+                        elif num_joints in [24, 45, 68]:
+                            idx_r, idx_l = 16, 17
+
+                        if num_joints > max(idx_r, idx_l):
+                            dx = float(pts_3d[idx_r][0]) - float(pts_3d[idx_l][0])
+                            dz = float(pts_3d[idx_r][2]) - float(pts_3d[idx_l][2])
+                            angle = math.degrees(math.atan2(abs(dz), abs(dx)))
+
+                            if angle <= frontal_3d_angle_tolerance:
+                                is_frontal = True
+                                frontal_pts = max(0.0, (frontal_3d_angle_tolerance - angle) * 10.0)
+
+                elif frontal_method == "2D_Ratio":
+                    try:
+                        if is_val(kps, confs, 2) and is_val(kps, confs, 5) and is_val(kps, confs, 8) and is_val(kps, confs, 11):
+                            shoulder_w = abs(kps[2][0] - kps[5][0])
+                            hip_w = abs(kps[8][0] - kps[11][0])
+                            if shoulder_w > 1e-5:
+                                ratio_2d = hip_w / shoulder_w
+                                if ratio_2d >= frontal_2d_threshold:
+                                    is_frontal = True
+                                    frontal_pts = max(0.0, ratio_2d * 100.0)
+                    except Exception:
+                        pass
+
+                all_frames_data.append({
+                    "has_feet": has_feet,
+                    "has_ankles": has_ankles,
+                    "has_knees": has_knees,
+                    "is_frontal": is_frontal,
+                    "length": length,
+                    "frontal_pts": frontal_pts
+                })
+
+                if is_frontal:
+                    frontal_indices.append(i)
+
+        candidates = frontal_indices if len(frontal_indices) > 0 else list(range(len(pose_metas)))
+        max_body_length = max([all_frames_data[idx]["length"] for idx in candidates]) if candidates else 1.0
+
+        if max_body_length == 0:
+            max_body_length = 1.0
+
+        best_idx = candidates[0]
+        best_score = -1.0
+
+        for idx in candidates:
+            data = all_frames_data[idx]
+
+            bein_pts = max(
+                1000.0 if (data["has_feet"] or data["has_ankles"]) else 0.0,
+                500.0 if not (data["has_feet"] or data["has_ankles"]) and data["has_knees"] else 0.0
+            )
+
+            total_score = (
+                bein_pts
+                + (500.0 if data["has_feet"] and data["is_frontal"] else 0.0)
+                + data["frontal_pts"]
+                + ((data["length"] / max_body_length) * 100.0)
+            )
+
+            if total_score > best_score:
+                best_score = total_score
+                best_idx = idx
+
+        log_messages.append(f"\n-> Gewinner Frame (Anchor): {best_idx}")
+
+        start_idx = max(0, best_idx - anchor_window)
+        end_idx = min(len(pose_metas) - 1, best_idx + anchor_window)
+
+        sum_scale_factors = 0.0
+        valid_frames = 0
+        final_scale = 1.0
+
+        robust_used_records = []
+        robust_rejected_records = []
+        robust_confidence = 0.0
+
+        # --- MODUS 4: ROBUST NLF 3D RATIO ---
+        if mode_id == "4":
+            log_messages.append("\n--- ROBUST NLF 3D RATIO ENGINE ---")
+            log_messages.append(
+                f"TopFrames={nlf_top_frame_count} | Aggregation={nlf_ratio_aggregation} | "
+                f"OutlierThreshold={nlf_outlier_threshold * 100.0:.1f}% | MinBones={nlf_min_bone_count} | Basis={nlf_scale_basis}"
+            )
+
+            robust_records = []
+
+            for i in range(len(pose_metas)):
+                record = compute_frame_robust_nlf_ratio(i, max_body_length)
+                if record is not None:
+                    robust_records.append(record)
+
+            if not robust_records:
+                return (
+                    pose_data_copy,
+                    "Fehler: Robust NLF 3D Ratio konnte keine validen Frame-Ratios berechnen.",
+                    video_nlf_data,
+                    "{}"
+                )
+
+            final_scale, robust_used_records, robust_rejected_records, robust_confidence = aggregate_robust_records(robust_records)
+            valid_frames = len(robust_used_records)
+
+            log_messages.append(f"Valide Robust-Frame-Kandidaten: {len(robust_records)}")
+            log_messages.append(f"Verwendete Top-Frames nach Outlier-Filter: {len(robust_used_records)}")
+            log_messages.append(f"Verworfene Outlier im Preselect: {len(robust_rejected_records)}")
+            log_messages.append(f"Robust Final Scale: {final_scale:.6f}x | Confidence: {robust_confidence:.3f}")
+
+            log_messages.append("\nTop verwendete Robust-NLF-Frames:")
+            for rec in robust_used_records[:30]:
+                ratio_text = ", ".join([f"{k}:{v:.3f}" for k, v in rec["ratios"].items()])
+                log_messages.append(
+                    f"  Frame {str(rec['frame']).rjust(4)} | Scale {rec['ratio']:.6f}x | Score {rec['score']:.3f} | "
+                    f"Bones={rec['used_keys']} | Visible={rec['visible_parts']} | Ratios[{ratio_text}] | "
+                    f"Std={rec['ratio_std']:.4f} | Consistency={rec['ratio_consistency']:.3f}"
+                )
+
+            if len(robust_used_records) > 30:
+                log_messages.append(f"  ... weitere {len(robust_used_records) - 30} verwendete Frames ausgelassen.")
+
+            if robust_rejected_records:
+                log_messages.append("\nVerworfene Robust-NLF-Outlier:")
+                for rec in robust_rejected_records[:20]:
+                    ratio_text = ", ".join([f"{k}:{v:.3f}" for k, v in rec["ratios"].items()])
+                    log_messages.append(
+                        f"  Frame {str(rec['frame']).rjust(4)} | Scale {rec['ratio']:.6f}x | Score {rec['score']:.3f} | "
+                        f"Reason={rec.get('reject_reason', 'unknown')} | Ratios[{ratio_text}]"
+                    )
+
+                if len(robust_rejected_records) > 20:
+                    log_messages.append(f"  ... weitere {len(robust_rejected_records) - 20} verworfene Frames ausgelassen.")
+
+        # --- MODUS 1, 2, 3: LEGACY-BERECHNUNG ---
+        else:
+            for i in range(start_idx, end_idx + 1):
+                kps = getattr(pose_metas[i], "kps_body", [])
+                confs = getattr(pose_metas[i], "kps_body_p", None)
+
+                visible_parts_keys, frame_ist_px = get_visible_parts_for_frame(i)
+
+                if frame_ist_px == 0 or not visible_parts_keys:
+                    continue
+
+                scale_factor = 1.0
+
+                if mode_id == "3":
+                    soll_3d_sum = sum(calib_nlf_3d.get(k, 0) for k in visible_parts_keys)
+
+                    if soll_3d_sum <= 0:
+                        continue
+
+                    ist_3d_window_vals = []
+
+                    for w in range(max(0, i - nlf_smoothing_window), min(len(pose_metas), i + nlf_smoothing_window + 1)):
+                        w_bones = get_nlf_3d_bones_for_frame(raw_poses, w)
+                        if w_bones:
+                            w_sum = sum(w_bones.get(k, 0) for k in visible_parts_keys)
+                            if w_sum > 0:
+                                ist_3d_window_vals.append(w_sum)
+
+                    if ist_3d_window_vals:
+                        smoothed_ist_3d = float(np.mean(ist_3d_window_vals))
+                    else:
+                        current_bones = get_nlf_3d_bones_for_frame(raw_poses, i)
+                        smoothed_ist_3d = sum(current_bones.get(k, 0) for k in visible_parts_keys)
+
+                    if smoothed_ist_3d <= 0.01:
+                        smoothed_ist_3d = 0.01
+
+                    scale_factor = soll_3d_sum / smoothed_ist_3d
+
+                    log_messages.append(f"\n  Frame {i} | 3D-Compare LEGACY: Sichtbar={visible_parts_keys}")
+                    log_messages.append(f"    Soll-3D: {soll_3d_sum:.4f} | Smoothed-Ist-3D: {smoothed_ist_3d:.4f}")
+                    log_messages.append(f"    Lokaler Faktor: {scale_factor:.3f}x")
+
+                else:
+                    frame_soll_m = sum(bone_m.get(k, 0) for k in visible_parts_keys)
+
+                    if frame_soll_m == 0:
+                        continue
+
+                    if valid_depth_frames is not None:
+                        depth_v_idx, borrowed_from = get_nearest_depth_idx(i, valid_depth_frames)
+                    else:
+                        depth_v_idx = min(i, (depth_np.shape[0] - 1) if depth_np is not None else 0)
+
+                    if mode_id == "2" and raw_poses is not None and i < len(raw_poses) and raw_poses[i] is not None:
+                        pts = extract_nlf_points(raw_poses, i)
+                        if pts is not None:
+                            frame_depth = get_nlf_2d_depth(pts, depth_np, depth_v_idx, W, H)
+                        else:
+                            frame_depth = get_skeleton_depth(kps, confs, depth_np, depth_v_idx, W, H)
+
+                        log_messages.append(f"\n  Frame {i} | Depth Map via NLF 2D Overlay")
+                    else:
+                        frame_depth = get_skeleton_depth(kps, confs, depth_np, depth_v_idx, W, H)
+                        log_messages.append(f"\n  Frame {i} | Depth Map via PoseData 2D Maske")
+
+                    if is_inverted:
+                        frame_depth = 1.0 / max(frame_depth, 0.0001)
+
+                    expected_px = (frame_soll_m * fx_video) / frame_depth
+                    scale_factor = expected_px / frame_ist_px
+
+                    log_messages.append(f"    Ist-Px: {frame_ist_px:.1f} | Ist-Meter: {frame_soll_m:.3f}m | Tiefe: {frame_depth:.3f}m")
+                    log_messages.append(f"    Soll-Px: {expected_px:.1f} | Lokaler Faktor: {scale_factor:.3f}x")
+
+                sum_scale_factors += scale_factor
+                valid_frames += 1
+
+            if valid_frames == 0:
+                return (pose_data_copy, "Fehler: Keine validen Körperteile gefunden.", video_nlf_data, "{}")
+
+            final_scale = sum_scale_factors / valid_frames
+
+        log_messages.append(f"\n=== FINALES ERGEBNIS ===")
+        log_messages.append(f"Finaler Skalierungsfaktor ({valid_frames} Frames): {final_scale:.6f}x")
+
+        global_pivot_x = 0.5
+        global_pivot_y = 0.5
+
+        kps_b = getattr(pose_metas[best_idx], "kps_body", [])
+        c_b = getattr(pose_metas[best_idx], "kps_body_p", None)
+
+        val_y = [kps_b[idx][1] for idx in range(len(kps_b)) if is_val(kps_b, c_b, idx)]
+        val_x = [kps_b[idx][0] for idx in range(len(kps_b)) if is_val(kps_b, c_b, idx)]
+
+        if val_y and val_x:
+            global_pivot_x = float(np.mean(val_x))
+            global_pivot_y = float(max(val_y))
+
+        scale_x = final_scale if scale_2d_axes == "X and Y (Uniform)" else 1.0
+
+        for meta in pose_metas:
+            for attr in ["kps_body", "kps_lhand", "kps_rhand", "kps_face"]:
+                arr = getattr(meta, attr, None)
+
+                if arr is not None and len(arr) > 0:
+                    for j in range(len(arr)):
+                        if len(arr[j]) >= 2 and arr[j][1] > 0:
+                            arr[j][0] = global_pivot_x + (arr[j][0] - global_pivot_x) * scale_x
+                            arr[j][1] = global_pivot_y + (arr[j][1] - global_pivot_y) * final_scale
+
+        config_dict = {
+            "anchor_scale": float(final_scale),
+            "scale_x_factor": float(scale_x),
+            "pivot_x": float(global_pivot_x),
+            "pivot_y": float(global_pivot_y)
+        }
+
+        if mode_id == "4":
+            config_dict["nlf_scale_mode"] = "robust_nlf_3d_ratio"
+            config_dict["nlf_anchor_frame"] = int(best_idx)
+            config_dict["nlf_used_frames"] = [int(r["frame"]) for r in robust_used_records]
+            config_dict["nlf_rejected_frames"] = [int(r["frame"]) for r in robust_rejected_records]
+            config_dict["nlf_scale_confidence"] = float(robust_confidence)
+            config_dict["nlf_final_aggregation"] = str(nlf_ratio_aggregation)
+            config_dict["nlf_scale_basis"] = str(nlf_scale_basis)
+            config_dict["nlf_top_frame_count"] = int(nlf_top_frame_count)
+            config_dict["nlf_outlier_threshold"] = float(nlf_outlier_threshold)
+        elif mode_id == "3":
+            config_dict["nlf_scale_mode"] = "pure_nlf_3d_compare_legacy"
+            config_dict["nlf_anchor_frame"] = int(best_idx)
+        else:
+            config_dict["nlf_scale_mode"] = "depth_pinhole"
+            config_dict["nlf_anchor_frame"] = int(best_idx)
+
+        config_str = json.dumps(config_dict)
+
+        return (pose_data_copy, "\n".join(log_messages), video_nlf_data, config_str)
+
+
+
 NODE_CLASS_MAPPINGS = {
     "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "WanFaceStitcherV3": WanFaceStitcherV3,
@@ -29440,6 +30431,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFProportionalRetargeterV181": NLFProportionalRetargeterV181,
     "NLFProportionalRetargeterV19": NLFProportionalRetargeterV19,
     "NLFProportionalRetargeterV20": NLFProportionalRetargeterV20,
+    "PoseGlobalPerspectiveScalerV57": PoseGlobalPerspectiveScalerV57,
     
 }
 
@@ -29566,6 +30558,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFProportionalRetargeterV181": "NLF Proportional Retargeter V18.1",
     "NLFProportionalRetargeterV19": "NLF Proportional Retargeter V19",
     "NLFProportionalRetargeterV20": "NLF Proportional Retargeter V20",
+    "PoseGlobalPerspectiveScalerV57": "Pose Global Perspective Scaler V57",
 
     
     
