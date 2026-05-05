@@ -238,8 +238,8 @@ class RenderNLFPosesWithData:
     def process(self, nlf_poses, width, height, dw_poses=None, ref_dw_pose=None, draw_face=True, draw_hand=True, draw_body=True, render_device="gpu", scale_hands=True, render_backend="taichi"):
         
         # Imports aus dem NLF-Ordner
-        from .NLFPoseExtract.nlf_render import render_nlf_as_images, render_multi_nlf_as_images, shift_dwpose_according_to_nlf, process_data_to_COCO_format, intrinsic_matrix_from_field_of_view
-        from .NLFPoseExtract.align3d import solve_new_camera_params_central, solve_new_camera_params_down
+        from ...NLFPoseExtract.nlf_render import render_nlf_as_images, render_multi_nlf_as_images, shift_dwpose_according_to_nlf, process_data_to_COCO_format, intrinsic_matrix_from_field_of_view
+        from ...NLFPoseExtract.align3d import solve_new_camera_params_central, solve_new_camera_params_down
         
         if render_backend == "taichi":
             try:
@@ -351,7 +351,7 @@ class NLFDataToPoseData:
     DESCRIPTION = "Wandelt 3D NLF Daten zurück in reguläre 2D Pose Data um. (Mappt Indizes)"
 
     def process(self, nlf_poses, width, height):
-        from .pose_utils.human_visualization import AAPoseMeta
+        from ...pose_utils.human_visualization import AAPoseMeta
         
         pose_input = nlf_poses['joints3d_nonparam'][0] if isinstance(nlf_poses, dict) and 'joints3d_nonparam' in nlf_poses else nlf_poses
         
@@ -433,7 +433,7 @@ class RenderNLFPosesDirect:
     DESCRIPTION = "Rendert manuell skalierte NLF-Daten DIREKT, ohne das Modell die Koordinaten überschreiben zu lassen."
 
     def process(self, nlf_poses_scaled, width, height, render_backend="taichi", dw_poses_fallback=None):
-        from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
+        from ...NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
         
         if render_backend == "taichi":
             try:
@@ -490,7 +490,7 @@ class RenderNLFPosesDirect7:
         import torch
         import numpy as np
         import traceback
-        from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
+        from ...NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
         
         log_messages = ["=== RENDER NLF POSES DIRECT V6 LOG ==="]
         
@@ -650,8 +650,8 @@ class RenderNLFPosesDirectPoseDataMimic13:
         import numpy as np
         import traceback
         import cv2
-        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
-        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+        from ...NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
+        from ...pose_draw.draw_pose_utils import draw_pose_to_canvas_np
 
         log_messages = ["=== RENDER NLF POSES POSEDATA MIMIC 13 LOG ==="]
         scaled_nlf_poses = copy.deepcopy(nlf_poses)
@@ -1034,8 +1034,8 @@ class RenderNLFPosesDirectPoseDataMimic14:
         import numpy as np
         import traceback
         import cv2
-        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
-        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+        from ...NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
+        from ...pose_draw.draw_pose_utils import draw_pose_to_canvas_np
 
         log_messages = ["=== RENDER NLF POSES MIMIC 14 (POSEDATA) LOG ==="]
         scaled_nlf_poses = copy.deepcopy(nlf_poses)
@@ -1374,7 +1374,7 @@ class NLFDataToMaskV2:
         import numpy as np
         import torch
         import cv2
-        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
+        from ...NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
 
         pose_input = scaled_nlf_poses['joints3d_nonparam'][0] if isinstance(scaled_nlf_poses, dict) else scaled_nlf_poses
         intrinsic_matrix = intrinsic_matrix_from_field_of_view([height, width])
@@ -1502,8 +1502,8 @@ class RenderNLFPosesDirectPoseDataMimic15:
         import numpy as np
         import traceback
         import cv2
-        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
-        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+        from ...NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
+        from ...pose_draw.draw_pose_utils import draw_pose_to_canvas_np
 
         log_messages = ["=== RENDER NLF POSES MIMIC 14 (POSEDATA) LOG ==="]
         scaled_nlf_poses = copy.deepcopy(nlf_poses)
@@ -1816,7 +1816,7 @@ class NLFDataToMaskV3:
         import cv2
         import math
         import copy
-        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+        from ...pose_draw.draw_pose_utils import draw_pose_to_canvas_np
 
         if not nlf_data_for_mask:
             return (torch.zeros((1, 512, 512)),)
@@ -2079,7 +2079,7 @@ class NLFDataToMaskV4:
         import cv2
         import math
         import copy
-        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+        from ...pose_draw.draw_pose_utils import draw_pose_to_canvas_np
 
         if not nlf_data_for_mask:
             return (torch.zeros((1, 512, 512)),)
@@ -2353,8 +2353,8 @@ class RenderNLFPosesDirectPoseDataMimic16:
         import numpy as np
         import traceback
         import cv2
-        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
-        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+        from ...NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
+        from ...pose_draw.draw_pose_utils import draw_pose_to_canvas_np
 
         log_messages = ["=== RENDER NLF POSES MIMIC 15 LOG ==="]
         scaled_nlf_poses = copy.deepcopy(nlf_poses)
@@ -2761,7 +2761,7 @@ class NLFDataToMaskV5:
         import cv2
         import math
         import copy
-        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+        from ...pose_draw.draw_pose_utils import draw_pose_to_canvas_np
 
         if not nlf_data_for_mask:
             return (torch.zeros((1, 512, 512)),)
@@ -3046,8 +3046,8 @@ class RenderNLFPosesDirectPoseDataMimic17:
         import numpy as np
         import traceback
         import cv2
-        from .NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
-        from .pose_draw.draw_pose_utils import draw_pose_to_canvas_np
+        from ...NLFPoseExtract.nlf_render_flat import intrinsic_matrix_from_field_of_view, process_data_to_COCO_format, p3d_single_p2d
+        from ...pose_draw.draw_pose_utils import draw_pose_to_canvas_np
 
         log_messages = ["=== RENDER NLF POSES MIMIC 17 LOG ==="]
         scaled_nlf_poses = copy.deepcopy(nlf_poses)
@@ -3468,8 +3468,8 @@ class RenderNLFPosesDirectHybrid8:
         import torch
         import numpy as np
         import traceback
-        from .NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
-        from .NLFPoseExtract.nlf_render_flat import process_data_to_COCO_format, p3d_single_p2d
+        from ...NLFPoseExtract.nlf_render import render_multi_nlf_as_images, render_nlf_as_images, intrinsic_matrix_from_field_of_view
+        from ...NLFPoseExtract.nlf_render_flat import process_data_to_COCO_format, p3d_single_p2d
 
         log_messages = ["=== RENDER NLF POSES DIRECT HYBRID 8 LOG ==="]
         

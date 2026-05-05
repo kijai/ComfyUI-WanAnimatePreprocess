@@ -5281,8 +5281,8 @@ class DrawViTPose_v3:
         import cv2
         import numpy as np
         import torch
-        from .pose_utils.human_visualization import draw_handpose_new
-        from .utils import resize_to_bounds, padding_resize
+        from ...pose_utils.human_visualization import draw_handpose_new
+        from ...utils import resize_to_bounds, padding_resize
         import math
 
         retarget_image = pose_data.get("retarget_image", None)
@@ -5736,7 +5736,7 @@ class LoadPoseDataFromJsonNode:
         import os
         import numpy as np
         import folder_paths
-        from .pose_utils.pose2d_utils import AAPoseMeta
+        from ...pose_utils.pose2d_utils import AAPoseMeta
 
         input_dir = folder_paths.get_input_directory()
         file_path = os.path.join(input_dir, json_file)
@@ -5824,8 +5824,8 @@ class PoseAndFaceDetectionV8_NoWarp:
         import json
         from tqdm import tqdm
         from comfy.utils import ProgressBar
-        from .utils import resize_by_area, bbox_from_detector, crop
-        from .retarget_pose import load_pose_metas_from_kp2ds_seq, get_face_bboxes, get_retarget_pose, AAPoseMeta
+        from ...utils import resize_by_area, bbox_from_detector, crop
+        from ...retarget_pose import load_pose_metas_from_kp2ds_seq, get_face_bboxes, get_retarget_pose, AAPoseMeta
 
         detector = model["yolo"]
         pose_model = model["vitpose"]
