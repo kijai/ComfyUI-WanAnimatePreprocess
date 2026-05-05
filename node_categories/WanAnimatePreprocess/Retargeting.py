@@ -6079,3 +6079,1392 @@ class NLFProportionalRetargeterV20:
         clean_config_str = json.dumps(config_dict)
 
         return (nlf_data_retargeted, "\n".join(log_messages), clean_config_str)
+
+
+class NLFProportionalRetargeterV22:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_nlf_data": ("NLFPRED", {"tooltip": "Die originalen 3D NLF Daten"}),
+                "calibration_data": ("POSE_CALIBRATION", {"tooltip": "Die Referenz-Daten aus V20/V22"}),
+                "bypass": ("BOOLEAN", {"default": False, "tooltip": "Ignoriert die Node komplett und gibt Originaldaten zurück."}),
+
+                "scale_torso": ("BOOLEAN", {"default": True, "tooltip": "Skaliert den Torso"}),
+                "scale_shoulders": ("BOOLEAN", {"default": True, "tooltip": "Skaliert die Schultern"}),
+                "scale_hips": ("BOOLEAN", {"default": True, "tooltip": "Skaliert die Hüften"}),
+                "scale_arms": ("BOOLEAN", {"default": True, "tooltip": "Skaliert die Arme"}),
+                "scale_legs": ("BOOLEAN", {"default": True, "tooltip": "Skaliert die Beine"}),
+
+                "frontal_3d_angle_tolerance": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 90.0, "step": 1.0, "tooltip": "Toleranz für die Frontal-Suche"}),
+                "scale_stance_and_head": ("BOOLEAN", {"default": False, "tooltip": "Wendet den Höhen-Korrekturfaktor auch auf Schulter-/Hüftbreite und den Kopf an."}),
+                "temporal_smooth_factor": ("FLOAT", {"default": 0.33, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Glättet die Gelenke gegen Zittern."}),
+                "ground_smooth_factor": ("FLOAT", {"default": 0.70, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Glättet NUR die Auf/Ab-Bewegung des Ground Anchors."}),
+
+                "leg_height_guard": ("BOOLEAN", {"default": True, "tooltip": "V18.1 Safety: verhindert, dass Leg Scaling die Gesamthöhe/Schulterhöhe in einzelnen Frames sprengt."}),
+                "leg_height_guard_tolerance": ("FLOAT", {"default": 0.025, "min": 0.0, "max": 0.25, "step": 0.005, "tooltip": "Relative Toleranz. 0.025 = 2.5 Prozent Abweichung zur No-Legs-Baseline erlaubt."}),
+                "leg_height_guard_min_factor": ("FLOAT", {"default": 0.70, "min": 0.30, "max": 1.00, "step": 0.01, "tooltip": "Minimaler lokaler Bein-Kompressionsfaktor bei problematischen Frames."}),
+                "leg_height_guard_max_factor": ("FLOAT", {"default": 1.00, "min": 1.00, "max": 1.50, "step": 0.01, "tooltip": "Maximaler lokaler Bein-Faktor. Default 1.0 bedeutet: Guard darf nur komprimieren, nicht verlängern."}),
+                "leg_height_guard_smooth": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 0.95, "step": 0.01, "tooltip": "Glättet den lokalen Bein-Guard-Faktor."}),
+
+                "ground_anchor_mode": (["v18_legacy", "conservative", "advanced_trend"], {"default": "conservative", "tooltip": "V19 Ground-Modus: v18_legacy = altes Verhalten, conservative = Clamp + Body Guard, advanced_trend = Lookahead/Trend-Analyse."}),
+                "ground_shift_percentile": ("FLOAT", {"default": 80.0, "min": 50.0, "max": 100.0, "step": 1.0, "tooltip": "Robuster Fußanker statt hartem max()."}),
+                "ground_shift_max_step": ("FLOAT", {"default": 14.0, "min": 0.0, "max": 100.0, "step": 1.0, "tooltip": "Maximal erlaubte Änderung des Ground-Shifts pro Frame."}),
+                "body_anchor_guard": ("BOOLEAN", {"default": True, "tooltip": "Begrenzt den Ground-Shift, wenn Schulter/Hüfte dadurch zu stark hoch/runter gezogen werden."}),
+                "body_anchor_max_delta": ("FLOAT", {"default": 18.0, "min": 0.0, "max": 120.0, "step": 1.0, "tooltip": "Maximale erlaubte Body-Y-Abweichung durch Ground-Shift gegenüber Original/Trend."}),
+                "body_anchor_lookahead_radius": ("INT", {"default": 3, "min": 0, "max": 12, "step": 1, "tooltip": "Advanced: Frames davor/danach für Trend-Erkennung."}),
+                "body_anchor_trend_tolerance": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 80.0, "step": 1.0, "tooltip": "Advanced: zusätzliche Toleranz für echte Auf/Ab-Bewegung, z.B. Treppen."}),
+
+                "upper_body_anchor_mode": (["neck_shoulders", "shoulders_only", "neck_only"], {"default": "neck_shoulders", "tooltip": "Oberer Referenzpunkt für den Shoulder-Foot-Ratio-Guard."}),
+                "shoulder_foot_ratio_guard": ("BOOLEAN", {"default": True, "tooltip": "V22: Soft-Guard gegen zu langen Torso / zu kurze Beine. V19 bleibt Hauptlogik."}),
+                "shoulder_foot_ratio_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Wie stark die Hüfte Richtung Zielposition zwischen Schulter und Fuß gezogen wird."}),
+                "shoulder_foot_ratio_tolerance": ("FLOAT", {"default": 0.035, "min": 0.0, "max": 0.20, "step": 0.005, "tooltip": "Toleranz für Verhältnisfehler. 0.035 = 3.5 Prozentpunkte."}),
+                "shoulder_foot_max_pelvis_shift": ("FLOAT", {"default": 18.0, "min": 0.0, "max": 80.0, "step": 1.0, "tooltip": "Maximale weiche Hüftkorrektur pro Frame."}),
+                "shoulder_foot_pelvis_smooth": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 0.95, "step": 0.01, "tooltip": "Glättet die V22-Hüftkorrektur über Frames."}),
+                "shoulder_foot_only_fix_short_legs": ("BOOLEAN", {"default": True, "tooltip": "Wenn aktiv, greift V22 nur ein, wenn die Hüfte zu tief liegt und Beine dadurch zu kurz wirken."}),
+            },
+            "optional": {
+                "nlf_render_config": ("STRING", {"forceInput": True, "tooltip": "Die Camera Config aus dem Scaler wird bereinigt."}),
+            }
+        }
+
+    RETURN_TYPES = ("NLFPRED", "STRING", "STRING")
+    RETURN_NAMES = ("nlf_data_retargeted", "log_output", "nlf_render_config_clean")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess/Retargeting"
+    DESCRIPTION = "V22: V19-Core + Soft Shoulder-Foot-Ratio-Guard gegen zu langen Torso / zu kurze Beine."
+
+    def process(
+        self,
+        video_nlf_data,
+        calibration_data,
+        bypass,
+        scale_torso,
+        scale_shoulders,
+        scale_hips,
+        scale_arms,
+        scale_legs,
+        frontal_3d_angle_tolerance,
+        scale_stance_and_head,
+        temporal_smooth_factor,
+        ground_smooth_factor,
+        leg_height_guard,
+        leg_height_guard_tolerance,
+        leg_height_guard_min_factor,
+        leg_height_guard_max_factor,
+        leg_height_guard_smooth,
+        ground_anchor_mode,
+        ground_shift_percentile,
+        ground_shift_max_step,
+        body_anchor_guard,
+        body_anchor_max_delta,
+        body_anchor_lookahead_radius,
+        body_anchor_trend_tolerance,
+        upper_body_anchor_mode,
+        shoulder_foot_ratio_guard,
+        shoulder_foot_ratio_strength,
+        shoulder_foot_ratio_tolerance,
+        shoulder_foot_max_pelvis_shift,
+        shoulder_foot_pelvis_smooth,
+        shoulder_foot_only_fix_short_legs,
+        nlf_render_config="{}"
+    ):
+        import copy
+        import numpy as np
+        import math
+        import torch
+        import json
+
+        if bypass:
+            return (
+                video_nlf_data,
+                "=== NLF PROPORTIONAL RETARGETER V22 ===\nBYPASS AKTIVIERT: Keine Daten verändert.",
+                nlf_render_config if nlf_render_config else "{}"
+            )
+
+        log_messages = ["=== NLF PROPORTIONAL RETARGETER V22 (V19 CORE + SOFT SHOULDER-FOOT RATIO GUARD) ==="]
+
+        true_3d_bones = calibration_data.get("true_3d_bones", {})
+        if not true_3d_bones:
+            log_messages.append("FEHLER: Keine true_3d_bones in calibration_data gefunden.")
+            return (video_nlf_data, "\n".join(log_messages), "{}")
+
+        is_dict = isinstance(video_nlf_data, dict)
+        nlf_data_retargeted = copy.deepcopy(video_nlf_data)
+
+        if is_dict:
+            raw_poses = nlf_data_retargeted.get("joints3d_nonparam", [nlf_data_retargeted])[0]
+        else:
+            raw_poses = nlf_data_retargeted
+
+        is_normalized = math.isclose(true_3d_bones.get("torso", 0.0), 100.0, abs_tol=1e-3)
+        head_val = true_3d_bones.get("head", 0.0)
+
+        allowed_ground_modes = ["v18_legacy", "conservative", "advanced_trend"]
+        if ground_anchor_mode not in allowed_ground_modes:
+            ground_anchor_mode = "conservative"
+
+        allowed_upper_modes = ["neck_shoulders", "shoulders_only", "neck_only"]
+        if upper_body_anchor_mode not in allowed_upper_modes:
+            upper_body_anchor_mode = "neck_shoulders"
+
+        leg_height_guard_tolerance = max(0.0, float(leg_height_guard_tolerance))
+        leg_height_guard_min_factor = float(np.clip(leg_height_guard_min_factor, 0.30, 1.00))
+        leg_height_guard_max_factor = float(np.clip(leg_height_guard_max_factor, 1.00, 1.50))
+        leg_height_guard_smooth = float(np.clip(leg_height_guard_smooth, 0.0, 0.95))
+
+        ground_shift_percentile = float(np.clip(ground_shift_percentile, 50.0, 100.0))
+        ground_shift_max_step = max(0.0, float(ground_shift_max_step))
+        body_anchor_max_delta = max(0.0, float(body_anchor_max_delta))
+        body_anchor_lookahead_radius = int(max(0, min(12, body_anchor_lookahead_radius)))
+        body_anchor_trend_tolerance = max(0.0, float(body_anchor_trend_tolerance))
+
+        shoulder_foot_ratio_strength = float(np.clip(shoulder_foot_ratio_strength, 0.0, 1.0))
+        shoulder_foot_ratio_tolerance = max(0.0, float(shoulder_foot_ratio_tolerance))
+        shoulder_foot_max_pelvis_shift = max(0.0, float(shoulder_foot_max_pelvis_shift))
+        shoulder_foot_pelvis_smooth = float(np.clip(shoulder_foot_pelvis_smooth, 0.0, 0.95))
+
+        toggles = {
+            "scale_torso": scale_torso,
+            "scale_shoulders": scale_shoulders,
+            "scale_hips": scale_hips,
+            "scale_arms": scale_arms,
+            "scale_legs": scale_legs
+        }
+
+        log_messages.append(
+            f"Leg Height Guard: {'AKTIV' if leg_height_guard and scale_legs else 'INAKTIV'} | "
+            f"Tolerance: {leg_height_guard_tolerance * 100.0:.2f}% | "
+            f"Clamp: [{leg_height_guard_min_factor:.3f}, {leg_height_guard_max_factor:.3f}] | "
+            f"Smooth: {leg_height_guard_smooth:.2f}"
+        )
+        log_messages.append(
+            f"Ground Anchor Mode: {ground_anchor_mode} | "
+            f"GroundSmooth: {ground_smooth_factor:.2f} | "
+            f"FootPercentile: {ground_shift_percentile:.1f} | "
+            f"MaxStep: {ground_shift_max_step:.2f} | "
+            f"BodyGuard: {body_anchor_guard} | "
+            f"BodyMaxDelta: {body_anchor_max_delta:.2f} | "
+            f"LookaheadRadius: {body_anchor_lookahead_radius} | "
+            f"TrendTolerance: {body_anchor_trend_tolerance:.2f}"
+        )
+        log_messages.append(
+            f"Shoulder-Foot Ratio Guard: {'AKTIV' if shoulder_foot_ratio_guard and scale_legs else 'INAKTIV'} | "
+            f"UpperAnchor: {upper_body_anchor_mode} | "
+            f"Strength: {shoulder_foot_ratio_strength:.2f} | "
+            f"Tolerance: {shoulder_foot_ratio_tolerance * 100.0:.2f}pp | "
+            f"MaxPelvisShift: {shoulder_foot_max_pelvis_shift:.2f} | "
+            f"Smooth: {shoulder_foot_pelvis_smooth:.2f} | "
+            f"OnlyFixShortLegs: {shoulder_foot_only_fix_short_legs}"
+        )
+
+        # --- STUFE 1: ANCHOR-FRAME FINDEN ---
+        all_frames_data = []
+        frontal_indices = []
+
+        for i, frame_data in enumerate(raw_poses):
+            if frame_data is None or len(frame_data) == 0:
+                all_frames_data.append({"length": 0.0, "is_frontal": False, "has_feet": False})
+                continue
+
+            is_tensor = isinstance(frame_data, torch.Tensor)
+            pts = frame_data[0].cpu().numpy() if is_tensor and frame_data.dim() == 3 else (frame_data.cpu().numpy() if is_tensor else np.array(frame_data))
+            if pts.ndim == 3:
+                pts = pts[0]
+
+            def is_val(idx):
+                return idx < len(pts) and np.linalg.norm(pts[idx]) > 1e-5
+
+            valid_y = [pts[idx][1] for idx in range(len(pts)) if is_val(idx)]
+            length = (max(valid_y) - min(valid_y)) if valid_y else 0.0
+
+            is_frontal = False
+            if len(pts) >= 18:
+                dx_h, dz_h = pts[2][0] - pts[1][0], pts[2][2] - pts[1][2]
+                angle_h = math.degrees(math.atan2(abs(dz_h), abs(dx_h)))
+
+                dx_s, dz_s = pts[17][0] - pts[16][0], pts[17][2] - pts[16][2]
+                angle_s = math.degrees(math.atan2(abs(dz_s), abs(dx_s)))
+
+                if max(angle_h, angle_s) <= frontal_3d_angle_tolerance:
+                    is_frontal = True
+
+            all_frames_data.append({"length": length, "is_frontal": is_frontal, "has_feet": is_val(7) or is_val(8)})
+            if is_frontal:
+                frontal_indices.append(i)
+
+        candidates = frontal_indices if frontal_indices else list(range(len(raw_poses)))
+        max_len = max([d["length"] for d in all_frames_data]) if all_frames_data else 1.0
+
+        if not candidates:
+            log_messages.append("FEHLER: Keine verwertbaren Frames gefunden.")
+            return (video_nlf_data, "\n".join(log_messages), "{}")
+
+        best_idx, best_score = candidates[0], -1.0
+        for idx in candidates:
+            d = all_frames_data[idx]
+            score = (
+                (1000.0 if d["has_feet"] else 0.0)
+                + (500.0 if d["is_frontal"] else 0.0)
+                + ((d["length"] / max_len) * 100.0 if max_len > 1e-5 else 0.0)
+            )
+            if score > best_score:
+                best_score, best_idx = score, idx
+
+        log_messages.append(f"-> Referenz-Frame (Anchor) für globalen Ratio-Loop: {best_idx}")
+
+        ref_frame_data = raw_poses[best_idx]
+        is_t = isinstance(ref_frame_data, torch.Tensor)
+        ref_pts = ref_frame_data[0].cpu().numpy() if is_t and ref_frame_data.dim() == 3 else (ref_frame_data.cpu().numpy() if is_t else np.array(ref_frame_data))
+        if ref_pts.ndim == 3:
+            ref_pts = ref_pts[0]
+
+        # --- HILFSFUNKTIONEN ---
+        tree = {
+            0: [1, 2, 3],
+            1: [4],
+            4: [7],
+            7: [10],
+            2: [5],
+            5: [8],
+            8: [11],
+            3: [6],
+            6: [9],
+            9: [12, 13, 14],
+            12: [15],
+            13: [16],
+            16: [18],
+            18: [20],
+            20: [22],
+            14: [17],
+            17: [19],
+            19: [21],
+            21: [23]
+        }
+
+        def is_valid_point(p_array, idx):
+            return p_array is not None and idx < len(p_array) and np.linalg.norm(p_array[idx]) > 1e-5
+
+        def extract_points(frame_data, copy_array=False):
+            if frame_data is None or len(frame_data) == 0:
+                return None
+
+            is_tensor_local = isinstance(frame_data, torch.Tensor)
+            if is_tensor_local and frame_data.dim() == 3:
+                arr = frame_data[0].cpu().numpy()
+            elif is_tensor_local:
+                arr = frame_data.cpu().numpy()
+            else:
+                arr = np.array(frame_data)
+
+            if arr.ndim == 3:
+                arr = arr[0]
+
+            if copy_array:
+                arr = arr.copy()
+
+            return arr
+
+        def get_all_descendants(node, tree_map):
+            desc = []
+            if node in tree_map:
+                for child in tree_map[node]:
+                    desc.append(child)
+                    desc.extend(get_all_descendants(child, tree_map))
+            return desc
+
+        def get_height_stable(p_array):
+            if p_array is None:
+                return 0.0
+
+            if 12 < len(p_array) and np.linalg.norm(p_array[12]) > 1e-5:
+                top_y = p_array[12][1]
+            else:
+                return 0.0
+
+            feet_y = [
+                p_array[idx][1]
+                for idx in [7, 8, 10, 11, 4, 5]
+                if idx < len(p_array) and np.linalg.norm(p_array[idx]) > 1e-5
+            ]
+
+            return (max(feet_y) - top_y) if feet_y else 0.0
+
+        def get_avg_y(p_array, indices):
+            if p_array is None:
+                return 0.0
+            vals = [
+                p_array[idx][1]
+                for idx in indices
+                if idx < len(p_array) and np.linalg.norm(p_array[idx]) > 1e-5
+            ]
+            return float(sum(vals) / len(vals)) if vals else 0.0
+
+        def get_center(p_array, indices):
+            if p_array is None:
+                return None
+
+            vals = [
+                p_array[idx]
+                for idx in indices
+                if idx < len(p_array) and np.linalg.norm(p_array[idx]) > 1e-5
+            ]
+
+            if not vals:
+                return None
+
+            return np.mean(np.stack(vals, axis=0), axis=0)
+
+        def get_upper_body_anchor(p_array):
+            if upper_body_anchor_mode == "shoulders_only":
+                center = get_center(p_array, [16, 17])
+                if center is not None:
+                    return center
+
+            if upper_body_anchor_mode == "neck_only":
+                if is_valid_point(p_array, 12):
+                    return p_array[12].copy()
+
+            center = get_center(p_array, [12, 16, 17])
+            if center is not None:
+                return center
+
+            if is_valid_point(p_array, 12):
+                return p_array[12].copy()
+
+            center = get_center(p_array, [16, 17])
+            if center is not None:
+                return center
+
+            return None
+
+        def get_body_anchor_y(p_array):
+            shoulder_y = get_avg_y(p_array, [16, 17])
+            hip_y = get_avg_y(p_array, [1, 2])
+
+            if shoulder_y != 0.0 and hip_y != 0.0:
+                return float((shoulder_y + hip_y) * 0.5)
+            if shoulder_y != 0.0:
+                return float(shoulder_y)
+            if hip_y != 0.0:
+                return float(hip_y)
+            return 0.0
+
+        def get_foot_values_y(p_array):
+            if p_array is None:
+                return []
+            return [
+                float(p_array[idx][1])
+                for idx in [7, 8, 10, 11, 4, 5]
+                if idx < len(p_array) and np.linalg.norm(p_array[idx]) > 1e-5
+            ]
+
+        def get_foot_anchor_y(p_array, robust=False, percentile=80.0):
+            vals = get_foot_values_y(p_array)
+            if not vals:
+                return 0.0
+            if robust:
+                return float(np.percentile(np.array(vals, dtype=np.float32), percentile))
+            return float(max(vals))
+
+        def median_filter_value(series, idx, radius):
+            start = max(0, idx - radius)
+            end = min(len(series), idx + radius + 1)
+            vals = [float(v) for v in series[start:end] if v is not None and abs(float(v)) > 1e-5]
+            return float(np.median(vals)) if vals else 0.0
+
+        def window_range_value(series, idx, radius):
+            start = max(0, idx - radius)
+            end = min(len(series), idx + radius + 1)
+            vals = [float(v) for v in series[start:end] if v is not None and abs(float(v)) > 1e-5]
+            return float(max(vals) - min(vals)) if vals else 0.0
+
+        def get_bone_lengths(pts_array):
+            def dist(p1, p2):
+                if (
+                    p1 < len(pts_array)
+                    and p2 < len(pts_array)
+                    and np.linalg.norm(pts_array[p1]) > 1e-5
+                    and np.linalg.norm(pts_array[p2]) > 1e-5
+                ):
+                    return float(np.linalg.norm(pts_array[p2] - pts_array[p1]))
+                return 0.0
+
+            return {
+                "Torso": dist(0, 12),
+                "Kopf": dist(12, 15),
+                "R_Oberschenkel": dist(2, 5),
+                "R_Wade": dist(5, 8),
+                "L_Oberschenkel": dist(1, 4),
+                "L_Wade": dist(4, 7),
+                "R_Arm": dist(17, 19),
+                "R_Unterarm": dist(19, 21),
+                "L_Arm": dist(16, 18),
+                "L_Unterarm": dist(18, 20),
+                "Schulterbreite": dist(16, 17),
+                "Hueftbreite": dist(1, 2)
+            }
+
+        def get_frame_targets(pts_array):
+            if pts_array is None or len(pts_array) <= 12 or not is_valid_point(pts_array, 0) or not is_valid_point(pts_array, 12):
+                return {}
+
+            orig_torso_curr = np.linalg.norm(pts_array[12] - pts_array[0]) if np.linalg.norm(pts_array[12]) > 1e-5 else 0.0
+            missing_neck_curr = orig_torso_curr * (head_val / 100.0) / 2.0 if is_normalized else head_val / 2.0
+            frame_ref_torso = orig_torso_curr + missing_neck_curr
+
+            return {
+                k: (v / 100.0 * frame_ref_torso if is_normalized else v)
+                for k, v in true_3d_bones.items()
+            }
+
+        def compute_target_pelvis_ratio(targets):
+            torso_len = float(targets.get("torso", 0.0))
+
+            r_thigh = float(targets.get("calibration_r_thigh", targets.get("r_thigh", 0.0)))
+            r_calf = float(targets.get("calibration_r_calf", targets.get("r_calf", 0.0)))
+            l_thigh = float(targets.get("calibration_l_thigh", targets.get("l_thigh", 0.0)))
+            l_calf = float(targets.get("calibration_l_calf", targets.get("l_calf", 0.0)))
+
+            right_leg = r_thigh + r_calf
+            left_leg = l_thigh + l_calf
+
+            if right_leg > 1e-5 and left_leg > 1e-5:
+                leg_len = (right_leg + left_leg) * 0.5
+            elif right_leg > 1e-5:
+                leg_len = right_leg
+            elif left_leg > 1e-5:
+                leg_len = left_leg
+            else:
+                leg_len = 0.0
+
+            if torso_len <= 1e-5 or leg_len <= 1e-5:
+                return 0.45, torso_len, leg_len
+
+            ratio = torso_len / (torso_len + leg_len)
+            return float(np.clip(ratio, 0.18, 0.70)), torso_len, leg_len
+
+        def build_and_log(pts_source, factor, tgls, final_mode=False, force_all=False, leg_height_factor=1.0):
+            pts_b = pts_source.copy()
+
+            if len(pts_b) <= 12 or not is_valid_point(pts_b, 0) or not is_valid_point(pts_b, 12):
+                return pts_b
+
+            targets = get_frame_targets(pts_b)
+
+            # 1. Torso
+            if force_all or tgls.get("scale_torso", True):
+                if is_valid_point(pts_b, 0) and is_valid_point(pts_b, 12):
+                    cv = pts_b[12] - pts_b[0]
+                    cl = np.linalg.norm(cv)
+
+                    if cl > 1e-5:
+                        t_len = targets.get("torso", cl)
+                        if final_mode:
+                            t_len *= factor
+
+                        f_node = t_len / cl
+
+                        for p, c in [(0, 3), (3, 6), (6, 9), (9, 12)]:
+                            if p >= len(pts_b) or c >= len(pts_b):
+                                continue
+                            if not is_valid_point(pts_b, p) or not is_valid_point(pts_b, c):
+                                continue
+
+                            vec = pts_b[c] - pts_b[p]
+                            new_c = pts_b[p] + vec * f_node
+                            delta = new_c - pts_b[c]
+                            pts_b[c] += delta
+
+                            for d in get_all_descendants(c, tree):
+                                if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
+                                    pts_b[d] += delta
+
+            # 2. Kopf
+            if 15 < len(pts_b) and is_valid_point(pts_b, 12) and is_valid_point(pts_b, 15):
+                cv = pts_b[15] - pts_b[12]
+                cl = np.linalg.norm(cv)
+
+                if cl > 1e-5:
+                    t_len = targets.get("head", cl * 2.0) / 2.0
+                    if final_mode and scale_stance_and_head:
+                        t_len *= factor
+
+                    delta = (pts_b[12] + (cv / cl * t_len)) - pts_b[15]
+                    pts_b[15] += delta
+
+            # 3. Arme, Beine, Schultern, Hüften
+            ops = [
+                ("shoulder_width", 12, 17),
+                ("shoulder_width", 12, 16),
+                ("hip_width", 0, 2),
+                ("hip_width", 0, 1),
+                ("r_arm", 17, 19),
+                ("r_forearm", 19, 21),
+                ("l_arm", 16, 18),
+                ("l_forearm", 18, 20),
+                ("r_thigh", 2, 5),
+                ("r_calf", 5, 8),
+                ("l_thigh", 1, 4),
+                ("l_calf", 4, 7)
+            ]
+
+            for key, p_idx, c_idx in ops:
+                if p_idx >= len(pts_b) or c_idx >= len(pts_b):
+                    continue
+                if not is_valid_point(pts_b, p_idx) or not is_valid_point(pts_b, c_idx):
+                    continue
+
+                is_allowed = force_all
+
+                if not is_allowed:
+                    if "shoulder" in key and tgls.get("scale_shoulders", True):
+                        is_allowed = True
+                    elif "hip" in key and tgls.get("scale_hips", True):
+                        is_allowed = True
+                    elif "arm" in key and tgls.get("scale_arms", True):
+                        is_allowed = True
+                    elif ("thigh" in key or "calf" in key) and tgls.get("scale_legs", True):
+                        is_allowed = True
+
+                if not is_allowed:
+                    continue
+
+                cv = pts_b[c_idx] - pts_b[p_idx]
+                cl = np.linalg.norm(cv)
+
+                if cl < 1e-5:
+                    continue
+
+                if key in ["shoulder_width", "hip_width"]:
+                    stance_target = targets.get(key, cl * 2.0) / 2.0
+                    calib_key = f"calibration_{key}"
+                    bone_target = targets.get(calib_key, stance_target * 2.0) / 2.0
+
+                    if final_mode and scale_stance_and_head:
+                        stance_target *= factor
+                        bone_target *= factor
+
+                    scale_xz_stance = stance_target / cl
+                    pos_stance = pts_b[p_idx].copy()
+                    pos_stance[0] += cv[0] * scale_xz_stance
+                    pos_stance[1] += cv[1]
+                    pos_stance[2] += cv[2] * scale_xz_stance
+
+                    delta_stance = pos_stance - pts_b[c_idx]
+                    pts_b[c_idx] += delta_stance
+
+                    for d in get_all_descendants(c_idx, tree):
+                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
+                            pts_b[d] += delta_stance
+
+                    scale_xz_config = bone_target / cl
+                    pos_config = pts_b[p_idx].copy()
+                    pos_config[0] += cv[0] * scale_xz_config
+                    pos_config[1] += cv[1]
+                    pos_config[2] += cv[2] * scale_xz_config
+
+                    delta_config = pos_config - pts_b[c_idx]
+                    pts_b[c_idx] += delta_config
+
+                else:
+                    if key not in targets:
+                        continue
+
+                    t_len_normal = targets[key]
+                    cal_k = "calibration_" + key
+                    t_len_final = targets.get(cal_k, t_len_normal)
+
+                    if final_mode:
+                        t_len_final *= factor
+
+                    if final_mode and ("thigh" in key or "calf" in key):
+                        t_len_final *= leg_height_factor
+
+                    dir_vec = cv / cl
+                    new_c_pos = pts_b[p_idx] + (dir_vec * t_len_final)
+                    delta_shift = new_c_pos - pts_b[c_idx]
+                    pts_b[c_idx] = new_c_pos
+
+                    for d in get_all_descendants(c_idx, tree):
+                        if d < len(pts_b) and np.linalg.norm(pts_b[d]) > 1e-5:
+                            pts_b[d] += delta_shift
+
+            return pts_b
+
+        def apply_shoulder_foot_ratio_guard(pts_candidate, pts_original, frame_idx, prev_ratio_shift):
+            debug = {
+                "enabled": shoulder_foot_ratio_guard and scale_legs,
+                "applied": False,
+                "upper_y": 0.0,
+                "foot_y": 0.0,
+                "pelvis_y": 0.0,
+                "target_pelvis_y": 0.0,
+                "target_ratio": 0.0,
+                "current_ratio": 0.0,
+                "ratio_error": 0.0,
+                "raw_shift": 0.0,
+                "limited_shift": 0.0,
+                "smoothed_shift": 0.0,
+                "final_shift": 0.0,
+                "target_torso": 0.0,
+                "target_leg": 0.0,
+                "reason": "inactive"
+            }
+
+            if not shoulder_foot_ratio_guard or not scale_legs or shoulder_foot_ratio_strength <= 0.0:
+                return pts_candidate, debug, prev_ratio_shift
+
+            pts_g = pts_candidate.copy()
+
+            upper_anchor = get_upper_body_anchor(pts_g)
+            if upper_anchor is None:
+                debug["reason"] = "no_upper_anchor"
+                return pts_g, debug, prev_ratio_shift
+
+            current_foot_y = get_foot_anchor_y(pts_original, robust=True, percentile=ground_shift_percentile)
+            trend_foot_y = foot_y_trend[frame_idx] if frame_idx < len(foot_y_trend) else 0.0
+
+            if ground_anchor_mode == "advanced_trend" and trend_foot_y > 1e-5:
+                foot_spike_limit = max(body_anchor_trend_tolerance * 2.0, 12.0)
+                if current_foot_y > 1e-5 and abs(current_foot_y - trend_foot_y) > foot_spike_limit:
+                    foot_y = trend_foot_y
+                else:
+                    foot_y = current_foot_y
+            else:
+                foot_y = current_foot_y
+
+            pelvis_center = get_center(pts_g, [1, 2])
+            if pelvis_center is None:
+                pelvis_center = get_center(pts_g, [0])
+
+            if pelvis_center is None or foot_y <= 1e-5:
+                debug["reason"] = "no_pelvis_or_foot"
+                return pts_g, debug, prev_ratio_shift
+
+            upper_y = float(upper_anchor[1])
+            pelvis_y = float(pelvis_center[1])
+
+            total_span = foot_y - upper_y
+            if abs(total_span) < 1e-5:
+                debug["reason"] = "bad_span"
+                return pts_g, debug, prev_ratio_shift
+
+            targets = get_frame_targets(pts_g)
+            target_ratio, target_torso, target_leg = compute_target_pelvis_ratio(targets)
+
+            current_ratio = (pelvis_y - upper_y) / total_span
+            ratio_error = current_ratio - target_ratio
+
+            target_pelvis_y = upper_y + total_span * target_ratio
+            raw_shift = target_pelvis_y - pelvis_y
+
+            debug["upper_y"] = upper_y
+            debug["foot_y"] = foot_y
+            debug["pelvis_y"] = pelvis_y
+            debug["target_pelvis_y"] = target_pelvis_y
+            debug["target_ratio"] = target_ratio
+            debug["current_ratio"] = current_ratio
+            debug["ratio_error"] = ratio_error
+            debug["raw_shift"] = raw_shift
+            debug["target_torso"] = target_torso
+            debug["target_leg"] = target_leg
+
+            if abs(ratio_error) <= shoulder_foot_ratio_tolerance:
+                debug["reason"] = "within_tolerance"
+                return pts_g, debug, prev_ratio_shift
+
+            # Wichtig:
+            # Wenn only_fix_short_legs aktiv ist, greifen wir nur ein, wenn die Hüfte zu tief liegt.
+            # Y nach unten: current_ratio > target_ratio bedeutet Torso zu lang / Beine zu kurz.
+            if shoulder_foot_only_fix_short_legs and ratio_error <= 0.0:
+                debug["reason"] = "blocked_not_short_legs"
+                return pts_g, debug, prev_ratio_shift
+
+            limited_shift = raw_shift * shoulder_foot_ratio_strength
+            if shoulder_foot_max_pelvis_shift > 0.0:
+                limited_shift = float(np.clip(limited_shift, -shoulder_foot_max_pelvis_shift, shoulder_foot_max_pelvis_shift))
+
+            smoothed_shift = limited_shift
+            if shoulder_foot_pelvis_smooth > 0.0 and prev_ratio_shift is not None:
+                smoothed_shift = (prev_ratio_shift * shoulder_foot_pelvis_smooth) + (limited_shift * (1.0 - shoulder_foot_pelvis_smooth))
+
+            final_shift = float(smoothed_shift)
+
+            # V22 macht bewusst KEIN hartes IK und KEIN Foot-Lock.
+            # Füße bleiben stehen. Wir verschieben nur Becken/Root und Knie weich.
+            # Dadurch kann die Hüfte höher, ohne dass der Ground-Anchor alles wieder wegcancelled.
+            pelvis_nodes = [0, 1, 2]
+            knee_nodes = [4, 5]
+
+            for idx in pelvis_nodes:
+                if is_valid_point(pts_g, idx):
+                    pts_g[idx][1] += final_shift
+
+            for idx in knee_nodes:
+                if is_valid_point(pts_g, idx):
+                    pts_g[idx][1] += final_shift * 0.55
+
+            # Spine weich zwischen neuer Root und altem oberen Körper neu verteilen.
+            # Schultern/Kopf bleiben stabiler als bei V21.
+            if is_valid_point(pts_g, 0) and is_valid_point(pts_g, 12):
+                root_y = float(pts_g[0][1])
+                neck_y = float(pts_g[12][1])
+                spine_blend = 0.65
+
+                for idx, alpha in [(3, 0.25), (6, 0.50), (9, 0.75)]:
+                    if is_valid_point(pts_g, idx):
+                        desired_y = root_y * (1.0 - alpha) + neck_y * alpha
+                        pts_g[idx][1] = pts_g[idx][1] * (1.0 - spine_blend) + desired_y * spine_blend
+
+            debug["applied"] = True
+            debug["limited_shift"] = limited_shift
+            debug["smoothed_shift"] = smoothed_shift
+            debug["final_shift"] = final_shift
+            debug["reason"] = "applied"
+
+            return pts_g, debug, final_shift
+
+        # --- PHASE 1: GLOBALER HEIGHT-FACTOR ---
+        orig_h_global = get_height_stable(ref_pts)
+        global_f_scale = 1.0
+
+        log_messages.append("\n--- TOTAL-HEIGHT-ENFORCER ---")
+        if orig_h_global > 1e-5:
+            for iteration in range(10):
+                pts_test = build_and_log(
+                    ref_pts,
+                    global_f_scale,
+                    toggles,
+                    final_mode=True,
+                    force_all=True,
+                    leg_height_factor=1.0
+                )
+                test_h = get_height_stable(pts_test)
+
+                if test_h < 1e-5:
+                    break
+
+                diff = abs(orig_h_global - test_h)
+                if diff < 0.1:
+                    break
+
+                ratio = orig_h_global / test_h
+                global_f_scale *= ratio
+
+        log_messages.append(f"Berechneter universeller Kompressions-Faktor: {global_f_scale:.6f}x")
+
+        # --- PHASE 1.5: ADVANCED-TREND-VORANALYSE ---
+        body_y_series = []
+        foot_y_series = []
+        height_series = []
+        body_y_trend = []
+        foot_y_trend = []
+        body_window_range = []
+        foot_window_range = []
+
+        for frame_data in raw_poses:
+            pts_pre = extract_points(frame_data, copy_array=False)
+            body_y_series.append(get_body_anchor_y(pts_pre) if pts_pre is not None else 0.0)
+            foot_y_series.append(get_foot_anchor_y(pts_pre, robust=True, percentile=ground_shift_percentile) if pts_pre is not None else 0.0)
+            height_series.append(get_height_stable(pts_pre) if pts_pre is not None else 0.0)
+
+        for idx in range(len(raw_poses)):
+            body_y_trend.append(median_filter_value(body_y_series, idx, body_anchor_lookahead_radius))
+            foot_y_trend.append(median_filter_value(foot_y_series, idx, body_anchor_lookahead_radius))
+            body_window_range.append(window_range_value(body_y_series, idx, body_anchor_lookahead_radius))
+            foot_window_range.append(window_range_value(foot_y_series, idx, body_anchor_lookahead_radius))
+
+        if ground_anchor_mode == "advanced_trend":
+            log_messages.append(
+                f"Advanced Trend Analyse aktiv: Frames={len(raw_poses)} | "
+                f"Medianfenster={body_anchor_lookahead_radius * 2 + 1} | "
+                f"BodyRangeMedian={float(np.median([v for v in body_window_range if v > 1e-5])) if any(v > 1e-5 for v in body_window_range) else 0.0:.2f} | "
+                f"FootRangeMedian={float(np.median([v for v in foot_window_range if v > 1e-5])) if any(v > 1e-5 for v in foot_window_range) else 0.0:.2f}"
+            )
+
+        # --- PHASE 2: FRAMES VERARBEITEN ---
+        prev_pts = None
+        prev_shift = None
+        prev_leg_guard_factor = 1.0
+        prev_ratio_guard_shift = None
+
+        guard_events = []
+        ground_guard_events = []
+        ratio_guard_events = []
+
+        for frame_idx in range(len(raw_poses)):
+            frame_data = raw_poses[frame_idx]
+            if frame_data is None or len(frame_data) == 0:
+                continue
+
+            is_tensor = isinstance(frame_data, torch.Tensor)
+            pts = frame_data[0].cpu().numpy().copy() if is_tensor and frame_data.dim() == 3 else (frame_data.cpu().numpy().copy() if is_tensor else np.array(frame_data).copy())
+            if pts.ndim == 3:
+                pts = pts[0]
+
+            log_this_frame = (frame_idx % 10 == 0)
+
+            bones_before = None
+            h_before = get_height_stable(pts)
+            shoulder_y_before = get_avg_y(pts, [16, 17])
+            hip_y_before = get_avg_y(pts, [1, 2])
+            body_y_before = get_body_anchor_y(pts)
+            foot_y_before_legacy = get_foot_anchor_y(pts, robust=False)
+            foot_y_before_robust = get_foot_anchor_y(pts, robust=True, percentile=ground_shift_percentile)
+
+            if log_this_frame:
+                bones_before = get_bone_lengths(pts)
+
+            # --- V19 / V18.1 LEG HEIGHT GUARD ---
+            guard_used = False
+            guard_smoothing_bypassed = False
+            guard_clamped_by_no_expand = False
+            guard_iterations = 0
+            guard_target_h = 0.0
+            guard_raw_h = 0.0
+            guard_final_pre_ground_h = 0.0
+            guard_unsmoothed_factor = 1.0
+            guard_local_factor = 1.0
+            guard_raw_rel_error = 0.0
+            guard_final_rel_error = 0.0
+
+            if leg_height_guard and scale_legs:
+                no_leg_toggles = toggles.copy()
+                no_leg_toggles["scale_legs"] = False
+
+                pts_no_legs = build_and_log(
+                    pts,
+                    global_f_scale,
+                    no_leg_toggles,
+                    final_mode=True,
+                    force_all=False,
+                    leg_height_factor=1.0
+                )
+                guard_target_h = get_height_stable(pts_no_legs)
+
+                pts_raw_legs = build_and_log(
+                    pts,
+                    global_f_scale,
+                    toggles,
+                    final_mode=True,
+                    force_all=False,
+                    leg_height_factor=1.0
+                )
+                guard_raw_h = get_height_stable(pts_raw_legs)
+
+                if guard_target_h <= 1e-5:
+                    guard_target_h = h_before
+
+                if guard_target_h > 1e-5 and guard_raw_h > 1e-5:
+                    guard_raw_rel_error = (guard_raw_h - guard_target_h) / guard_target_h
+
+                    if abs(guard_raw_rel_error) > leg_height_guard_tolerance:
+                        if guard_raw_rel_error < 0.0 and leg_height_guard_max_factor <= 1.0001:
+                            guard_clamped_by_no_expand = True
+                            pts_final = pts_raw_legs
+                            guard_final_pre_ground_h = guard_raw_h
+                            guard_local_factor = 1.0
+                            guard_unsmoothed_factor = 1.0
+                            guard_final_rel_error = guard_raw_rel_error
+                        else:
+                            guard_used = True
+
+                            candidate_factor = 1.0
+                            pts_candidate = pts_raw_legs
+                            h_candidate = guard_raw_h
+
+                            for guard_iterations in range(1, 7):
+                                if h_candidate <= 1e-5:
+                                    break
+
+                                ratio = guard_target_h / h_candidate
+                                candidate_factor *= ratio
+                                candidate_factor = float(np.clip(candidate_factor, leg_height_guard_min_factor, leg_height_guard_max_factor))
+
+                                pts_candidate = build_and_log(
+                                    pts,
+                                    global_f_scale,
+                                    toggles,
+                                    final_mode=True,
+                                    force_all=False,
+                                    leg_height_factor=candidate_factor
+                                )
+                                h_candidate = get_height_stable(pts_candidate)
+
+                                rel_err_candidate = abs(h_candidate - guard_target_h) / guard_target_h
+                                if rel_err_candidate <= leg_height_guard_tolerance:
+                                    break
+
+                            guard_unsmoothed_factor = candidate_factor
+
+                            if leg_height_guard_smooth > 0.0:
+                                smoothed_factor = (prev_leg_guard_factor * leg_height_guard_smooth) + (guard_unsmoothed_factor * (1.0 - leg_height_guard_smooth))
+                                smoothed_factor = float(np.clip(smoothed_factor, leg_height_guard_min_factor, leg_height_guard_max_factor))
+
+                                pts_smoothed_candidate = build_and_log(
+                                    pts,
+                                    global_f_scale,
+                                    toggles,
+                                    final_mode=True,
+                                    force_all=False,
+                                    leg_height_factor=smoothed_factor
+                                )
+                                h_smoothed_candidate = get_height_stable(pts_smoothed_candidate)
+
+                                rel_err_smoothed = abs(h_smoothed_candidate - guard_target_h) / guard_target_h
+                                hard_limit = max(leg_height_guard_tolerance * 2.0, 0.04)
+
+                                if rel_err_smoothed > hard_limit:
+                                    guard_smoothing_bypassed = True
+                                    guard_local_factor = guard_unsmoothed_factor
+                                    pts_final = pts_candidate
+                                    guard_final_pre_ground_h = h_candidate
+                                else:
+                                    guard_local_factor = smoothed_factor
+                                    pts_final = pts_smoothed_candidate
+                                    guard_final_pre_ground_h = h_smoothed_candidate
+                            else:
+                                guard_local_factor = guard_unsmoothed_factor
+                                pts_final = pts_candidate
+                                guard_final_pre_ground_h = h_candidate
+
+                            prev_leg_guard_factor = guard_local_factor
+                            guard_final_rel_error = (guard_final_pre_ground_h - guard_target_h) / guard_target_h if guard_target_h > 1e-5 else 0.0
+
+                        guard_events.append({
+                            "frame": frame_idx,
+                            "target_h": guard_target_h,
+                            "raw_h": guard_raw_h,
+                            "final_h": guard_final_pre_ground_h,
+                            "raw_error": guard_raw_rel_error,
+                            "final_error": guard_final_rel_error,
+                            "factor": guard_local_factor,
+                            "unsmoothed_factor": guard_unsmoothed_factor,
+                            "iterations": guard_iterations,
+                            "smoothing_bypassed": guard_smoothing_bypassed,
+                            "blocked_no_expand": guard_clamped_by_no_expand
+                        })
+
+                    else:
+                        pts_final = pts_raw_legs
+
+                        if leg_height_guard_smooth > 0.0:
+                            prev_leg_guard_factor = (prev_leg_guard_factor * leg_height_guard_smooth) + (1.0 * (1.0 - leg_height_guard_smooth))
+                        else:
+                            prev_leg_guard_factor = 1.0
+
+                        guard_final_pre_ground_h = guard_raw_h
+                else:
+                    pts_final = pts_raw_legs
+                    guard_final_pre_ground_h = guard_raw_h
+
+            else:
+                pts_final = build_and_log(
+                    pts,
+                    global_f_scale,
+                    toggles,
+                    final_mode=True,
+                    force_all=False,
+                    leg_height_factor=1.0
+                )
+                guard_final_pre_ground_h = get_height_stable(pts_final)
+
+            # --- V22 SOFT SHOULDER-FOOT RATIO GUARD ---
+            pts_final, ratio_debug, new_ratio_shift = apply_shoulder_foot_ratio_guard(
+                pts_final,
+                pts,
+                frame_idx,
+                prev_ratio_guard_shift
+            )
+
+            if ratio_debug.get("applied", False):
+                prev_ratio_guard_shift = new_ratio_shift
+                ratio_guard_events.append({
+                    "frame": frame_idx,
+                    "upper_y": ratio_debug["upper_y"],
+                    "foot_y": ratio_debug["foot_y"],
+                    "pelvis_y": ratio_debug["pelvis_y"],
+                    "target_pelvis_y": ratio_debug["target_pelvis_y"],
+                    "current_ratio": ratio_debug["current_ratio"],
+                    "target_ratio": ratio_debug["target_ratio"],
+                    "ratio_error": ratio_debug["ratio_error"],
+                    "raw_shift": ratio_debug["raw_shift"],
+                    "final_shift": ratio_debug["final_shift"],
+                    "reason": ratio_debug["reason"]
+                })
+            elif shoulder_foot_pelvis_smooth > 0.0 and prev_ratio_guard_shift is not None:
+                prev_ratio_guard_shift = prev_ratio_guard_shift * shoulder_foot_pelvis_smooth
+
+            # --- V19 GROUND ANCHOR ---
+            ground_debug = {
+                "mode": ground_anchor_mode,
+                "has_feet": False,
+                "foot_ref_source": "none",
+                "orig_anchor": 0.0,
+                "new_anchor": 0.0,
+                "raw_shift": 0.0,
+                "smoothed_shift": 0.0,
+                "step_clamped_shift": 0.0,
+                "body_guard_shift": 0.0,
+                "final_shift": 0.0,
+                "step_clamped": False,
+                "body_guarded": False,
+                "body_ref_y": 0.0,
+                "body_before_ground": 0.0,
+                "body_after_raw": 0.0,
+                "body_after_final": 0.0,
+                "body_delta_raw": 0.0,
+                "body_delta_final": 0.0,
+                "allowed_body_delta": body_anchor_max_delta,
+                "trend_extra": 0.0,
+                "current_body_y": body_y_before,
+                "trend_body_y": body_y_trend[frame_idx] if frame_idx < len(body_y_trend) else 0.0,
+                "current_foot_y": foot_y_before_robust,
+                "trend_foot_y": foot_y_trend[frame_idx] if frame_idx < len(foot_y_trend) else 0.0,
+            }
+
+            if ground_anchor_mode == "v18_legacy":
+                orig_anchor = get_foot_anchor_y(pts, robust=False)
+                new_anchor = get_foot_anchor_y(pts_final, robust=False)
+                foot_ref_source = "legacy_max"
+            else:
+                current_orig_anchor = get_foot_anchor_y(pts, robust=True, percentile=ground_shift_percentile)
+                trend_orig_anchor = foot_y_trend[frame_idx] if frame_idx < len(foot_y_trend) else 0.0
+
+                if ground_anchor_mode == "advanced_trend" and trend_orig_anchor > 1e-5:
+                    foot_spike_limit = max(body_anchor_trend_tolerance * 2.0, 12.0)
+                    if current_orig_anchor > 1e-5 and abs(current_orig_anchor - trend_orig_anchor) > foot_spike_limit:
+                        orig_anchor = trend_orig_anchor
+                        foot_ref_source = "advanced_trend_median"
+                    else:
+                        orig_anchor = current_orig_anchor
+                        foot_ref_source = "advanced_current_robust"
+                else:
+                    orig_anchor = current_orig_anchor
+                    foot_ref_source = "conservative_robust"
+
+                new_anchor = get_foot_anchor_y(pts_final, robust=True, percentile=ground_shift_percentile)
+
+            if orig_anchor > 1e-5 and new_anchor > 1e-5:
+                ground_debug["has_feet"] = True
+                ground_debug["foot_ref_source"] = foot_ref_source
+                ground_debug["orig_anchor"] = orig_anchor
+                ground_debug["new_anchor"] = new_anchor
+
+                raw_shift = orig_anchor - new_anchor
+                ground_debug["raw_shift"] = raw_shift
+
+                if ground_smooth_factor > 0.0 and prev_shift is not None:
+                    smoothed_shift = (prev_shift * ground_smooth_factor) + (raw_shift * (1.0 - ground_smooth_factor))
+                else:
+                    smoothed_shift = raw_shift
+
+                ground_debug["smoothed_shift"] = smoothed_shift
+
+                if ground_anchor_mode == "v18_legacy":
+                    final_shift = smoothed_shift
+                    ground_debug["step_clamped_shift"] = final_shift
+                    ground_debug["body_guard_shift"] = final_shift
+                else:
+                    step_clamped_shift = smoothed_shift
+                    if ground_shift_max_step > 0.0 and prev_shift is not None:
+                        step_delta = smoothed_shift - prev_shift
+                        if abs(step_delta) > ground_shift_max_step:
+                            step_clamped_shift = prev_shift + float(np.clip(step_delta, -ground_shift_max_step, ground_shift_max_step))
+                            ground_debug["step_clamped"] = True
+
+                    ground_debug["step_clamped_shift"] = step_clamped_shift
+
+                    body_guard_shift = step_clamped_shift
+                    body_before_ground = get_body_anchor_y(pts_final)
+                    current_body_ref = body_y_before
+                    trend_body_ref = body_y_trend[frame_idx] if frame_idx < len(body_y_trend) else 0.0
+
+                    if ground_anchor_mode == "advanced_trend" and trend_body_ref > 1e-5:
+                        body_ref_y = trend_body_ref
+                        local_body_range = body_window_range[frame_idx] if frame_idx < len(body_window_range) else 0.0
+                        trend_extra = min(body_anchor_trend_tolerance, max(0.0, local_body_range * 0.50))
+                    else:
+                        body_ref_y = current_body_ref
+                        trend_extra = 0.0
+
+                    allowed_body_delta = body_anchor_max_delta + trend_extra
+                    body_after_raw = body_before_ground + step_clamped_shift
+                    body_delta_raw = body_after_raw - body_ref_y if body_ref_y > 1e-5 else 0.0
+
+                    if body_anchor_guard and body_ref_y > 1e-5 and body_before_ground > 1e-5 and allowed_body_delta > 0.0:
+                        if abs(body_delta_raw) > allowed_body_delta:
+                            desired_body_after = body_ref_y + (allowed_body_delta if body_delta_raw > 0.0 else -allowed_body_delta)
+                            body_guard_shift = desired_body_after - body_before_ground
+                            ground_debug["body_guarded"] = True
+
+                    ground_debug["body_guard_shift"] = body_guard_shift
+                    ground_debug["body_ref_y"] = body_ref_y
+                    ground_debug["body_before_ground"] = body_before_ground
+                    ground_debug["body_after_raw"] = body_after_raw
+                    ground_debug["body_delta_raw"] = body_delta_raw
+                    ground_debug["allowed_body_delta"] = allowed_body_delta
+                    ground_debug["trend_extra"] = trend_extra
+
+                    final_shift = body_guard_shift
+
+                ground_debug["final_shift"] = final_shift
+
+                for j in range(len(pts_final)):
+                    if np.linalg.norm(pts_final[j]) > 1e-5:
+                        pts_final[j][1] += final_shift
+
+                prev_shift = final_shift
+
+                ground_debug["body_after_final"] = get_body_anchor_y(pts_final)
+                if ground_debug["body_ref_y"] > 1e-5:
+                    ground_debug["body_delta_final"] = ground_debug["body_after_final"] - ground_debug["body_ref_y"]
+
+                if ground_debug["step_clamped"] or ground_debug["body_guarded"]:
+                    ground_guard_events.append({
+                        "frame": frame_idx,
+                        "raw_shift": ground_debug["raw_shift"],
+                        "smoothed_shift": ground_debug["smoothed_shift"],
+                        "step_clamped_shift": ground_debug["step_clamped_shift"],
+                        "final_shift": ground_debug["final_shift"],
+                        "step_clamped": ground_debug["step_clamped"],
+                        "body_guarded": ground_debug["body_guarded"],
+                        "body_delta_raw": ground_debug["body_delta_raw"],
+                        "body_delta_final": ground_debug["body_delta_final"],
+                        "allowed_body_delta": ground_debug["allowed_body_delta"],
+                        "foot_ref_source": ground_debug["foot_ref_source"]
+                    })
+
+            # --- TEMPORAL SMOOTHING ---
+            if temporal_smooth_factor > 0.0:
+                if prev_pts is None:
+                    prev_pts = pts_final.copy()
+                else:
+                    for j in range(len(pts_final)):
+                        if j < len(prev_pts) and np.linalg.norm(pts_final[j]) > 1e-5 and np.linalg.norm(prev_pts[j]) > 1e-5:
+                            pts_final[j] = (prev_pts[j] * temporal_smooth_factor) + (pts_final[j] * (1.0 - temporal_smooth_factor))
+                        if j < len(prev_pts):
+                            prev_pts[j] = pts_final[j].copy()
+
+            # --- LOGGING ---
+            if log_this_frame:
+                bones_after = get_bone_lengths(pts_final)
+                h_after = get_height_stable(pts_final)
+                shoulder_y_after = get_avg_y(pts_final, [16, 17])
+                hip_y_after = get_avg_y(pts_final, [1, 2])
+                body_y_after = get_body_anchor_y(pts_final)
+                foot_y_after_legacy = get_foot_anchor_y(pts_final, robust=False)
+                foot_y_after_robust = get_foot_anchor_y(pts_final, robust=True, percentile=ground_shift_percentile)
+
+                log_messages.append(f"\n--- FRAME {frame_idx} VERGLEICH (V22 V19-Core + Shoulder-Foot Soft Guard) ---")
+                log_messages.append(f"Gesamthöhe (Y-Bounding Box) | Vorher: {h_before:.2f} -> Nachher: {h_after:.2f}")
+                log_messages.append(f"Schulter-Y Ø             | Vorher: {shoulder_y_before:.2f} -> Nachher: {shoulder_y_after:.2f} | Delta: {(shoulder_y_after - shoulder_y_before):+.2f}")
+                log_messages.append(f"Hüft-Y Ø                 | Vorher: {hip_y_before:.2f} -> Nachher: {hip_y_after:.2f} | Delta: {(hip_y_after - hip_y_before):+.2f}")
+                log_messages.append(f"Body-Y Ø                 | Vorher: {body_y_before:.2f} -> Nachher: {body_y_after:.2f} | Delta: {(body_y_after - body_y_before):+.2f}")
+                log_messages.append(f"Fuß-Anker-Y Legacy/Robust | Vorher: {foot_y_before_legacy:.2f}/{foot_y_before_robust:.2f} -> Nachher: {foot_y_after_legacy:.2f}/{foot_y_after_robust:.2f}")
+
+                if leg_height_guard and scale_legs:
+                    log_messages.append(
+                        f"Leg Height Guard         | Target(No-Legs): {guard_target_h:.2f} | "
+                        f"Raw-Legs: {guard_raw_h:.2f} | FinalPreGround: {guard_final_pre_ground_h:.2f}"
+                    )
+                    log_messages.append(
+                        f"Leg Guard Faktor         | Used: {guard_local_factor:.5f} | "
+                        f"Unsmoothed: {guard_unsmoothed_factor:.5f} | "
+                        f"Triggered: {guard_used} | Iter: {guard_iterations} | "
+                        f"SmoothingBypassed: {guard_smoothing_bypassed} | NoExpandBlocked: {guard_clamped_by_no_expand}"
+                    )
+                    log_messages.append(
+                        f"Leg Guard Error          | Raw: {guard_raw_rel_error * 100.0:+.2f}% | "
+                        f"Final: {guard_final_rel_error * 100.0:+.2f}%"
+                    )
+
+                log_messages.append(
+                    f"Shoulder-Foot Guard      | Applied: {ratio_debug.get('applied', False)} | Reason: {ratio_debug.get('reason', 'none')} | "
+                    f"UpperY: {ratio_debug.get('upper_y', 0.0):.2f} | FootY: {ratio_debug.get('foot_y', 0.0):.2f}"
+                )
+                log_messages.append(
+                    f"Shoulder-Foot Ratio      | Current: {ratio_debug.get('current_ratio', 0.0):.4f} | "
+                    f"Target: {ratio_debug.get('target_ratio', 0.0):.4f} | "
+                    f"Error: {ratio_debug.get('ratio_error', 0.0) * 100.0:+.2f}pp"
+                )
+                log_messages.append(
+                    f"Shoulder-Foot Pelvis     | PelvisY: {ratio_debug.get('pelvis_y', 0.0):.2f} | "
+                    f"TargetPelvisY: {ratio_debug.get('target_pelvis_y', 0.0):.2f} | "
+                    f"RawShift: {ratio_debug.get('raw_shift', 0.0):+.2f} | "
+                    f"FinalShift: {ratio_debug.get('final_shift', 0.0):+.2f}"
+                )
+
+                if ground_debug["has_feet"]:
+                    log_messages.append(
+                        f"Ground Anchor V19        | Mode: {ground_debug['mode']} | Source: {ground_debug['foot_ref_source']} | "
+                        f"OrigAnchor: {ground_debug['orig_anchor']:.2f} | NewAnchor: {ground_debug['new_anchor']:.2f}"
+                    )
+                    log_messages.append(
+                        f"Ground Shift             | Raw: {ground_debug['raw_shift']:+.2f} | "
+                        f"Smooth: {ground_debug['smoothed_shift']:+.2f} | "
+                        f"StepClamp: {ground_debug['step_clamped_shift']:+.2f} | "
+                        f"BodyGuard: {ground_debug['body_guard_shift']:+.2f} | "
+                        f"Final: {ground_debug['final_shift']:+.2f}"
+                    )
+                    log_messages.append(
+                        f"Ground Guards            | StepClamped: {ground_debug['step_clamped']} | "
+                        f"BodyGuarded: {ground_debug['body_guarded']} | "
+                        f"AllowedBodyDelta: {ground_debug['allowed_body_delta']:.2f} | TrendExtra: {ground_debug['trend_extra']:.2f}"
+                    )
+                    log_messages.append(
+                        f"Body Guard Ref           | BodyRef: {ground_debug['body_ref_y']:.2f} | "
+                        f"BodyBeforeGround: {ground_debug['body_before_ground']:.2f} | "
+                        f"DeltaRaw: {ground_debug['body_delta_raw']:+.2f} | "
+                        f"DeltaFinal: {ground_debug['body_delta_final']:+.2f}"
+                    )
+                    if ground_anchor_mode == "advanced_trend":
+                        log_messages.append(
+                            f"Advanced Trend           | BodyCurrent/Trend: {ground_debug['current_body_y']:.2f}/{ground_debug['trend_body_y']:.2f} | "
+                            f"FootCurrent/Trend: {ground_debug['current_foot_y']:.2f}/{ground_debug['trend_foot_y']:.2f} | "
+                            f"BodyRangeWin: {body_window_range[frame_idx]:.2f} | FootRangeWin: {foot_window_range[frame_idx]:.2f}"
+                        )
+                else:
+                    log_messages.append("Ground Anchor V19        | Keine gültigen Fußpunkte für Shift gefunden.")
+
+                log_messages.append("-" * 70)
+
+                for k in bones_before.keys():
+                    log_messages.append(f"Knochen: {k.ljust(18)} | Vorher: {bones_before[k]:.2f} -> Nachher: {bones_after[k]:.2f}")
+
+            # Output zurückschreiben
+            if is_tensor:
+                if frame_data.dim() == 3:
+                    raw_poses[frame_idx][0] = torch.from_numpy(pts_final).to(frame_data.device)
+                else:
+                    raw_poses[frame_idx] = torch.from_numpy(pts_final).to(frame_data.device)
+            else:
+                raw_poses[frame_idx] = pts_final.tolist()
+
+        # --- SUMMARY: SHOULDER-FOOT GUARD ---
+        log_messages.append("\n--- V22 SHOULDER-FOOT RATIO GUARD SUMMARY ---")
+        log_messages.append(f"Ratio Guard Events: {len(ratio_guard_events)}")
+        log_messages.append(f"Mode: Soft waist correction | Hard IK: False | FootLock: False")
+
+        if ratio_guard_events:
+            worst_ratio = max(ratio_guard_events, key=lambda e: abs(e["ratio_error"]))
+            strongest_shift = max(ratio_guard_events, key=lambda e: abs(e["final_shift"]))
+
+            log_messages.append(
+                f"Stärkster Ratio-Ausreißer: Frame {worst_ratio['frame']} | "
+                f"CurrentRatio: {worst_ratio['current_ratio']:.4f} | TargetRatio: {worst_ratio['target_ratio']:.4f} | "
+                f"Error: {worst_ratio['ratio_error'] * 100.0:+.2f}pp | Shift: {worst_ratio['final_shift']:+.2f}"
+            )
+            log_messages.append(
+                f"Stärkster Pelvis-Softshift: Frame {strongest_shift['frame']} | "
+                f"Pelvis: {strongest_shift['pelvis_y']:.2f} -> Target {strongest_shift['target_pelvis_y']:.2f} | "
+                f"RawShift: {strongest_shift['raw_shift']:+.2f} | FinalShift: {strongest_shift['final_shift']:+.2f}"
+            )
+
+            log_messages.append("\nErste Ratio-Guard-Events:")
+            for e in ratio_guard_events[:25]:
+                log_messages.append(
+                    f"Frame {str(e['frame']).rjust(4)} | "
+                    f"Upper {e['upper_y']:.2f} | Foot {e['foot_y']:.2f} | "
+                    f"Pelvis {e['pelvis_y']:.2f}->{e['target_pelvis_y']:.2f} | "
+                    f"Ratio {e['current_ratio']:.4f}->{e['target_ratio']:.4f} | "
+                    f"Err {e['ratio_error'] * 100.0:+.2f}pp | "
+                    f"Shift {e['final_shift']:+.2f}"
+                )
+
+            if len(ratio_guard_events) > 25:
+                log_messages.append(f"... weitere {len(ratio_guard_events) - 25} Ratio-Guard-Events ausgelassen.")
+        else:
+            log_messages.append("Keine Shoulder-Foot-Ratio-Eingriffe nötig oder Guard deaktiviert.")
+
+        # --- SUMMARY: LEG GUARD ---
+        log_messages.append("\n--- V22 LEG HEIGHT GUARD SUMMARY ---")
+        log_messages.append(f"Leg Guard Events: {len(guard_events)}")
+
+        if guard_events:
+            worst_raw = max(guard_events, key=lambda e: abs(e["raw_error"]))
+            worst_final = max(guard_events, key=lambda e: abs(e["final_error"]))
+            blocked_count = sum(1 for e in guard_events if e.get("blocked_no_expand", False))
+
+            log_messages.append(
+                f"Stärkster Raw-Ausreißer: Frame {worst_raw['frame']} | "
+                f"Target: {worst_raw['target_h']:.2f} | Raw: {worst_raw['raw_h']:.2f} | "
+                f"RawError: {worst_raw['raw_error'] * 100.0:+.2f}% | "
+                f"Faktor: {worst_raw['factor']:.5f}"
+            )
+            log_messages.append(
+                f"Stärkster Final-Ausreißer nach Guard: Frame {worst_final['frame']} | "
+                f"Target: {worst_final['target_h']:.2f} | Final: {worst_final['final_h']:.2f} | "
+                f"FinalError: {worst_final['final_error'] * 100.0:+.2f}% | "
+                f"Faktor: {worst_final['factor']:.5f}"
+            )
+            log_messages.append(f"No-Expand-blockierte negative Events: {blocked_count}")
+
+            log_messages.append("\nErste Leg-Guard-Events:")
+            for e in guard_events[:25]:
+                log_messages.append(
+                    f"Frame {str(e['frame']).rjust(4)} | "
+                    f"Target {e['target_h']:.2f} | Raw {e['raw_h']:.2f} | Final {e['final_h']:.2f} | "
+                    f"RawErr {e['raw_error'] * 100.0:+.2f}% | FinalErr {e['final_error'] * 100.0:+.2f}% | "
+                    f"Factor {e['factor']:.5f} | Iter {e['iterations']} | "
+                    f"SmoothBypass {e['smoothing_bypassed']} | NoExpandBlocked {e.get('blocked_no_expand', False)}"
+                )
+
+            if len(guard_events) > 25:
+                log_messages.append(f"... weitere {len(guard_events) - 25} Leg-Guard-Events ausgelassen.")
+        else:
+            log_messages.append("Keine Height-Guard-Eingriffe nötig oder Leg Scaling/Guard war deaktiviert.")
+
+        # --- SUMMARY: GROUND GUARD ---
+        log_messages.append("\n--- V22 GROUND ANCHOR GUARD SUMMARY ---")
+        log_messages.append(f"Ground Guard Events: {len(ground_guard_events)}")
+        log_messages.append(f"Ground Mode benutzt: {ground_anchor_mode}")
+
+        if ground_guard_events:
+            worst_body_raw = max(ground_guard_events, key=lambda e: abs(e["body_delta_raw"]))
+            worst_shift = max(ground_guard_events, key=lambda e: abs(e["raw_shift"] - e["final_shift"]))
+            step_count = sum(1 for e in ground_guard_events if e.get("step_clamped", False))
+            body_count = sum(1 for e in ground_guard_events if e.get("body_guarded", False))
+
+            log_messages.append(f"StepClamp Events: {step_count} | BodyGuard Events: {body_count}")
+            log_messages.append(
+                f"Stärkster Body-Raw-Ausreißer: Frame {worst_body_raw['frame']} | "
+                f"RawShift: {worst_body_raw['raw_shift']:+.2f} | FinalShift: {worst_body_raw['final_shift']:+.2f} | "
+                f"BodyDeltaRaw: {worst_body_raw['body_delta_raw']:+.2f} | BodyDeltaFinal: {worst_body_raw['body_delta_final']:+.2f} | "
+                f"Allowed: {worst_body_raw['allowed_body_delta']:.2f}"
+            )
+            log_messages.append(
+                f"Stärkste Shift-Korrektur: Frame {worst_shift['frame']} | "
+                f"RawShift: {worst_shift['raw_shift']:+.2f} | Smooth: {worst_shift['smoothed_shift']:+.2f} | "
+                f"StepClamp: {worst_shift['step_clamped_shift']:+.2f} | Final: {worst_shift['final_shift']:+.2f} | "
+                f"Source: {worst_shift['foot_ref_source']}"
+            )
+
+            log_messages.append("\nErste Ground-Guard-Events:")
+            for e in ground_guard_events[:25]:
+                log_messages.append(
+                    f"Frame {str(e['frame']).rjust(4)} | "
+                    f"RawShift {e['raw_shift']:+.2f} | Smooth {e['smoothed_shift']:+.2f} | "
+                    f"Step {e['step_clamped_shift']:+.2f} | Final {e['final_shift']:+.2f} | "
+                    f"StepClamp {e['step_clamped']} | BodyGuard {e['body_guarded']} | "
+                    f"BodyRaw {e['body_delta_raw']:+.2f} | BodyFinal {e['body_delta_final']:+.2f} | "
+                    f"Allowed {e['allowed_body_delta']:.2f} | Source {e['foot_ref_source']}"
+                )
+
+            if len(ground_guard_events) > 25:
+                log_messages.append(f"... weitere {len(ground_guard_events) - 25} Ground-Guard-Events ausgelassen.")
+        else:
+            log_messages.append("Keine Ground-StepClamp/BodyGuard-Eingriffe nötig oder v18_legacy ohne Guard benutzt.")
+
+        # --- CONFIG CLEAN ---
+        try:
+            config_dict = json.loads(nlf_render_config) if isinstance(nlf_render_config, str) and nlf_render_config.strip() else {}
+        except Exception:
+            config_dict = {}
+
+        config_dict["anchor_scale"] = 1.0
+        config_dict["scale_x_factor"] = 1.0
+        clean_config_str = json.dumps(config_dict)
+
+        return (nlf_data_retargeted, "\n".join(log_messages), clean_config_str)
