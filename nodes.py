@@ -615,6 +615,7 @@ NODE_CLASS_MAPPINGS = {
     "NLFProportionalRetargeterV181": NLFProportionalRetargeterV181,
     "NLFProportionalRetargeterV19": NLFProportionalRetargeterV19,
     "NLFProportionalRetargeterV20": NLFProportionalRetargeterV20,
+    "NLFProportionalRetargeterV21": NLFProportionalRetargeterV21,
     "PoseGlobalPerspectiveScalerV57": PoseGlobalPerspectiveScalerV57,
     
 }
@@ -743,6 +744,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFProportionalRetargeterV181": "NLF Proportional Retargeter V18.1",
     "NLFProportionalRetargeterV19": "NLF Proportional Retargeter V19",
     "NLFProportionalRetargeterV20": "NLF Proportional Retargeter V20",
+    "NLFProportionalRetargeterV21": "NLF Proportional Retargeter V21",
     "PoseGlobalPerspectiveScalerV57": "Pose Global Perspective Scaler V57",
 
     
