@@ -340,6 +340,7 @@ from .node_categories.WanAnimatePreprocess.SCAIL import *
 from .node_categories.WanAnimatePreprocess.Scaling import *
 from .node_categories.WanAnimatePreprocess.Sync import *
 from .node_categories.WanAnimatePreprocess.Timed import *
+from .node_categories.WanAnimatePreprocess.Temporal import *
 from .node_categories.WanAnimatePreprocess.Ultimate import *
 from .node_categories.WanAnimatePreprocess.Video import *
 from .node_categories.WanAnimatePreprocess.nodes import *
@@ -405,6 +406,8 @@ from .node_categories.WanAnimatePreprocess.nodes import *
 # NLFDataToMaskV5 -> node_categories/WanAnimatePreprocess/SCAIL.py
 # RenderNLFPosesDirectPoseDataMimic17 -> node_categories/WanAnimatePreprocess/SCAIL.py
 # RenderNLFPosesDirectHybrid8 -> node_categories/WanAnimatePreprocess/SCAIL.py
+# NLFTemporalSmootherV1 -> node_categories/WanAnimatePreprocess/Temporal.py
+# DWPoseTemporalSmootherV1 -> node_categories/WanAnimatePreprocess/Temporal.py
 # SavePoseCalibration -> node_categories/WanAnimatePreprocess/Ultimate.py
 # LoadPoseCalibration -> node_categories/WanAnimatePreprocess/Ultimate.py
 # PoseLocalBoneRetargeterV10 -> node_categories/WanAnimatePreprocess/Ultimate.py
@@ -599,6 +602,8 @@ NODE_CLASS_MAPPINGS = {
     "NLFProportionalRetargeterV20": NLFProportionalRetargeterV20,
     "NLFProportionalRetargeterV22": NLFProportionalRetargeterV22,
     "PoseGlobalPerspectiveScalerV57": PoseGlobalPerspectiveScalerV57,
+    "NLFTemporalSmootherV1": NLFTemporalSmootherV1,
+    "DWPoseTemporalSmootherV1": DWPoseTemporalSmootherV1,
     
 }
 
@@ -728,6 +733,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NLFProportionalRetargeterV20": "NLF Proportional Retargeter V20",
     "NLFProportionalRetargeterV22": "NLF Proportional Retargeter V22 (V19 + Shoulder-Foot Soft Guard)",
     "PoseGlobalPerspectiveScalerV57": "Pose Global Perspective Scaler V57",
+    "NLFTemporalSmootherV1": "NLF Temporal Smoother V1",
+    "DWPoseTemporalSmootherV1": "DWPose Temporal Smoother V1",
 
     
     
