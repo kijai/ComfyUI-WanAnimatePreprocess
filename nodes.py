@@ -13,7 +13,11 @@ from comfy.utils import ProgressBar
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
 
-folder_paths.add_model_folder_path("detection", os.path.join(folder_paths.models_dir, "detection"))
+_detection_path = os.path.join(folder_paths.models_dir, "detection")
+folder_paths.add_model_folder_path("detection", _detection_path)
+_det_paths, _det_exts = folder_paths.folder_names_and_paths["detection"]
+if ".onnx" not in _det_exts:
+    folder_paths.folder_names_and_paths["detection"] = (_det_paths, set(_det_exts) | {".onnx"})
 
 from .models.onnx_models import ViTPose, Yolo
 from .pose_utils.pose2d_utils import load_pose_metas_from_kp2ds_seq, crop, bbox_from_detector
