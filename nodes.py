@@ -74,7 +74,7 @@ class PoseAndFaceDetection:
             },
         }
 
-    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX,")
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX")
     RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
