@@ -15,10 +15,21 @@ offload_device = mm.unet_offload_device()
 
 _detection_path = os.path.join(folder_paths.models_dir, "detection")
 folder_paths.add_model_folder_path("detection", _detection_path)
-_det_paths, _det_exts = folder_paths.folder_names_and_paths["detection"]
-if ".onnx" not in _det_exts:
-    folder_paths.folder_names_and_paths["detection"] = (_det_paths, set(_det_exts) | {".onnx"})
-    folder_paths.filename_list_cache.pop("detection", None)
+# Newer ComfyUI registers "detection" itself with supported_pt_extensions, which has no
+# ".onnx", so add_model_folder_path only appends the path and every .onnx gets filtered out.
+# An empty set means no filter is applied at all, leave that case alone.
+_detection_exts = folder_paths.folder_names_and_paths["detection"][1]
+if _detection_exts and ".onnx" not in _detection_exts:
+    _detection_exts.add(".onnx")
+    # Widening the set does not invalidate anything that already cached the filtered
+    # list, and INPUT_TYPES would keep serving the stale .bin-only result. Both cache
+    # layers are internals, so tolerate them being renamed or dropped upstream.
+    _list_cache = getattr(folder_paths, "filename_list_cache", None)
+    if isinstance(_list_cache, dict):
+        _list_cache.pop("detection", None)
+    _cache_helper = getattr(folder_paths, "cache_helper", None)
+    if hasattr(_cache_helper, "clear"):
+        _cache_helper.clear()
 
 from .models.onnx_models import ViTPose, Yolo
 from .pose_utils.pose2d_utils import load_pose_metas_from_kp2ds_seq, crop, bbox_from_detector
